@@ -1,0 +1,1277 @@
+//! Lossless Markdown parser (ADR-003).
+//!
+//! Block parser partitions the document into blocks whose spans exactly cover `[0, len)`
+//! (including blank-line trivia), which makes byte-identical round-trip a structural
+//! property of the serializer. Inline parser partitions paragraph/heading/cell content into
+//! inline nodes for navigation and minimal-diff editing.
+
+use editor_domain::{errors::DocumentError, ByteOffset, MarkdownProfile};
+
+use crate::ast::*;
+
+/// Parse a full document from source bytes under the given profile.
+pub fn parse(source: &[u8], profile: MarkdownProfile) -> Result<Document, DocumentError> {
+    let len = source.len() as u64;
+    // Two-pass: first collect link reference definitions so that reference/collapsed/
+    // shortcut links resolve against definitions appearing later in the document (§100).
+    let preliminary = parse_block_sequence(source, 0, len, 0, &profile, &Refs::default())?;
+    let refs = collect_references(&preliminary);
+    let blocks = parse_block_sequence(source, 0, len, 0, &profile, &refs)?;
+    Ok(Document { span: SourceSpan::new(ByteOffset(0), ByteOffset(len)), blocks })
+}
+
+// ---------------------------------------------------------------------------
+// Line helpers
+// ---------------------------------------------------------------------------
+
+/// A line: `[start, end)` includes its trailing newline; `content` excludes line ending.
+#[derive(Clone, Copy, Debug)]
+struct Line {
+    start: u64,
+    end: u64,
+    /// Offset just before the line-ending (`\n` or `\r\n` or EOF).
+    content_end: u64,
+}
+
+fn collect_lines(bytes: &[u8], start: u64, end: u64) -> Vec<Line> {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < end {
+        let line_start = i;
+        // find end of content (next \n or end)
+        let mut j = i;
+        while j < end && bytes[j as usize] != b'\n' {
+            j += 1;
+        }
+        // content_end excludes a trailing \r (for CRLF)
+        let mut content_end = j;
+        if content_end > line_start && bytes[(content_end - 1) as usize] == b'\r' {
+            content_end -= 1;
+        }
+        let line_end = if j < end { j + 1 } else { j }; // include newline
+        out.push(Line { start: line_start, end: line_end, content_end });
+        i = line_end;
+    }
+    out
+}
+
+fn line_content<'a>(bytes: &'a [u8], line: Line) -> &'a [u8] {
+    &bytes[line.start as usize..line.content_end as usize]
+}
+
+/// Count leading spaces (0..=3 meaningful for most blocks; 4+ => indented code).
+fn leading_indent(bytes: &[u8]) -> usize {
+    bytes.iter().take_while(|&&b| b == b' ').count()
+}
+
+fn is_blank(content: &[u8]) -> bool {
+    content.iter().all(|&b| b == b' ' || b == b'\t')
+}
+
+// ---------------------------------------------------------------------------
+// Byte trim helpers (the `str::trim*` methods are not available on `[u8]`).
+// ---------------------------------------------------------------------------
+
+fn trim_start_bytes(s: &[u8]) -> &[u8] {
+    let i = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    &s[i..]
+}
+
+fn trim_end_bytes(s: &[u8]) -> &[u8] {
+    let i = s.iter().rposition(|&b| b != b' ' && b != b'\t').map_or(0, |p| p + 1);
+    &s[..i]
+}
+
+fn trim_bytes(s: &[u8]) -> &[u8] {
+    trim_end_bytes(trim_start_bytes(s))
+}
+
+fn trim_matches_bytes(s: &[u8], matcher: impl Fn(u8) -> bool) -> &[u8] {
+    let i = s.iter().position(|&b| !matcher(b)).unwrap_or(s.len());
+    let j = s[i..].iter().rposition(|&b| !matcher(b)).map_or(i, |p| i + p + 1);
+    &s[i..j]
+}
+
+// ---------------------------------------------------------------------------
+// Block parser
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
+/// Public wrapper for `parse_block_sequence` (used by incremental reparse, §58).
+pub fn parse_block_sequence_export(
+    bytes: &[u8],
+    start: u64,
+    end: u64,
+    base_indent: u32,
+    profile: &MarkdownProfile,
+) -> Result<Vec<Block>, DocumentError> {
+    parse_block_sequence(bytes, start, end, base_indent, profile, &Refs::default())
+}
+
+fn parse_block_sequence(
+    bytes: &[u8],
+    start: u64,
+    end: u64,
+    base_indent: u32,
+    profile: &MarkdownProfile,
+    refs: &Refs,
+) -> Result<Vec<Block>, DocumentError> {
+    let lines = collect_lines(bytes, start, end);
+    let mut blocks = Vec::new();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = lines[idx];
+        let content = line_content(bytes, line);
+        let indent = leading_indent(content) as u32;
+        let stripped = &content[(indent as usize).min(content.len())..];
+
+        // Blank line -> BlankLine trivia (consume consecutive blanks).
+        if is_blank(content) {
+            let mut j = idx;
+            while j < lines.len() && is_blank(line_content(bytes, lines[j])) {
+                j += 1;
+            }
+            let span = SourceSpan::new(ByteOffset(lines[idx].start), ByteOffset(lines[j - 1].end));
+            blocks.push(Block::BlankLine(NodeMeta { span, dirty: false }));
+            idx = j;
+            continue;
+        }
+
+        // Indented code block (4+ spaces, not inside list item content area).
+        if indent >= 4 + base_indent && stripped.first() != Some(&b'>') {
+            let (blk, next) = parse_indented_code(bytes, &lines, idx, base_indent);
+            blocks.push(blk);
+            idx = next;
+            continue;
+        }
+
+        // ATX heading.
+        if let Some(h) = try_atx_heading(bytes, line, stripped, refs) {
+            blocks.push(Block::Heading(h));
+            idx += 1;
+            continue;
+        }
+
+        // Thematic break.
+        if is_thematic_break(stripped) {
+            let span = SourceSpan::new(ByteOffset(line.start), ByteOffset(line.end));
+            let marker = thematic_marker(stripped).unwrap_or(b'-');
+            blocks.push(Block::ThematicBreak(ThematicBreak { meta: NodeMeta { span, dirty: false }, marker }));
+            idx += 1;
+            continue;
+        }
+
+        // Fenced code block.
+        if let Some((fence_char, fence_len, info)) = parse_fence_open(stripped) {
+            let (blk, next) = parse_fenced_code(bytes, &lines, idx, fence_char, fence_len, info);
+            blocks.push(blk);
+            idx = next;
+            continue;
+        }
+
+        // Block quote.
+        if stripped.first() == Some(&b'>') {
+            let (blk, next) = parse_block_quote(bytes, &lines, idx, profile, refs);
+            blocks.push(blk);
+            idx = next;
+            continue;
+        }
+
+        // GFM table.
+        if profile.is_gfm() && stripped.contains(&b'|') && idx + 1 < lines.len() {
+            if let Some((table, next)) = try_parse_table(bytes, &lines, idx, refs) {
+                blocks.push(Block::Table(table));
+                idx = next;
+                continue;
+            }
+        }
+
+        // Link reference definition.
+        if let Some((def, consumed)) = try_link_reference_def(bytes, &lines, idx) {
+            blocks.push(Block::LinkReferenceDefinition(def));
+            idx += consumed;
+            continue;
+        }
+
+        // List.
+        if let Some(marker) = list_marker(stripped) {
+            let (list, next) = parse_list(bytes, &lines, idx, marker, profile, refs);
+            blocks.push(Block::List(list));
+            idx = next;
+            continue;
+        }
+
+        // HTML block (simplified: line starts with `<` and a known tag name).
+        if stripped.starts_with(b"<") && looks_like_html_block(stripped) {
+            let (blk, next) = parse_html_block(bytes, &lines, idx);
+            blocks.push(blk);
+            idx = next;
+            continue;
+        }
+
+        // Paragraph (with possible setext heading underline).
+        let (blk, next) = parse_paragraph(bytes, &lines, idx, refs);
+        blocks.push(blk);
+        idx = next;
+    }
+    Ok(blocks)
+}
+
+// ---------------------------------------------------------------------------
+// Specific block parsers
+// ---------------------------------------------------------------------------
+
+fn try_atx_heading(bytes: &[u8], line: Line, stripped: &[u8], refs: &Refs) -> Option<Heading> {
+    let mut hashes = 0usize;
+    while stripped.get(hashes) == Some(&b'#') {
+        hashes += 1;
+    }
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    // Must be followed by space or end-of-line.
+    if let Some(&c) = stripped.get(hashes) {
+        if c != b' ' && c != b'\t' {
+            return None;
+        }
+    }
+    let rest = trim_start_bytes(&stripped[hashes..]);
+    // Closing hashes.
+    let mut close = 0usize;
+    let mut content_end = rest.len();
+    // Count trailing hashes preceded by space.
+    if !rest.is_empty() {
+        let trimmed = trim_end_bytes(rest);
+        let trailing = &rest[trimmed.len()..];
+        if !trailing.is_empty() && !trimmed.ends_with(b" #") && trimmed.ends_with(b"#") {
+            // only count closing hashes if they are all trailing after a space
+        }
+        // Count trailing run of '#' (with only spaces before).
+        let mut t = rest.len();
+        while t > 0 && rest[t - 1] == b'#' {
+            t -= 1;
+        }
+        // require at least one space before the closing run
+        if t < rest.len() && t > 0 && (rest[t - 1] == b' ' || rest[t - 1] == b'\t') {
+            close = rest.len() - t;
+            content_end = t - 1; // drop the space before closing hashes
+        } else if t == 0 {
+            // all hashes, no content
+            close = rest.len();
+            content_end = 0;
+        }
+    }
+    let _ = content_end;
+    let ind = leading_indent(line_content(bytes, line));
+    let content_offset = line.start + ind as u64 + hashes as u64;
+    let inlines = parse_inlines(bytes, content_offset, line.content_end, refs);
+    let span = SourceSpan::new(ByteOffset(line.start), ByteOffset(line.end));
+    Some(Heading {
+        meta: NodeMeta { span, dirty: false },
+        level: hashes as u8,
+        style: HeadingStyle::Atx,
+        atx_open_hashes: hashes as u8,
+        atx_close_hashes: close as u8,
+        inlines,
+    })
+}
+
+fn is_thematic_break(s: &[u8]) -> bool {
+    let chars: Vec<u8> = s.iter().filter(|&&b| b != b' ' && b != b'\t').copied().collect();
+    if chars.is_empty() {
+        return false;
+    }
+    let m = chars[0];
+    if m != b'-' && m != b'*' && m != b'_' {
+        return false;
+    }
+    chars.iter().all(|&c| c == m) && chars.len() >= 3
+}
+
+fn thematic_marker(s: &[u8]) -> Option<u8> {
+    let m = s.iter().find(|&&b| b != b' ' && b != b'\t').copied()?;
+    if m == b'-' || m == b'*' || m == b'_' {
+        Some(m)
+    } else {
+        None
+    }
+}
+
+fn parse_fence_open(s: &[u8]) -> Option<(u8, u8, String)> {
+    let &c = s.first()?;
+    if c != b'`' && c != b'~' {
+        return None;
+    }
+    let mut n = 0usize;
+    while s.get(n) == Some(&c) {
+        n += 1;
+    }
+    if n < 3 {
+        return None;
+    }
+    // Backtick fences must not contain backticks in info string; we don't enforce here.
+    let info = String::from_utf8_lossy(trim_start_bytes(&s[n..])).to_string();
+    Some((c, n as u8, info))
+}
+
+fn parse_fenced_code(
+    bytes: &[u8],
+    lines: &[Line],
+    idx: usize,
+    fence_char: u8,
+    fence_len: u8,
+    info: String,
+) -> (Block, usize) {
+    let start = lines[idx].start;
+    let mut j = idx + 1;
+    while j < lines.len() {
+        let c = line_content(bytes, lines[j]);
+        let ind = leading_indent(c);
+        let s = &c[ind.min(c.len())..];
+        if s.starts_with(&vec![fence_char; fence_len as usize])
+            && s.iter().take_while(|&&b| b == fence_char).count() >= fence_len as usize
+            && s[fence_len as usize..].iter().all(|&b| b == b' ' || b == b'\t')
+        {
+            break;
+        }
+        j += 1;
+    }
+    let end_line = if j < lines.len() { lines[j].end } else { lines[lines.len() - 1].end };
+    let span = SourceSpan::new(ByteOffset(start), ByteOffset(end_line));
+    let next = if j < lines.len() { j + 1 } else { lines.len() };
+    (
+        Block::CodeBlock(CodeBlock {
+            meta: NodeMeta { span, dirty: false },
+            fenced: true,
+            fence_char,
+            fence_len,
+            info_string: info,
+        }),
+        next,
+    )
+}
+
+fn parse_indented_code(bytes: &[u8], lines: &[Line], idx: usize, base_indent: u32) -> (Block, usize) {
+    let start = lines[idx].start;
+    let mut j = idx;
+    while j < lines.len() {
+        let c = line_content(bytes, lines[j]);
+        if is_blank(c) {
+            // blank lines may belong to code block if followed by more indented lines
+            // (simplified: keep consuming while next non-blank is indented)
+            let mut k = j + 1;
+            while k < lines.len() && is_blank(line_content(bytes, lines[k])) {
+                k += 1;
+            }
+            if k < lines.len() && (leading_indent(line_content(bytes, lines[k])) as u32) >= 4 + base_indent {
+                j = k;
+                continue;
+            }
+            break;
+        }
+        if (leading_indent(c) as u32) < 4 + base_indent {
+            break;
+        }
+        j += 1;
+    }
+    let end = if j > idx { lines[j - 1].end } else { lines[idx].end };
+    let span = SourceSpan::new(ByteOffset(start), ByteOffset(end));
+    (Block::CodeBlock(CodeBlock { meta: NodeMeta { span, dirty: false }, fenced: false, fence_char: 0, fence_len: 0, info_string: String::new() }), j)
+}
+
+fn parse_block_quote(bytes: &[u8], lines: &[Line], idx: usize, profile: &MarkdownProfile, refs: &Refs) -> (Block, usize) {
+    let start = lines[idx].start;
+    let mut j = idx;
+    let mut inner_end = start;
+    while j < lines.len() {
+        let c = line_content(bytes, lines[j]);
+        let ind = leading_indent(c);
+        let s = &c[ind.min(c.len())..];
+        if s.first() != Some(&b'>') {
+            if is_blank(c) || ind >= 4 {
+                break;
+            }
+            break;
+        }
+        inner_end = lines[j].end;
+        j += 1;
+    }
+    let span = SourceSpan::new(ByteOffset(start), ByteOffset(inner_end));
+    // Build a de-marked buffer: strip leading `>` and one optional space per quote line.
+    // Children spans are relative to this de-marked buffer (offset 0 = first byte after
+    // stripping). The serializer emits the parent span verbatim for non-dirty nodes, so
+    // round-trip is byte-identical regardless of children span offsets.
+    let mut de_marked = Vec::new();
+    for k in idx..j {
+        let c = line_content(bytes, lines[k]);
+        let ind = leading_indent(c);
+        let s = &c[ind.min(c.len())..];
+        // Strip leading `>`.
+        let after_gt = if s.first() == Some(&b'>') { &s[1..] } else { s };
+        // Strip one optional space after `>`.
+        let after_space = if after_gt.first() == Some(&b' ') { &after_gt[1..] } else { after_gt };
+        de_marked.extend_from_slice(after_space);
+        // Preserve line ending from the original line.
+        de_marked.extend_from_slice(&bytes[lines[k].content_end as usize..lines[k].end as usize]);
+    }
+    let children = if de_marked.is_empty() {
+        Vec::new()
+    } else {
+        // Recursively parse the de-marked content. Errors are non-fatal: empty children
+        // preserve round-trip via the parent span.
+        parse_block_sequence(&de_marked, 0, de_marked.len() as u64, 0, profile, refs).unwrap_or_default()
+    };
+    (Block::BlockQuote(BlockQuote { meta: NodeMeta { span, dirty: false }, children }), j)
+}
+
+fn list_marker(s: &[u8]) -> Option<ListMarker> {
+    if s.is_empty() {
+        return None;
+    }
+    let c = s[0];
+    if c == b'-' || c == b'*' || c == b'+' {
+        // must be followed by space or end
+        if s.len() == 1 || s[1] == b' ' || s[1] == b'\t' {
+            return Some(ListMarker { ordered: false, marker: c, start: 1 });
+        }
+        return None;
+    }
+    // ordered
+    let mut digits = 0usize;
+    while s.get(digits).map_or(false, |b| b.is_ascii_digit()) {
+        digits += 1;
+    }
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    let after = s.get(digits)?;
+    if after != &b'.' && after != &b')' {
+        return None;
+    }
+    if s.len() > digits + 1 && s[digits + 1] != b' ' && s[digits + 1] != b'\t' {
+        return None;
+    }
+    let start: u32 = String::from_utf8_lossy(&s[..digits]).parse().unwrap_or(1);
+    Some(ListMarker { ordered: true, marker: *after, start })
+}
+
+#[derive(Clone, Copy)]
+struct ListMarker {
+    ordered: bool,
+    marker: u8,
+    start: u32,
+}
+
+fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: &MarkdownProfile, refs: &Refs) -> (List, usize) {
+    let start = lines[idx].start;
+    let mut j = idx;
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut tight = true;
+    while j < lines.len() {
+        let c = line_content(bytes, lines[j]);
+        if is_blank(c) {
+            // peek ahead: if next non-blank is a list marker of same kind, loose
+            let mut k = j + 1;
+            while k < lines.len() && is_blank(line_content(bytes, lines[k])) {
+                k += 1;
+            }
+            if k < lines.len() {
+                let nc = line_content(bytes, lines[k]);
+                let ns = &nc[leading_indent(nc).min(nc.len())..];
+                if let Some(nm) = list_marker(ns) {
+                    if nm.ordered == m.ordered && nm.marker == m.marker {
+                        tight = false;
+                    }
+                }
+            }
+            j += 1;
+            continue;
+        }
+        let ind = leading_indent(c);
+        let s = &c[ind.min(c.len())..];
+        if let Some(nm) = list_marker(s) {
+            if nm.ordered != m.ordered || nm.marker != m.marker {
+                break;
+            }
+            // item start
+            let item_start = lines[j].start;
+            // determine content start after marker
+            let marker_len = if nm.ordered { count_digits(s) + 1 } else { 1 };
+            let after_marker = &s[marker_len.min(s.len())..];
+            let content_indent = marker_len + after_marker.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+            let mut k = j + 1;
+            while k < lines.len() {
+                let nc = line_content(bytes, lines[k]);
+                if is_blank(nc) {
+                    k += 1;
+                    continue;
+                }
+                let nind = leading_indent(nc);
+                if nind < content_indent {
+                    // could be a new marker of same list or end
+                    let ns2 = &nc[nind.min(nc.len())..];
+                    if let Some(nm2) = list_marker(ns2) {
+                        if nm2.ordered == m.ordered && nm2.marker == m.marker {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                k += 1;
+            }
+            let item_end_line = if k > j { k - 1 } else { j };
+            // trim trailing blank lines from item span
+            let mut last = item_end_line;
+            while last > j && is_blank(line_content(bytes, lines[last])) {
+                last -= 1;
+            }
+            let item_span = SourceSpan::new(ByteOffset(item_start), ByteOffset(lines[last].end));
+            // task list?
+            let after = &s[marker_len.min(s.len())..];
+            let after_trim = trim_start_bytes(after);
+            let task = if after_trim.starts_with(b"[ ] ") {
+                Some(TaskState::Open)
+            } else if after_trim.starts_with(b"[x] ") || after_trim.starts_with(b"[X] ") {
+                Some(TaskState::Done)
+            } else {
+                None
+            };
+            // Build a de-marked buffer for the item's children: strip the marker + content
+            // indent from the first line, and strip `content_indent` from continuation lines.
+            // Children spans are relative to this de-marked buffer. The serializer emits the
+            // item span verbatim for non-dirty nodes, so round-trip is byte-identical.
+            let mut de_marked = Vec::new();
+            for line_idx in j..=last {
+                let lc = line_content(bytes, lines[line_idx]);
+                if line_idx == j {
+                    // First line: skip marker + trailing spaces after marker.
+                    let skip = (ind as usize) + marker_len + after_marker.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                    de_marked.extend_from_slice(&lc[skip.min(lc.len())..]);
+                } else {
+                    // Continuation: strip content_indent (clamped to line length).
+                    let strip = (ind as usize) + content_indent;
+                    de_marked.extend_from_slice(&lc[strip.min(lc.len())..]);
+                }
+                de_marked.extend_from_slice(&bytes[lines[line_idx].content_end as usize..lines[line_idx].end as usize]);
+            }
+            let children = if de_marked.is_empty() {
+                Vec::new()
+            } else {
+                parse_block_sequence(&de_marked, 0, de_marked.len() as u64, 0, profile, refs).unwrap_or_default()
+            };
+            items.push(ListItem { meta: NodeMeta { span: item_span, dirty: false }, task, children });
+            j = k;
+        } else {
+            // not a marker; if indented enough it's continuation, else stop
+            if ind >= 2 {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    let end = if j > idx { lines[j - 1].end } else { lines[idx].end };
+    // trim trailing blanks for list span
+    let span = SourceSpan::new(ByteOffset(start), ByteOffset(end));
+    (List { meta: NodeMeta { span, dirty: false }, ordered: m.ordered, marker: m.marker, start: m.start, tight, items }, j)
+}
+
+fn count_digits(s: &[u8]) -> usize {
+    s.iter().take_while(|b| b.is_ascii_digit()).count()
+}
+
+fn try_link_reference_def(bytes: &[u8], lines: &[Line], idx: usize) -> Option<(LinkReferenceDefinition, usize)> {
+    let c = line_content(bytes, lines[idx]);
+    let s = &c[leading_indent(c).min(c.len())..];
+    if !s.starts_with(b"[") {
+        return None;
+    }
+    let close = s.iter().position(|&b| b == b']')?;
+    if s.get(close + 1) != Some(&b':') {
+        return None;
+    }
+    let label = String::from_utf8_lossy(&s[1..close]).trim().to_string();
+    let rest = trim_start_bytes(&s[close + 2..]);
+    // destination
+    let dest_end = rest
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t')
+        .unwrap_or(rest.len());
+    let destination = String::from_utf8_lossy(&rest[..dest_end]).to_string();
+    let title = if dest_end < rest.len() {
+        let t = trim_bytes(&rest[dest_end..]);
+        if t.is_empty() {
+            None
+        } else {
+            // Strip surrounding quotes if present (CommonMark allows "..." or '...').
+            let stripped = if t.len() >= 2 && ((t[0] == b'"' && t[t.len() - 1] == b'"') || (t[0] == b'\'' && t[t.len() - 1] == b'\'')) {
+                &t[1..t.len() - 1]
+            } else {
+                t
+            };
+            Some(String::from_utf8_lossy(stripped).to_string())
+        }
+    } else {
+        None
+    };
+    let span = SourceSpan::new(ByteOffset(lines[idx].start), ByteOffset(lines[idx].end));
+    Some((
+        LinkReferenceDefinition { meta: NodeMeta { span, dirty: false }, label, destination, title },
+        1,
+    ))
+}
+
+fn looks_like_html_block(s: &[u8]) -> bool {
+    // Simplified: starts with `<` followed by a letter, `/`, `!`, or `?`.
+    match s.get(1) {
+        Some(b) => b.is_ascii_alphabetic() || *b == b'/' || *b == b'!' || *b == b'?',
+        None => false,
+    }
+}
+
+fn parse_html_block(bytes: &[u8], lines: &[Line], idx: usize) -> (Block, usize) {
+    let start = lines[idx].start;
+    // Simplified: consume until blank line.
+    let mut j = idx + 1;
+    while j < lines.len() && !is_blank(line_content(bytes, lines[j])) {
+        j += 1;
+    }
+    let end = lines[j - 1].end;
+    let span = SourceSpan::new(ByteOffset(start), ByteOffset(end));
+    (Block::HtmlBlock(HtmlBlock { meta: NodeMeta { span, dirty: false } }), j)
+}
+
+fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Block, usize) {
+    let start = lines[idx].start;
+    let mut j = idx;
+    let mut setext_level: Option<u8> = None;
+    loop {
+        let c = line_content(bytes, lines[j]);
+        if is_blank(c) {
+            break;
+        }
+        let ind = leading_indent(c);
+        let s = &c[ind.min(c.len())..];
+        // Setext underline?
+        if j > idx && is_setext_underline(s) {
+            setext_level = Some(if s[0] == b'=' { 1 } else { 2 });
+            j += 1;
+            break;
+        }
+        // Stop if a new block starts (fence, atx, thematic, block quote, list, html).
+        if j > idx {
+            if is_thematic_break(s) || parse_fence_open(s).is_some() || try_atx_heading(bytes, lines[j], s, refs).is_some() || s.first() == Some(&b'>') || list_marker(s).is_some() || (s.starts_with(b"<") && looks_like_html_block(s)) {
+                break;
+            }
+        }
+        j += 1;
+        if j >= lines.len() {
+            break;
+        }
+    }
+    let last = if j > idx { j - 1 } else { idx };
+    let content_end = if setext_level.is_some() { lines[last - 1].content_end } else { lines[last].content_end };
+    let para_end = lines[j - 1].end;
+    let span = SourceSpan::new(ByteOffset(start), ByteOffset(para_end));
+    let inlines = parse_inlines(bytes, start, content_end, refs);
+    if let Some(level) = setext_level {
+        return (
+            Block::Heading(Heading {
+                meta: NodeMeta { span, dirty: false },
+                level,
+                style: HeadingStyle::Setext,
+                atx_open_hashes: 0,
+                atx_close_hashes: 0,
+                inlines,
+            }),
+            j,
+        );
+    }
+    (Block::Paragraph(Paragraph { meta: NodeMeta { span, dirty: false }, inlines }), j)
+}
+
+fn is_setext_underline(s: &[u8]) -> bool {
+    let t = trim_end_bytes(s);
+    if t.is_empty() {
+        return false;
+    }
+    let c = t[0];
+    if c != b'=' && c != b'-' {
+        return false;
+    }
+    t.iter().all(|&b| b == c) && t.len() >= 1
+}
+
+// ---------------------------------------------------------------------------
+// GFM table
+// ---------------------------------------------------------------------------
+
+fn try_parse_table(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> Option<(Table, usize)> {
+    let header_line = line_content(bytes, lines[idx]);
+    let hs = &header_line[leading_indent(header_line).min(header_line.len())..];
+    let delim_line = line_content(bytes, lines[idx + 1]);
+    let ds = &delim_line[leading_indent(delim_line).min(delim_line.len())..];
+    if !ds.contains(&b'|') && !ds.contains(&b':') && !ds.contains(&b'-') {
+        return None;
+    }
+    let aligns = parse_delim_row(ds)?;
+    let header_cells = split_table_cells(hs);
+    if aligns.len() != header_cells.len() && !header_cells.is_empty() {
+        // GFM allows mismatch but require at least a valid delimiter
+    }
+    let mut rows = Vec::new();
+    let hspan = SourceSpan::new(ByteOffset(lines[idx].start), ByteOffset(lines[idx].end));
+    let hcells: Vec<TableCell> = header_cells
+        .iter()
+        .map(|(s, e)| TableCell {
+            meta: NodeMeta { span: SourceSpan::new(ByteOffset(*s), ByteOffset(*e)), dirty: false },
+            inlines: parse_inlines(bytes, *s, *e, refs),
+        })
+        .collect();
+    rows.push(TableRow { meta: NodeMeta { span: hspan, dirty: false }, header: true, cells: hcells });
+    let mut j = idx + 2;
+    while j < lines.len() {
+        let c = line_content(bytes, lines[j]);
+        if is_blank(c) {
+            break;
+        }
+        let cs = &c[leading_indent(c).min(c.len())..];
+        if !cs.contains(&b'|') {
+            break;
+        }
+        let cells = split_table_cells(cs);
+        let rspan = SourceSpan::new(ByteOffset(lines[j].start), ByteOffset(lines[j].end));
+        let rcells: Vec<TableCell> = cells
+            .iter()
+            .map(|(s, e)| TableCell {
+                meta: NodeMeta { span: SourceSpan::new(ByteOffset(*s), ByteOffset(*e)), dirty: false },
+                inlines: parse_inlines(bytes, *s, *e, refs),
+            })
+            .collect();
+        rows.push(TableRow { meta: NodeMeta { span: rspan, dirty: false }, header: false, cells: rcells });
+        j += 1;
+    }
+    let end = lines[j - 1].end;
+    let span = SourceSpan::new(ByteOffset(lines[idx].start), ByteOffset(end));
+    Some((Table { meta: NodeMeta { span, dirty: false }, alignments: aligns, rows }, j))
+}
+
+fn parse_delim_row(s: &[u8]) -> Option<Vec<TableAlign>> {
+    let cells: Vec<&[u8]> = s.split(|&b| b == b'|').collect();
+    let mut aligns = Vec::new();
+    for cell in cells {
+        let t = trim_matches_bytes(cell, |b: u8| b == b' ' || b == b'\t');
+        if t.is_empty() {
+            continue;
+        }
+        if !t.iter().all(|&b| b == b'-' || b == b':') || !t.contains(&b'-') {
+            return None;
+        }
+        let left = t.starts_with(b":");
+        let right = t.ends_with(b":");
+        aligns.push(match (left, right) {
+            (true, true) => TableAlign::Center,
+            (true, false) => TableAlign::Left,
+            (false, true) => TableAlign::Right,
+            (false, false) => TableAlign::None,
+        });
+    }
+    if aligns.is_empty() {
+        None
+    } else {
+        Some(aligns)
+    }
+}
+
+/// Split a table row into (start,end) byte offsets of cell contents (absolute offsets
+/// relative to the document, since `s` is a slice of `bytes` starting at `bytes_start`).
+fn split_table_cells(s: &[u8]) -> Vec<(u64, u64)> {
+    // Strip a leading/trailing pipe for offset math.
+    let mut cells = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    // Skip an optional leading pipe.
+    if s.first() == Some(&b'|') {
+        start = 1;
+        i = 1;
+    }
+    while i < s.len() {
+        let b = s[i];
+        if b == b'\\' && i + 1 < s.len() {
+            i += 2;
+            continue;
+        }
+        if b == b'|' {
+            cells.push((start as u64, i as u64));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    cells.push((start as u64, s.len() as u64));
+    // The offsets above are relative to `s`; callers add the document offset of `s`.
+    cells
+}
+
+// ---------------------------------------------------------------------------
+// Inline parser (simplified, span-partitioning)
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Clone)]
+struct Refs {
+    // label -> (destination, title)
+    map: std::collections::HashMap<String, (String, Option<String>)>,
+}
+
+/// Parse inline content in `bytes[start..end)` into a list of inline nodes whose spans
+/// partition the range. For the foundation this handles the common cases; full CommonMark
+/// delimiter-run nuance is a follow-up (ADR-003).
+fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline> {
+    let region = &bytes[start as usize..end as usize];
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut text_start = 0usize;
+    let abs = |off: usize| ByteOffset(start + off as u64);
+
+    let flush_text = |out: &mut Vec<Inline>, ts: usize, te: usize| {
+        if te > ts {
+            let span = SourceSpan::new(abs(ts), abs(te));
+            let s = String::from_utf8_lossy(&region[ts..te]).to_string();
+            out.push(Inline::Text(NodeMeta { span, dirty: false }, s));
+        }
+    };
+
+    while i < region.len() {
+        let b = region[i];
+
+        // Escape.
+        if b == b'\\' && i + 1 < region.len() && is_ascii_punct(region[i + 1]) {
+            flush_text(&mut out, text_start, i);
+            // Represent escaped punct as a Text node containing the escaped char (verbatim).
+            let span = SourceSpan::new(abs(i), abs(i + 2));
+            out.push(Inline::Text(NodeMeta { span, dirty: false }, (region[i + 1] as char).to_string()));
+            i += 2;
+            text_start = i;
+            continue;
+        }
+
+        // Hard line break via backslash before newline (§19).
+        if b == b'\\' && i + 1 < region.len() && region[i + 1] == b'\n' {
+            flush_text(&mut out, text_start, i);
+            let span = SourceSpan::new(abs(i), abs(i + 2));
+            out.push(Inline::HardBreak(NodeMeta { span, dirty: false }));
+            i += 2;
+            text_start = i;
+            continue;
+        }
+
+        // Hard line break: two+ trailing spaces before newline.
+        if b == b' ' {
+            // count trailing spaces
+            let mut k = i;
+            while k < region.len() && region[k] == b' ' {
+                k += 1;
+            }
+            if k > i + 1 && k < region.len() && region[k] == b'\n' {
+                flush_text(&mut out, text_start, i);
+                let span = SourceSpan::new(abs(i), abs(k + 1));
+                out.push(Inline::HardBreak(NodeMeta { span, dirty: false }));
+                i = k + 1;
+                text_start = i;
+                continue;
+            }
+        }
+
+        // Inline code span.
+        if b == b'`' {
+            let mut n = 0usize;
+            while region.get(i + n) == Some(&b'`') {
+                n += 1;
+            }
+            let after = &region[i + n..];
+            if let Some(cl) = find_code_close(after, n) {
+                let code_end = i + n + cl + n;
+                flush_text(&mut out, text_start, i);
+                let span = SourceSpan::new(abs(i), abs(code_end));
+                let inner = String::from_utf8_lossy(&region[i + n..i + n + cl]).to_string();
+                out.push(Inline::CodeSpan(NodeMeta { span, dirty: false }, inner, n as u8));
+                i = code_end;
+                text_start = i;
+                continue;
+            }
+        }
+
+        // Emphasis / strong with `*` or `_`.
+        if b == b'*' || b == b'_' {
+            let mut n = 0usize;
+            while region.get(i + n) == Some(&b) {
+                n += 1;
+            }
+            if let Some(em) = try_emphasis(&region, i, n, b, start, refs) {
+                flush_text(&mut out, text_start, i);
+                out.push(em.node);
+                i = em.end;
+                text_start = i;
+                continue;
+            }
+        }
+
+        // GFM strikethrough.
+        if b == b'~' && region.get(i + 1) == Some(&b'~') {
+            if let Some(close) = find_str(&region[i + 2..], b"~~") {
+                flush_text(&mut out, text_start, i);
+                let inner_start = i + 2;
+                let inner_end = i + 2 + close;
+                let span = SourceSpan::new(abs(i), abs(inner_end + 2));
+                let children = parse_inlines(bytes, start + inner_start as u64, start + inner_end as u64, refs);
+                out.push(Inline::Strikethrough(NodeMeta { span, dirty: false }, children));
+                i = inner_end + 2;
+                text_start = i;
+                continue;
+            }
+        }
+
+        // Image.
+        if b == b'!' && region.get(i + 1) == Some(&b'[') {
+            if let Some(img) = try_image(&region, i, start, refs) {
+                flush_text(&mut out, text_start, i);
+                out.push(img.node);
+                i = img.end;
+                text_start = i;
+                continue;
+            }
+        }
+
+        // Link.
+        if b == b'[' {
+            if let Some(link) = try_link(&region, i, start, refs) {
+                flush_text(&mut out, text_start, i);
+                out.push(link.node);
+                i = link.end;
+                text_start = i;
+                continue;
+            }
+        }
+
+        // Autolink.
+        if b == b'<' {
+            if let Some(end_off) = find_autolink_end(&region[i..]) {
+                flush_text(&mut out, text_start, i);
+                let span = SourceSpan::new(abs(i), abs(i + end_off));
+                let inner = String::from_utf8_lossy(&region[i + 1..i + end_off - 1]).to_string();
+                out.push(Inline::Autolink(NodeMeta { span, dirty: false }, inner));
+                i += end_off;
+                text_start = i;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+    flush_text(&mut out, text_start, region.len());
+    out
+}
+
+fn is_ascii_punct(b: u8) -> bool {
+    matches!(b, b'!'..=b'/' | b':'..=b'@' | b'['..=b'`' | b'{'..=b'~')
+}
+
+fn find_code_close(region: &[u8], n: usize) -> Option<usize> {
+    let mut i = 0usize;
+    while i < region.len() {
+        if region[i] == b'`' {
+            let mut k = 0usize;
+            while region.get(i + k) == Some(&b'`') {
+                k += 1;
+            }
+            if k == n {
+                return Some(i);
+            }
+            i += k;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn find_str(region: &[u8], needle: &[u8]) -> Option<usize> {
+    region.windows(needle.len()).position(|w| w == needle)
+}
+
+struct Parsed {
+    node: Inline,
+    end: usize,
+}
+
+fn try_emphasis(region: &[u8], i: usize, n: usize, ch: u8, base: u64, refs: &Refs) -> Option<Parsed> {
+    // Strong if n >= 2 and a closing run of >=2 exists; else emphasis if n >= 1.
+    let kind = if ch == b'*' { EmphasisKind::Asterisk } else { EmphasisKind::Underscore };
+    let after = &region[i + n..];
+    // Try strong (consume 2 delimiters).
+    if n >= 2 {
+        if let Some(close) = find_str(after, &[ch, ch]) {
+            let inner_start = i + 2;
+            let inner_end = i + 2 + close;
+            let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + (inner_end + 2) as u64));
+            let children = parse_inlines(region, inner_start as u64, inner_end as u64, refs);
+            // Adjust children spans to absolute using base offset of region start (0 here).
+            let children = rebase_inlines(children, base as i64);
+            return Some(Parsed { node: Inline::Strong(NodeMeta { span, dirty: false }, children, kind), end: inner_end + 2 });
+        }
+    }
+    // Emphasis with 1 delimiter.
+    if let Some(close) = find_str(after, &[ch]) {
+        // avoid matching the same run for underscore word-boundary nuance (simplified)
+        let inner_start = i + 1;
+        let inner_end = i + 1 + close;
+        let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + (inner_end + 1) as u64));
+        let children = parse_inlines(region, inner_start as u64, inner_end as u64, refs);
+        let children = rebase_inlines(children, base as i64);
+        return Some(Parsed { node: Inline::Emphasis(NodeMeta { span, dirty: false }, children, kind), end: inner_end + 1 });
+    }
+    None
+}
+
+/// `parse_inlines` was called on a sub-slice `region[inner_start..inner_end]` which is
+/// actually a sub-slice of `region` (we passed `region` as `bytes` and offsets relative to
+/// `region`). The returned spans are relative to `region` start (offset 0 = region start).
+/// We need them absolute in the document, so add `base` (the document offset of `region[0]`).
+fn rebase_inlines(inlines: Vec<Inline>, delta: i64) -> Vec<Inline> {
+    inlines
+        .into_iter()
+        .map(|il| {
+            let m = il.meta();
+            let span = SourceSpan::new(
+                ByteOffset((m.span.start.0 as i64 + delta).max(0) as u64),
+                ByteOffset((m.span.end.0 as i64 + delta).max(0) as u64),
+            );
+            rebase_inline(il, span)
+        })
+        .collect()
+}
+
+fn rebase_inline(il: Inline, span: SourceSpan) -> Inline {
+    let mut il = il;
+    let m = il.meta();
+    let _ = m;
+    match &mut il {
+        Inline::Text(m, _) | Inline::CodeSpan(m, _, _) | Inline::Autolink(m, _)
+        | Inline::HardBreak(m) | Inline::RawHtml(m) | Inline::UnknownInline(m) => {
+            m.span = span;
+        }
+        Inline::Emphasis(m, children, _) | Inline::Strong(m, children, _)
+        | Inline::Strikethrough(m, children) => {
+            m.span = span;
+            *children = rebase_inlines(core::mem::take(children), 0);
+        }
+        Inline::Link(l) => {
+            l.meta.span = span;
+            l.inlines = rebase_inlines(core::mem::take(&mut l.inlines), 0);
+        }
+        Inline::Image(im) => {
+            im.meta.span = span;
+        }
+    }
+    il
+}
+
+fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
+    // Find matching `]`.
+    let mut depth = 1i32;
+    let mut j = i + 1;
+    while j < region.len() && depth > 0 {
+        if region[j] == b'\\' {
+            j += 2;
+            continue;
+        }
+        if region[j] == b'[' {
+            depth += 1;
+        } else if region[j] == b']' {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        j += 1;
+    }
+    if depth != 0 {
+        return None;
+    }
+    let text_end = j; // position of `]`
+    let after = &region[text_end + 1..];
+    // Inline `( ... )`.
+    if after.first() == Some(&b'(') {
+        let close = after.iter().position(|&b| b == b')')?;
+        let inner = &after[1..close];
+        let (dest, title) = split_link_dest(inner);
+        let span_end = text_end + 1 + close + 1;
+        let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + span_end as u64));
+        let children = parse_inlines(region, (i + 1) as u64, text_end as u64, refs);
+        let children = rebase_inlines(children, base as i64);
+        return Some(Parsed {
+            node: Inline::Link(Link {
+                meta: NodeMeta { span, dirty: false },
+                inlines: children,
+                style: LinkStyle::Inline,
+                destination: dest,
+                title,
+                reference: None,
+            }),
+            end: span_end,
+        });
+    }
+    // Reference / shortcut / collapsed.
+    let (label, style, ref_consumed) = if after.first() == Some(&b'[') {
+        // [text][id] or [text][]
+        let close2 = after.iter().position(|&b| b == b']')?;
+        let id_bytes = &after[1..close2];
+        let label = if id_bytes.is_empty() {
+            String::from_utf8_lossy(&region[i + 1..text_end]).trim().to_string()
+        } else {
+            String::from_utf8_lossy(id_bytes).trim().to_string()
+        };
+        let style = if id_bytes.is_empty() { LinkStyle::Collapsed } else { LinkStyle::Reference };
+        (label, style, close2 + 1)
+    } else {
+        // shortcut: [text]
+        let label = String::from_utf8_lossy(&region[i + 1..text_end]).trim().to_string();
+        (label, LinkStyle::Shortcut, 0usize)
+    };
+    let normalized = normalize_label(&label);
+    let (destination, title) = refs.map.get(&normalized).cloned().unwrap_or_default();
+    let span_end = text_end + 1 + ref_consumed;
+    let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + span_end as u64));
+    let children = parse_inlines(region, (i + 1) as u64, text_end as u64, refs);
+    let children = rebase_inlines(children, base as i64);
+    Some(Parsed {
+        node: Inline::Link(Link {
+            meta: NodeMeta { span, dirty: false },
+            inlines: children,
+            style,
+            destination,
+            title,
+            reference: Some(label),
+        }),
+        end: span_end,
+    })
+}
+
+fn try_image(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
+    // `![alt](dest)` or reference.
+    let link = try_link(region, i + 1, base, refs)?;
+    let mut span = link.node.span();
+    span.start = ByteOffset(base + i as u64);
+    let end = link.end;
+    let alt = match &link.node {
+        Inline::Link(l) => collect_text(&l.inlines),
+        _ => String::new(),
+    };
+    let (style, destination, title, reference) = match &link.node {
+        Inline::Link(l) => (l.style, l.destination.clone(), l.title.clone(), l.reference.clone()),
+        _ => return None,
+    };
+    Some(Parsed {
+        node: Inline::Image(Image {
+            meta: NodeMeta { span, dirty: false },
+            alt,
+            style,
+            destination,
+            title,
+            reference,
+        }),
+        end,
+    })
+}
+
+fn collect_text(inlines: &[Inline]) -> String {
+    let mut s = String::new();
+    for il in inlines {
+        match il {
+            Inline::Text(_, t) => s.push_str(t),
+            Inline::Emphasis(_, c, _) | Inline::Strong(_, c, _) | Inline::Strikethrough(_, c) => {
+                s.push_str(&collect_text(c));
+            }
+            Inline::CodeSpan(_, t, _) => s.push_str(t),
+            Inline::Link(l) => s.push_str(&collect_text(&l.inlines)),
+            _ => {}
+        }
+    }
+    s
+}
+
+fn split_link_dest(inner: &[u8]) -> (String, Option<String>) {
+    // destination ends at first space; rest is title.
+    let mut in_quotes = false;
+    let mut split = inner.len();
+    for (i, &b) in inner.iter().enumerate() {
+        if b == b'"' {
+            in_quotes = !in_quotes;
+        }
+        if (b == b' ' || b == b'\t') && !in_quotes {
+            split = i;
+            break;
+        }
+    }
+    let dest = String::from_utf8_lossy(&inner[..split]).to_string();
+    let title_raw = trim_bytes(&inner[split..]);
+    let title = if title_raw.is_empty() {
+        None
+    } else {
+        let t = trim_matches_bytes(title_raw, |b: u8| b == b'"' || b == b'\'');
+        Some(String::from_utf8_lossy(t).to_string())
+    };
+    (dest, title)
+}
+
+fn find_autolink_end(region: &[u8]) -> Option<usize> {
+    // `<...>` with no spaces and a `>`; must contain a `:` or `@` for url/email.
+    if region.first() != Some(&b'<') {
+        return None;
+    }
+    let close = region.iter().position(|&b| b == b'>')?;
+    let inner = &region[1..close];
+    if inner.iter().any(|&b| b == b' ' || b == b'\t' || b == b'<') {
+        return None;
+    }
+    if !inner.contains(&b':') && !inner.contains(&b'@') {
+        return None;
+    }
+    Some(close + 1)
+}
+
+/// First pass: collect link reference definitions from the whole document so that
+/// reference/collapsed/shortcut links can resolve against definitions appearing later
+/// (§100). Labels are normalized per CommonMark: trimmed, case-folded, internal whitespace
+/// collapsed to single spaces.
+fn collect_references(blocks: &[Block]) -> Refs {
+    let mut refs = Refs::default();
+    for b in blocks {
+        if let Block::LinkReferenceDefinition(d) = b {
+            let normalized = normalize_label(&d.label);
+            refs.map.insert(normalized, (d.destination.clone(), d.title.clone()));
+        }
+    }
+    refs
+}
+
+/// Normalize a reference label per CommonMark: trim, case-fold to lowercase, collapse
+/// internal whitespace runs to a single space.
+fn normalize_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut prev_space = true; // trim leading
+    for c in label.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.extend(c.to_lowercase());
+            prev_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}

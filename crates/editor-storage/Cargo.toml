@@ -1,0 +1,20 @@
+[package]
+name = "editor-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DocumentStorage port, byte-range loading, UTF-8 boundary correction, atomic save."
+
+[dependencies]
+editor-domain = { path = "../editor-domain" }
+memmap2 = "0.9"
+
+# mmap fundamentally requires `unsafe` (ADR-006). Downgrade the workspace `deny` to `warn`
+# for this crate, then `deny` at the crate root and `allow` only in `src/mmap.rs`. Other
+# workspace lints (clippy) are replicated explicitly since `workspace = true` cannot be
+# mixed with per-crate overrides.
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

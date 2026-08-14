@@ -1,0 +1,14 @@
+[package]
+name = "editor-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Plugin host: manifest loading, capability enforcement, WASM runtime (skeleton), crash isolation."
+
+[dependencies]
+editor-domain = { path = "../editor-domain" }
+editor-plugin-api = { path = "../editor-plugin-api" }
+toml = "0.8"
+
+[lints]
+workspace = true

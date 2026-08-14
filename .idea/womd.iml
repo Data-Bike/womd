@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/adapters/generic-git/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/adapters/github/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-diff/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-domain/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-git/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-markdown/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-platform/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-plugin-api/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-plugin-host/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-storage/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-text/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/editor-ui/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

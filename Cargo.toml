@@ -1,0 +1,45 @@
+[package]
+name = "womd"
+version = "0.1.0"
+edition = "2024"
+description = "WoMD — a Word-like, source-preserving, Git-friendly Markdown document editor."
+license = "MIT OR Apache-2.0"
+default-run = "womd"
+
+[dependencies]
+editor-core = { path = "crates/editor-core" }
+editor-domain = { path = "crates/editor-domain" }
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/editor-domain",
+    "crates/editor-text",
+    "crates/editor-core",
+    "crates/editor-markdown",
+    "crates/editor-diff",
+    "crates/editor-git",
+    "crates/editor-storage",
+    "crates/editor-plugin-api",
+    "crates/editor-plugin-host",
+    "crates/editor-platform",
+    "crates/editor-ui",
+    "adapters/github",
+    "adapters/generic-git",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gorod/womd"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+# Strict `missing_docs` is re-enabled per-crate as each stabilizes; at foundation stage it
+# would generate ~350 noise warnings on internal `pub` helpers and obscure real issues.
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }

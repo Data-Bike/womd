@@ -1,0 +1,16 @@
+[package]
+name = "adapter-generic-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RepositoryHostAdapter implementation for plain Git remotes (no provider API)."
+
+[dependencies]
+editor-domain = { path = "../../crates/editor-domain" }
+editor-plugin-api = { path = "../../crates/editor-plugin-api" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "editor-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OS abstractions: file watcher, secure secret storage, open-url, clipboard, high-DPI."
+
+[dependencies]
+editor-domain = { path = "../editor-domain" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

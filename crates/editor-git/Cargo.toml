@@ -1,0 +1,16 @@
+[package]
+name = "editor-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VersionControl port + CredentialProvider + default libgit2 implementation."
+
+[dependencies]
+editor-domain = { path = "../editor-domain" }
+editor-diff = { path = "../editor-diff" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

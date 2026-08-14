@@ -1,0 +1,13 @@
+[package]
+name = "adapter-github"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RepositoryHostAdapter implementation for GitHub REST API."
+
+[dependencies]
+editor-domain = { path = "../../crates/editor-domain" }
+editor-plugin-api = { path = "../../crates/editor-plugin-api" }
+
+[lints]
+workspace = true

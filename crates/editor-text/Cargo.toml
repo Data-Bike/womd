@@ -1,0 +1,12 @@
+[package]
+name = "editor-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Source-preserving Piece Table text buffer with byte/scalar/grapheme/line coordinate systems."
+
+[dependencies]
+editor-domain = { path = "../editor-domain" }
+
+[lints]
+workspace = true
