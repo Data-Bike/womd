@@ -60,6 +60,8 @@ const gitDiff = document.getElementById("git-diff");
 const gitStash = document.getElementById("git-stash");
 const gitTags = document.getElementById("git-tags");
 const gitRemotes = document.getElementById("git-remotes");
+const gitDivider = document.getElementById("git-divider");
+const contextMenu = document.getElementById("context-menu");
 
 // ── File dialog ─────────────────────────────────────────────────────────────
 async function openFileDialog() {
@@ -1039,15 +1041,21 @@ function renderGitChanges() {
   let html = "";
   if (s.staged.length > 0) {
     html += '<div class="git-section-title">Staged Changes</div>';
-    for (const f of s.staged) html += `<div class="git-file-entry" onclick="gitUnstageFile('${escapeAttr(f.path)}')"><span class="git-file-status git-status-${f.status}">${statusLetter(f.status)}</span><span class="git-file-path">${escapeHtml(f.path)}</span></div>`;
+    for (const f of s.staged) {
+      html += renderFileDiffEntry(f, "staged");
+    }
   }
   if (s.changes.length > 0) {
     html += '<div class="git-section-title">Changes</div>';
-    for (const f of s.changes) html += `<div class="git-file-entry" onclick="gitStageFile('${escapeAttr(f.path)}')"><span class="git-file-status git-status-${f.status}">${statusLetter(f.status)}</span><span class="git-file-path">${escapeHtml(f.path)}</span></div>`;
+    for (const f of s.changes) {
+      html += renderFileDiffEntry(f, "changes");
+    }
   }
   if (s.untracked.length > 0) {
     html += '<div class="git-section-title">Untracked</div>';
-    for (const f of s.untracked) html += `<div class="git-file-entry" onclick="gitStageFile('${escapeAttr(f.path)}')"><span class="git-file-status git-status-Untracked">?</span><span class="git-file-path">${escapeHtml(f.path)}</span></div>`;
+    for (const f of s.untracked) {
+      html += renderFileDiffEntry(f, "untracked");
+    }
   }
   if (s.staged.length > 0) {
     html += '<div class="git-section-title">Commit</div>';
@@ -1058,6 +1066,77 @@ function renderGitChanges() {
     html += '<div style="padding:16px;color:var(--fg-muted);text-align:center">No changes</div>';
   }
   gitChanges.innerHTML = html;
+}
+
+/// Render a file entry with expandable inline diff and right-click context menu.
+function renderFileDiffEntry(f, section) {
+  const path = escapeAttr(f.path);
+  const safePath = escapeHtml(f.path);
+  const letter = f.status === "Untracked" ? "?" : statusLetter(f.status);
+  const cls = f.status === "Untracked" ? "Untracked" : f.status;
+  return `<div class="git-file-diff-block" data-path="${path}" data-section="${section}" data-status="${f.status}">
+    <div class="git-file-diff-header" onclick="gitToggleFileDiff(this)">
+      <span class="chevron">▶</span>
+      <span class="git-file-status git-status-${cls}">${letter}</span>
+      <span class="git-file-path">${safePath}</span>
+    </div>
+    <div class="git-file-diff-inline hidden"></div>
+  </div>`;
+}
+
+window.gitToggleFileDiff = async function(headerEl) {
+  const block = headerEl.closest(".git-file-diff-block");
+  const inlineDiv = block.querySelector(".git-file-diff-inline");
+  const isExpanded = !inlineDiv.classList.contains("hidden");
+  if (isExpanded) {
+    inlineDiv.classList.add("hidden");
+    headerEl.classList.remove("expanded");
+    return;
+  }
+  headerEl.classList.add("expanded");
+  inlineDiv.classList.remove("hidden");
+  inlineDiv.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">Loading diff...</div>';
+  const filePath = block.dataset.path;
+  const status = block.dataset.status;
+  try {
+    if (status === "Untracked") {
+      // Show entire file as new.
+      const content = await tauriInvoke("git_read_file_at_revision", { filePath, revision: "" });
+      inlineDiv.innerHTML = renderUntrackedDiff(content);
+    } else {
+      const diff = await tauriInvoke("git_diff_file", { filePath });
+      inlineDiv.innerHTML = renderDiffHtml(diff);
+    }
+  } catch (e) {
+    inlineDiv.innerHTML = `<div style="padding:8px;color:var(--diff-del)">${escapeHtml(String(e))}</div>`;
+  }
+};
+
+function renderDiffHtml(diff) {
+  if (!diff || !diff.hunks || diff.hunks.length === 0) {
+    return '<div style="padding:8px;color:var(--fg-muted);text-align:center">No line-level changes</div>';
+  }
+  let html = "";
+  for (const hunk of diff.hunks) {
+    html += `<div class="diff-hunk-header">@@ -${hunk.old_start} +${hunk.new_start} @@</div>`;
+    for (const line of hunk.lines) {
+      const cls = line.kind === "insert" ? "insert" : line.kind === "delete" ? "delete" : "equal";
+      const sign = line.kind === "insert" ? "+" : line.kind === "delete" ? "-" : " ";
+      html += `<div class="diff-line ${cls}"><span class="diff-line-num">${line.old_no || ""}</span><span class="diff-line-num">${line.new_no || ""}</span><span class="diff-line-sign">${sign}</span><span class="diff-line-content">${escapeHtml(line.text)}</span></div>`;
+    }
+  }
+  return html;
+}
+
+function renderUntrackedDiff(content) {
+  if (!content) return '<div style="padding:8px;color:var(--fg-muted)">Empty file</div>';
+  let html = "";
+  let lineNo = 1;
+  for (const line of content.split("\n")) {
+    html += `<div class="diff-line insert"><span class="diff-line-num"></span><span class="diff-line-num">${lineNo}</span><span class="diff-line-sign">+</span><span class="diff-line-content">${escapeHtml(line)}</span></div>`;
+    lineNo++;
+  }
+  return html;
 }
 
 function renderGitBranches() {
@@ -1081,18 +1160,22 @@ function renderGitHistory() {
 }
 
 function renderGitDiff() {
-  if (!gitData.diff || gitData.diff.length === 0) { gitDiff.innerHTML = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No changes</div>'; return; }
+  // The Diff tab now shows the diff viewer (commit selectors).
+  // This function is called by refreshGitAll but the actual rendering
+  // happens via renderDiffViewer() when the tab is activated.
+  if (!gitData.diff || gitData.diff.length === 0) {
+    // Only overwrite if the diff viewer form hasn't been rendered yet.
+    if (!document.getElementById("diff-mode-select")) {
+      gitDiff.innerHTML = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No changes</div>';
+    }
+    return;
+  }
+  // If the diff viewer form is present, don't overwrite it.
+  if (document.getElementById("diff-mode-select")) return;
   let html = "";
   for (const file of gitData.diff) {
     html += `<div class="diff-file-header">${escapeHtml(file.path)}</div>`;
-    for (const hunk of file.hunks) {
-      html += `<div class="diff-hunk-header">@@ -${hunk.old_start} +${hunk.new_start} @@</div>`;
-      for (const line of hunk.lines) {
-        const cls = line.kind === "insert" ? "insert" : line.kind === "delete" ? "delete" : "equal";
-        const sign = line.kind === "insert" ? "+" : line.kind === "delete" ? "-" : " ";
-        html += `<div class="diff-line ${cls}"><span class="diff-line-num">${line.old_no || ""}</span><span class="diff-line-num">${line.new_no || ""}</span><span class="diff-line-sign">${sign}</span><span class="diff-line-content">${escapeHtml(line.text)}</span></div>`;
-      }
-    }
+    html += renderDiffHtml(file);
   }
   gitDiff.innerHTML = html;
 }
@@ -1258,14 +1341,7 @@ window.gitShowDiff = async function() {
     } else {
       for (const file of diffs) {
         html += `<div class="diff-file-header">${escapeHtml(file.path)}</div>`;
-        for (const hunk of file.hunks) {
-          html += `<div class="diff-hunk-header">@@ -${hunk.old_start} +${hunk.new_start} @@</div>`;
-          for (const line of hunk.lines) {
-            const cls = line.kind === "insert" ? "insert" : line.kind === "delete" ? "delete" : "equal";
-            const sign = line.kind === "insert" ? "+" : line.kind === "delete" ? "-" : " ";
-            html += `<div class="diff-line ${cls}"><span class="diff-line-num">${line.old_no || ""}</span><span class="diff-line-num">${line.new_no || ""}</span><span class="diff-line-sign">${sign}</span><span class="diff-line-content">${escapeHtml(line.text)}</span></div>`;
-          }
-        }
+        html += renderDiffHtml(file);
       }
     }
     resultDiv.innerHTML = html;
@@ -1276,6 +1352,53 @@ window.gitStageFile = async function(path) { try { await tauriInvoke("git_stage_
 window.gitUnstageFile = async function(path) { try { await tauriInvoke("git_unstage_file", { filePath: path }); await refreshGitAll(); } catch (e) { alert("Unstage failed: " + e); } };
 window.gitCommit = async function() { const msg = document.getElementById("commit-msg")?.value?.trim(); if (!msg) { alert("Enter a commit message"); return; } try { await tauriInvoke("git_commit", { message: msg }); await refreshGitAll(); } catch (e) { alert("Commit failed: " + e); } };
 window.gitCheckout = async function(branch) { if (!confirm(`Checkout branch "${branch}"?`)) return; try { await tauriInvoke("git_checkout", { branch }); await refreshGitAll(); } catch (e) { alert("Checkout failed: " + e); } };
+
+// ── Context menu actions for files in Changes ──────────────────────────────
+window.gitDiscardFile = async function(path) {
+  if (!confirm(`Discard changes to "${path}"? This cannot be undone.`)) return;
+  try { await tauriInvoke("git_discard_file", { filePath: path }); await refreshGitAll(); }
+  catch (e) { alert("Discard failed: " + e); }
+};
+window.gitRemoveUntracked = async function(path) {
+  if (!confirm(`Delete untracked file "${path}"? This cannot be undone.`)) return;
+  try { await tauriInvoke("git_remove_untracked", { filePath: path }); await refreshGitAll(); }
+  catch (e) { alert("Remove failed: " + e); }
+};
+
+// Right-click context menu on file entries in Changes.
+gitChanges.addEventListener("contextmenu", (e) => {
+  const block = e.target.closest(".git-file-diff-block");
+  if (!block) return;
+  e.preventDefault();
+  const path = block.dataset.path;
+  const section = block.dataset.section;
+  const status = block.dataset.status;
+  const items = [];
+  // View diff (expand inline).
+  items.push({ label: "View diff", action: "view-diff" });
+  items.push({ separator: true });
+  if (section === "staged") {
+    items.push({ label: "Unstage file", action: "unstage" });
+  } else if (section === "changes") {
+    items.push({ label: "Stage file", action: "stage" });
+    items.push({ separator: true });
+    items.push({ label: "Discard changes", action: "discard", danger: true });
+  } else if (section === "untracked") {
+    items.push({ label: "Stage file", action: "stage" });
+    items.push({ separator: true });
+    items.push({ label: "Delete file", action: "delete", danger: true });
+  }
+  contextMenuHandlers["view-diff"] = () => {
+    const header = block.querySelector(".git-file-diff-header");
+    if (header.classList.contains("expanded")) return;
+    window.gitToggleFileDiff(header);
+  };
+  contextMenuHandlers["stage"] = () => window.gitStageFile(path);
+  contextMenuHandlers["unstage"] = () => window.gitUnstageFile(path);
+  contextMenuHandlers["discard"] = () => window.gitDiscardFile(path);
+  contextMenuHandlers["delete"] = () => window.gitRemoveUntracked(path);
+  showContextMenu(e.clientX, e.clientY, items);
+});
 
 document.querySelectorAll(".git-tab").forEach(btn => {
   btn.addEventListener("click", () => {
@@ -1406,9 +1529,74 @@ btnCodeblock.addEventListener("click", () => {
 btnGit.addEventListener("click", () => {
   gitPanelVisible = !gitPanelVisible;
   gitPanel.classList.toggle("hidden", !gitPanelVisible);
+  gitDivider.classList.toggle("hidden", !gitPanelVisible);
   btnGit.classList.toggle("active", gitPanelVisible);
   if (gitPanelVisible) refreshGitAll();
 });
+
+// ── Resizable divider between editor and git panel ─────────────────────────
+(function setupGitDivider() {
+  let dragging = false;
+  let startX = 0, startWidth = 0;
+  gitDivider.addEventListener("mousedown", (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startWidth = gitPanel.offsetWidth;
+    gitDivider.classList.add("dragging");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    // Git panel is on the right, so dragging left increases width.
+    const delta = startX - e.clientX;
+    let newWidth = startWidth + delta;
+    const maxWidth = window.innerWidth * 0.8;
+    const minWidth = 250;
+    if (newWidth > maxWidth) newWidth = maxWidth;
+    if (newWidth < minWidth) newWidth = minWidth;
+    gitPanel.style.width = newWidth + "px";
+  });
+  document.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    gitDivider.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  });
+})();
+
+// ── Context menu ───────────────────────────────────────────────────────────
+function showContextMenu(x, y, items) {
+  let html = "";
+  for (const item of items) {
+    if (item.separator) { html += '<div class="ctx-menu-separator"></div>'; continue; }
+    const cls = item.danger ? "ctx-menu-item danger" : "ctx-menu-item";
+    html += `<div class="${cls}" data-action="${escapeAttr(item.action)}">${escapeHtml(item.label)}</div>`;
+  }
+  contextMenu.innerHTML = html;
+  contextMenu.classList.remove("hidden");
+  // Position — keep within viewport.
+  const rect = contextMenu.getBoundingClientRect();
+  const maxX = window.innerWidth - rect.width - 4;
+  const maxY = window.innerHeight - rect.height - 4;
+  contextMenu.style.left = Math.min(x, maxX) + "px";
+  contextMenu.style.top = Math.min(y, maxY) + "px";
+  // Wire up clicks.
+  contextMenu.querySelectorAll(".ctx-menu-item").forEach(el => {
+    el.addEventListener("click", () => {
+      const action = el.dataset.action;
+      contextMenu.classList.add("hidden");
+      const handler = contextMenuHandlers[action];
+      if (handler) handler();
+    });
+  });
+}
+function hideContextMenu() { contextMenu.classList.add("hidden"); }
+document.addEventListener("click", () => hideContextMenu());
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideContextMenu(); });
+const contextMenuHandlers = {};
 
 selHeading.addEventListener("change", () => {
   const level = parseInt(selHeading.value, 10);

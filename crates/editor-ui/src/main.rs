@@ -637,6 +637,45 @@ fn git_diff(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitFileDiff>
     }).collect())
 }
 
+/// Get unified diff for a single file (working tree vs HEAD) with parsed hunks and lines.
+#[tauri::command]
+fn git_diff_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<GitFileDiff, String> {
+    let git = open_git_for_active(&state)?;
+    // Get the unified diff text for this file.
+    let text = git.exec_text(&["diff", "HEAD", "--", &file_path]).map_err(|e| e.to_string())?;
+    // If empty (no unstaged changes), try staged (index vs HEAD).
+    let text = if text.trim().is_empty() {
+        git.exec_text(&["diff", "--cached", "HEAD", "--", &file_path]).map_err(|e| e.to_string())?
+    } else { text };
+    let hunks = parse_unified_diff(&text);
+    Ok(GitFileDiff { path: file_path, old_path: None, hunks })
+}
+
+/// Get unified diff for a single file between two commits.
+#[tauri::command]
+fn git_diff_file_commits(state: tauri::State<'_, Mutex<AppState>>, file_path: String, commit_a: String, commit_b: String) -> Result<GitFileDiff, String> {
+    let git = open_git_for_active(&state)?;
+    let text = git.exec_text(&["diff", &commit_a, &commit_b, "--", &file_path]).map_err(|e| e.to_string())?;
+    let hunks = parse_unified_diff(&text);
+    Ok(GitFileDiff { path: file_path, old_path: None, hunks })
+}
+
+/// Discard changes to a file (restore from HEAD). Equivalent to `git checkout -- <file>`.
+#[tauri::command]
+fn git_discard_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.exec_text(&["checkout", "--", &file_path]).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Remove an untracked file (delete from disk).
+#[tauri::command]
+fn git_remove_untracked(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.exec_text(&["clean", "-f", "--", &file_path]).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 /// Stage all changes.
 #[tauri::command]
 fn git_stage_all(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
@@ -1041,8 +1080,15 @@ fn git_head_commit(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, S
 #[tauri::command]
 fn git_read_file_at_revision(state: tauri::State<'_, Mutex<AppState>>, file_path: String, revision: String) -> Result<String, String> {
     let git = open_git_for_active(&state)?;
-    let bytes = editor_git::read_file_at_revision(&git, &file_path, &revision).map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    if revision.is_empty() {
+        // Read from working tree (for untracked files).
+        let full = git.work_dir().join(&file_path);
+        let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        let bytes = editor_git::read_file_at_revision(&git, &file_path, &revision).map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
 }
 
 /// Check if the active document has unsaved changes.
@@ -1168,6 +1214,83 @@ fn line_change_to_info(lc: &editor_diff::LineChange) -> GitDiffLine {
             text: String::from_utf8_lossy(bytes).to_string(),
         },
     }
+}
+
+/// Parse a unified diff text into hunks with line-level changes.
+/// Each hunk header: `@@ -old_start,old_count +new_start,new_count @@`
+/// Body lines: ` ` equal, `+` insert, `-` delete, `\` no-newline marker.
+fn parse_unified_diff(text: &str) -> Vec<GitHunkInfo> {
+    let mut hunks = Vec::new();
+    let mut current_hunk: Option<GitHunkInfo> = None;
+    let mut old_line: u32 = 0;
+    let mut new_line: u32 = 0;
+
+    for line in text.lines() {
+        if line.starts_with("@@ ") {
+            // Push previous hunk.
+            if let Some(h) = current_hunk.take() {
+                hunks.push(h);
+            }
+            // Parse: @@ -old_start,old_count +new_start,new_count @@
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // parts: ["@@", "-old_start,old_count", "+new_start,new_count", "@@"]
+            let old_part = parts.get(1).unwrap_or(&"").trim_start_matches('-');
+            let new_part = parts.get(2).unwrap_or(&"").trim_start_matches('+');
+            let old_start: u32 = old_part.split(',').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let new_start: u32 = new_part.split(',').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            old_line = old_start;
+            new_line = new_start;
+            current_hunk = Some(GitHunkInfo { old_start, new_start, lines: Vec::new() });
+        } else if let Some(ref mut hunk) = current_hunk {
+            if line.starts_with("diff --git") || line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("index ") {
+                // File header — skip (we're parsing single file diff).
+                continue;
+            }
+            let bytes = line.as_bytes();
+            if bytes.is_empty() { continue; }
+            match bytes[0] {
+                b' ' => {
+                    let text_content = &line[1..];
+                    hunk.lines.push(GitDiffLine {
+                        kind: "equal".to_string(),
+                        old_no: Some(old_line),
+                        new_no: Some(new_line),
+                        text: text_content.to_string(),
+                    });
+                    old_line += 1;
+                    new_line += 1;
+                }
+                b'+' => {
+                    let text_content = &line[1..];
+                    hunk.lines.push(GitDiffLine {
+                        kind: "insert".to_string(),
+                        old_no: None,
+                        new_no: Some(new_line),
+                        text: text_content.to_string(),
+                    });
+                    new_line += 1;
+                }
+                b'-' => {
+                    let text_content = &line[1..];
+                    hunk.lines.push(GitDiffLine {
+                        kind: "delete".to_string(),
+                        old_no: Some(old_line),
+                        new_no: None,
+                        text: text_content.to_string(),
+                    });
+                    old_line += 1;
+                }
+                b'\\' => {
+                    // "\ No newline at end of file" — skip.
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(h) = current_hunk {
+        hunks.push(h);
+    }
+    hunks
 }
 
 // ── AST serialization for frontend rendering ────────────────────────────────
@@ -1352,6 +1475,10 @@ pub fn run() {
             git_checkout,
             git_file_history,
             git_log,
+            git_diff_file,
+            git_diff_file_commits,
+            git_discard_file,
+            git_remove_untracked,
             git_diff_commits,
             git_diff_vs_commit,
             git_log_detailed,
