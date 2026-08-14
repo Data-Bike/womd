@@ -24,6 +24,7 @@ let editingBlockIndex = -1;
 let suppressRender = false;
 let suppressBlur = false;  // prevent exitEditMode when clicking toolbar buttons
 let isTearOffWindow = false; // true for torn-off windows — show only their own tab
+let viewMode = "rendered"; // "rendered" | "source"
 
 // ── Settings state ─────────────────────────────────────────────────────────
 const SETTINGS_KEY = "womd_settings";
@@ -84,6 +85,7 @@ const btnHr = document.getElementById("btn-hr");
 const btnCodeblock = document.getElementById("btn-codeblock");
 const btnTask = document.getElementById("btn-task");
 const btnGit = document.getElementById("btn-git");
+const btnViewToggle = document.getElementById("btn-view-toggle");
 const selHeading = document.getElementById("sel-heading");
 const tabList = document.getElementById("tab-list");
 const tabNewBtn = document.getElementById("tab-new");
@@ -361,6 +363,17 @@ function scheduleAutosave() {
 function renderBlocks() {
   if (editingBlockIndex >= 0) return; // don't re-render while editing
   blockEditor.innerHTML = "";
+
+  // Source view mode — show raw Markdown.
+  if (viewMode === "source") {
+    blockEditor.classList.add("source-view");
+    const pre = document.createElement("div");
+    pre.className = "md-source-view";
+    pre.textContent = currentText;
+    blockEditor.appendChild(pre);
+    return;
+  }
+  blockEditor.classList.remove("source-view");
 
   if (syntaxBlocks.length === 0) {
     const empty = document.createElement("div");
@@ -1700,6 +1713,16 @@ btnGit.addEventListener("click", () => {
   if (gitPanelVisible) refreshGitAll();
 });
 
+// ── View toggle: rendered Markdown ↔ raw source ────────────────────────────
+function toggleViewMode() {
+  if (editingBlockIndex >= 0) exitEditMode();
+  viewMode = viewMode === "rendered" ? "source" : "rendered";
+  btnViewToggle.classList.toggle("active", viewMode === "source");
+  renderBlocks();
+}
+
+btnViewToggle.addEventListener("click", toggleViewMode);
+
 // ── Resizable divider between editor and git panel ─────────────────────────
 (function setupGitDivider() {
   let dragging = false;
@@ -1846,6 +1869,12 @@ blockEditor.addEventListener("click", (e) => {
 // Keyboard shortcuts.
 document.addEventListener("keydown", (e) => {
   if (e.ctrlKey || e.metaKey) {
+    // Ctrl+Shift+M — toggle Markdown source view.
+    if (e.shiftKey && (e.key === "M" || e.key === "m")) {
+      e.preventDefault();
+      toggleViewMode();
+      return;
+    }
     switch (e.key) {
       case "n": e.preventDefault(); newDocument(); break;
       case "o": e.preventDefault(); btnOpen.click(); break;

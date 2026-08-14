@@ -496,6 +496,17 @@ body {
 #btn-settings { background: transparent; border: none; color: var(--fg-muted); font-size: 16px; cursor: pointer; padding: 2px 8px; border-radius: 4px; }
 #btn-settings:hover { background: var(--bg-tab); color: var(--fg); }
 
+/* ═══ View toggle button ═══ */
+#btn-view-toggle { background: transparent; border: 1px solid var(--border); color: var(--fg-muted); font-size: 11px; font-weight: 600; font-family: monospace; cursor: pointer; padding: 2px 8px; border-radius: 4px; letter-spacing: 0.5px; }
+#btn-view-toggle:hover { background: var(--bg-tab); color: var(--fg); }
+#btn-view-toggle.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+
+/* ═══ Markdown source view ═══ */
+#block-editor.source-view { font-family: "Cascadia Code", "Fira Code", "Consolas", monospace; font-size: 13px; line-height: 1.6; }
+#block-editor.source-view .md-source-view { white-space: pre-wrap; word-break: break-word; color: var(--syn-plain); padding: 4px 0; }
+#block-editor.source-view .md-block { cursor: text; }
+#block-editor.source-view .empty-block { display: none; }
+
 /* ═══ Modal ═══ */
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 10001; display: flex; align-items: center; justify-content: center; }
 .modal-overlay.hidden { display: none; }
