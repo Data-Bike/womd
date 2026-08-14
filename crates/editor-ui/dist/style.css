@@ -579,6 +579,14 @@ body {
 .theme-card-swatches { display: flex; gap: 3px; }
 .theme-swatch { width: 16px; height: 16px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.2); }
 
+/* Language grid */
+.language-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.lang-card { border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; cursor: pointer; transition: border-color 0.15s; display: flex; align-items: center; gap: 8px; }
+.lang-card:hover { border-color: var(--accent); }
+.lang-card.selected { border-color: var(--accent); background: rgba(137, 180, 250, 0.08); }
+.lang-card-flag { font-size: 20px; }
+.lang-card-name { font-size: 13px; font-weight: 500; color: var(--fg); }
+
 /* ═══ Theme preview ═══ */
 .theme-preview { background: var(--bg-toolbar); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; }
 .theme-preview .pv-heading { color: var(--heading); font-weight: 700; font-size: 1.1em; margin-bottom: 4px; }

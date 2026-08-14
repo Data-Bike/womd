@@ -260,7 +260,7 @@ async function switchTab(tabId) {
 async function closeTab(tabId) {
   const tab = openTabs.find(t => t.id === tabId);
   if (tab && tab.is_dirty) {
-    if (!confirm(`"${tab.file_name}" has unsaved changes.\n\nClose anyway? Unsaved changes will be lost.`)) return;
+    if (!confirm(t("msg.close.unsaved", { name: tab.file_name }))) return;
   }
   flushEdits();
   const result = await tauriInvoke("close_tab", { tabId });
@@ -285,7 +285,7 @@ async function tearOffTab(tabId) {
   const tab = openTabs.find(t => t.id === tabId);
   if (!tab) return;
   if (!tab.file_path) {
-    alert("This tab has no file path — save it first before tearing off.");
+    alert(t("msg.no.filepath"));
     return;
   }
   try {
@@ -309,7 +309,7 @@ async function tearOffTab(tabId) {
       });
       webview.once("tauri://error", (e) => {
         console.error("Window creation error:", e);
-        alert("Could not create new window: " + e);
+        alert(t("msg.new.window.fail", { err: e }));
       });
     } else {
       // Fallback: try backend command (if JS API not available).
@@ -320,7 +320,7 @@ async function tearOffTab(tabId) {
     }
   } catch (e) {
     console.error("tear-off failed:", e);
-    alert("Could not open new window: " + e);
+    alert(t("msg.open.window.fail", { err: e }));
   }
 }
 
@@ -331,7 +331,7 @@ async function sendReplace(start, end, newText) {
   currentText = r.text;
   isDirty = r.is_dirty;
   updateDirtyState();
-  blockCount.textContent = `${r.block_count} blocks`;
+  blockCount.textContent = `${r.block_count} ${t("status.blocks")}`;
   await refreshSyntax();
   refreshTabs();
   scheduleAutosave();
@@ -388,7 +388,7 @@ function renderBlocks() {
   if (syntaxBlocks.length === 0) {
     const empty = document.createElement("div");
     empty.className = "md-block empty-block";
-    empty.textContent = "Empty document — start typing or open a file.";
+    empty.textContent = t("msg.empty.doc");
     empty.addEventListener("click", () => {
       // Insert a new paragraph block.
       currentText += (currentText.length > 0 ? "\n\n" : "") + "";
@@ -998,7 +998,7 @@ function updateUI(info) {
   fileNameEl.textContent = info.file_name;
   isDirty = info.is_dirty;
   updateDirtyState();
-  blockCount.textContent = `${info.block_count} blocks`;
+  blockCount.textContent = `${info.block_count} ${t("status.blocks")}`;
   cursorPos.textContent = `Ln 1, Col 1`;
 }
 
@@ -1081,7 +1081,7 @@ async function refreshGitAll() {
 }
 
 async function refreshGitStatus() {
-  try { gitData.status = await tauriInvoke("get_git_status"); gitBranchInfo.textContent = gitData.status.branch ? `branch: ${gitData.status.branch}` : ""; renderGitChanges(); }
+  try { gitData.status = await tauriInvoke("get_git_status"); gitBranchInfo.textContent = gitData.status.branch ? `${t("git.branch")}: ${gitData.status.branch}` : ""; renderGitChanges(); }
   catch (e) { gitData.status = null; gitBranchInfo.textContent = ""; renderGitChanges(); }
 }
 
@@ -1104,33 +1104,33 @@ function statusLetter(s) { return { Modified: "M", Added: "A", Deleted: "D", Ren
 
 function renderGitChanges() {
   const s = gitData.status;
-  if (!s) { gitChanges.innerHTML = '<div class="git-section-title">No repository</div>'; return; }
+  if (!s) { gitChanges.innerHTML = `<div class="git-section-title">${t("git.no.repo")}</div>`; return; }
   let html = "";
   if (s.staged.length > 0) {
-    html += '<div class="git-section-title">Staged Changes</div>';
+    html += `<div class="git-section-title">${t("git.stage")}</div>`;
     for (const f of s.staged) {
       html += renderFileDiffEntry(f, "staged");
     }
   }
   if (s.changes.length > 0) {
-    html += '<div class="git-section-title">Changes</div>';
+    html += `<div class="git-section-title">${t("git.changes")}</div>`;
     for (const f of s.changes) {
       html += renderFileDiffEntry(f, "changes");
     }
   }
   if (s.untracked.length > 0) {
-    html += '<div class="git-section-title">Untracked</div>';
+    html += `<div class="git-section-title">${t("git.changes")}</div>`;
     for (const f of s.untracked) {
       html += renderFileDiffEntry(f, "untracked");
     }
   }
   if (s.staged.length > 0) {
-    html += '<div class="git-section-title">Commit</div>';
+    html += `<div class="git-section-title">${t("git.commit")}</div>`;
     html += '<input type="text" class="git-commit-input" id="commit-msg" placeholder="Commit message..." />';
-    html += '<button class="git-action-btn" onclick="gitCommit()">Commit staged changes</button>';
+    html += `<button class="git-action-btn" onclick="gitCommit()">${t("git.commit")}</button>`;
   }
   if (s.changes.length === 0 && s.staged.length === 0 && s.untracked.length === 0) {
-    html += '<div style="padding:16px;color:var(--fg-muted);text-align:center">No changes</div>';
+    html += `<div style="padding:16px;color:var(--fg-muted);text-align:center">${t("git.no.changes")}</div>`;
   }
   gitChanges.innerHTML = html;
 }
@@ -1162,7 +1162,7 @@ window.gitToggleFileDiff = async function(headerEl) {
   }
   headerEl.classList.add("expanded");
   inlineDiv.classList.remove("hidden");
-  inlineDiv.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">Loading diff...</div>';
+  inlineDiv.innerHTML = `<div style="padding:8px;color:var(--fg-muted)">${t("git.loading.diff")}</div>`;
   const filePath = block.dataset.path;
   const status = block.dataset.status;
   try {
@@ -1207,21 +1207,21 @@ function renderUntrackedDiff(content) {
 }
 
 function renderGitBranches() {
-  if (!gitData.branches || gitData.branches.length === 0) { gitBranches.innerHTML = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No branches</div>'; return; }
+  if (!gitData.branches || gitData.branches.length === 0) { gitBranches.innerHTML = `<div style="padding:16px;color:var(--fg-muted);text-align:center">${t("git.no.branches")}</div>`; return; }
   let html = '<div class="git-section-title">Branches</div>';
   html += '<div class="git-inline-form"><input type="text" id="new-branch-name" placeholder="New branch name..." /><button class="git-action-btn" onclick="gitCreateBranch()">Create</button></div>';
   for (const b of gitData.branches) {
-    const actions = b.is_current ? '' : `<div class="git-branch-actions"><button class="git-mini-btn" onclick="event.stopPropagation();gitCheckout('${escapeAttr(b.name)}')">Checkout</button><button class="git-mini-btn" onclick="event.stopPropagation();gitMergeBranch('${escapeAttr(b.name)}')">Merge</button><button class="git-mini-btn" onclick="event.stopPropagation();gitRebaseBranch('${escapeAttr(b.name)}')">Rebase</button><button class="git-mini-btn git-mini-danger" onclick="event.stopPropagation();gitDeleteBranch('${escapeAttr(b.name)}')">Delete</button></div>`;
+    const actions = b.is_current ? '' : `<div class="git-branch-actions"><button class="git-mini-btn" onclick="event.stopPropagation();gitCheckout('${escapeAttr(b.name)}')">${t("git.checkout")}</button><button class="git-mini-btn" onclick="event.stopPropagation();gitMergeBranch('${escapeAttr(b.name)}')">${t("git.merge")}</button><button class="git-mini-btn" onclick="event.stopPropagation();gitRebaseBranch('${escapeAttr(b.name)}')">${t("git.rebase")}</button><button class="git-mini-btn git-mini-danger" onclick="event.stopPropagation();gitDeleteBranch('${escapeAttr(b.name)}')">${t("git.delete.branch")}</button></div>`;
     html += `<div class="git-branch-entry ${b.is_current ? 'current' : ''}"><div class="git-branch-row" onclick="gitCheckout('${escapeAttr(b.name)}')"><span class="git-branch-icon">${b.is_current ? '●' : '○'}</span><span class="git-branch-name">${escapeHtml(b.name)}</span>${b.ahead > 0 ? `<span class="git-branch-ahead">↓${b.ahead}</span>` : ''}${b.behind > 0 ? `<span class="git-branch-behind">↑${b.behind}</span>` : ''}</div>${actions}</div>`;
   }
   gitBranches.innerHTML = html;
 }
 
 function renderGitHistory() {
-  if (!gitData.log || gitData.log.length === 0) { gitHistory.innerHTML = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No commits</div>'; return; }
+  if (!gitData.log || gitData.log.length === 0) { gitHistory.innerHTML = `<div style="padding:16px;color:var(--fg-muted);text-align:center">${t("git.no.commits")}</div>`; return; }
   let html = '<div class="git-section-title">Commit History</div>';
   for (const c of gitData.log) {
-    html += `<div class="git-commit-entry"><div class="git-commit-row"><div class="git-commit-sha">${escapeHtml(c.sha.substring(0, 8))}</div><div class="git-commit-msg">${escapeHtml(c.message)}</div><div class="git-commit-meta">${escapeHtml(c.author)} · ${escapeHtml(c.date)}</div></div><div class="git-commit-actions"><button class="git-mini-btn" onclick="event.stopPropagation();gitCherryPick('${escapeAttr(c.sha)}')">Cherry-pick</button><button class="git-mini-btn" onclick="event.stopPropagation();gitRevertCommit('${escapeAttr(c.sha)}')">Revert</button><button class="git-mini-btn" onclick="event.stopPropagation();gitResetSoft('${escapeAttr(c.sha)}')">Reset soft</button><button class="git-mini-btn git-mini-danger" onclick="event.stopPropagation();gitResetHard('${escapeAttr(c.sha)}')">Reset hard</button></div></div>`;
+    html += `<div class="git-commit-entry"><div class="git-commit-row"><div class="git-commit-sha">${escapeHtml(c.sha.substring(0, 8))}</div><div class="git-commit-msg">${escapeHtml(c.message)}</div><div class="git-commit-meta">${escapeHtml(c.author)} · ${escapeHtml(c.date)}</div></div><div class="git-commit-actions"><button class="git-mini-btn" onclick="event.stopPropagation();gitCherryPick('${escapeAttr(c.sha)}')">${t("git.cherry.pick")}</button><button class="git-mini-btn" onclick="event.stopPropagation();gitRevertCommit('${escapeAttr(c.sha)}')">${t("git.revert")}</button><button class="git-mini-btn" onclick="event.stopPropagation();gitResetSoft('${escapeAttr(c.sha)}')">${t("git.reset.soft")}</button><button class="git-mini-btn git-mini-danger" onclick="event.stopPropagation();gitResetHard('${escapeAttr(c.sha)}')">${t("git.reset.hard")}</button></div></div>`;
   }
   gitHistory.innerHTML = html;
 }
@@ -1233,7 +1233,7 @@ function renderGitDiff() {
   if (!gitData.diff || gitData.diff.length === 0) {
     // Only overwrite if the diff viewer form hasn't been rendered yet.
     if (!document.getElementById("diff-mode-select")) {
-      gitDiff.innerHTML = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No changes</div>';
+      gitDiff.innerHTML = `<div style="padding:16px;color:var(--fg-muted);text-align:center">${t("git.no.changes")}</div>`;
     }
     return;
   }
@@ -1265,14 +1265,14 @@ async function refreshGitRemotes() {
 }
 
 function renderGitStash() {
-  let html = '<div class="git-section-title">Stash</div>';
+  let html = `<div class="git-section-title">${t("git.stash")}</div>`;
   html += '<button class="git-action-btn" onclick="gitStashPush()">Stash current changes</button>';
   const stash = gitData.stash || [];
   if (stash.length === 0) {
     html += '<div style="padding:16px;color:var(--fg-muted);text-align:center">No stashed changes</div>';
   } else {
     for (const s of stash) {
-      html += `<div class="git-stash-entry"><div class="git-stash-info"><span class="git-stash-idx">stash@{${s.index}}</span><span class="git-stash-msg">${escapeHtml(s.message)}</span></div><div class="git-stash-actions"><button class="git-mini-btn" onclick="gitStashApply(${s.index})">Apply</button><button class="git-mini-btn" onclick="gitStashPop(${s.index})">Pop</button><button class="git-mini-btn git-mini-danger" onclick="gitStashDrop(${s.index})">Drop</button></div></div>`;
+      html += `<div class="git-stash-entry"><div class="git-stash-info"><span class="git-stash-idx">stash@{${s.index}}</span><span class="git-stash-msg">${escapeHtml(s.message)}</span></div><div class="git-stash-actions"><button class="git-mini-btn" onclick="gitStashApply(${s.index})">${t("git.stash.apply")}</button><button class="git-mini-btn" onclick="gitStashPop(${s.index})">${t("git.stash.pop")}</button><button class="git-mini-btn git-mini-danger" onclick="gitStashDrop(${s.index})">${t("git.stash.drop")}</button></div></div>`;
     }
   }
   gitStash.innerHTML = html;
@@ -1285,8 +1285,8 @@ function renderGitTags() {
   if (tags.length === 0) {
     html += '<div style="padding:16px;color:var(--fg-muted);text-align:center">No tags</div>';
   } else {
-    for (const t of tags) {
-      html += `<div class="git-tag-entry"><span class="git-tag-icon">🏷</span><span class="git-tag-name">${escapeHtml(t.name)}</span><span class="git-tag-target">${escapeHtml(t.target)}</span>${t.message ? `<span class="git-tag-msg">${escapeHtml(t.message)}</span>` : ''}<button class="git-mini-btn git-mini-danger" onclick="gitDeleteTag('${escapeAttr(t.name)}')">Delete</button></div>`;
+    for (const tag of tags) {
+      html += `<div class="git-tag-entry"><span class="git-tag-icon">🏷</span><span class="git-tag-name">${escapeHtml(tag.name)}</span><span class="git-tag-target">${escapeHtml(tag.target)}</span>${tag.message ? `<span class="git-tag-msg">${escapeHtml(tag.message)}</span>` : ''}<button class="git-mini-btn git-mini-danger" onclick="gitDeleteTag('${escapeAttr(tag.name)}')">${t("git.delete.tag")}</button></div>`;
     }
   }
   gitTags.innerHTML = html;
@@ -1300,11 +1300,11 @@ function renderGitRemotes() {
     html += '<div style="padding:16px;color:var(--fg-muted);text-align:center">No remotes</div>';
   } else {
     for (const r of remotes) {
-      html += `<div class="git-remote-entry"><div class="git-remote-info"><span class="git-remote-name">${escapeHtml(r.name)}</span><span class="git-remote-url">${escapeHtml(r.fetch_url || r.url)}</span></div><div class="git-remote-actions"><button class="git-mini-btn" onclick="gitFetchRemote('${escapeAttr(r.name)}')">Fetch</button></div></div>`;
+      html += `<div class="git-remote-entry"><div class="git-remote-info"><span class="git-remote-name">${escapeHtml(r.name)}</span><span class="git-remote-url">${escapeHtml(r.fetch_url || r.url)}</span></div><div class="git-remote-actions"><button class="git-mini-btn" onclick="gitFetchRemote('${escapeAttr(r.name)}')">${t("git.fetch")}</button></div></div>`;
     }
   }
   html += '<div class="git-section-title" style="margin-top:12px">Push / Pull</div>';
-  html += '<div class="git-inline-form"><input type="text" id="push-remote-input" placeholder="remote" /><input type="text" id="push-branch-input" placeholder="branch" /><button class="git-action-btn" onclick="gitPushToRemote(false)">Push</button><button class="git-action-btn git-mini-danger" onclick="gitPushToRemote(true)">Force</button><button class="git-action-btn" onclick="gitPullFromRemote()">Pull</button></div>';
+  html += `<div class="git-inline-form"><input type="text" id="push-remote-input" placeholder="remote" /><input type="text" id="push-branch-input" placeholder="branch" /><button class="git-action-btn" onclick="gitPushToRemote(false)">${t("git.push")}</button><button class="git-action-btn git-mini-danger" onclick="gitPushToRemote(true)">Force</button><button class="git-action-btn" onclick="gitPullFromRemote()">${t("git.pull")}</button></div>`;
   gitRemotes.innerHTML = html;
 }
 
@@ -1372,7 +1372,7 @@ async function updateDiffCurrentFileName() {
       span.textContent = "→ " + base;
       span.title = path;
     } else {
-      span.textContent = "→ (unsaved)";
+      span.textContent = "→ " + t("git.unsaved");
     }
   } catch {
     span.textContent = "";
@@ -1461,7 +1461,7 @@ window.gitShowDiff = async function() {
     }
   }
 
-  resultDiv.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">Loading diff...</div>';
+  resultDiv.innerHTML = `<div style="padding:8px;color:var(--fg-muted)">${t("git.loading.diff")}</div>`;
   try {
     let diffs;
     if (mode === "wt-vs-commit") {
@@ -1562,18 +1562,18 @@ gitChanges.addEventListener("contextmenu", (e) => {
   const status = block.dataset.status;
   const items = [];
   // View diff (expand inline).
-  items.push({ label: "View diff", action: "view-diff" });
+  items.push({ label: t("git.diff"), action: "view-diff" });
   items.push({ separator: true });
   if (section === "staged") {
-    items.push({ label: "Unstage file", action: "unstage" });
+    items.push({ label: t("git.unstage"), action: "unstage" });
   } else if (section === "changes") {
-    items.push({ label: "Stage file", action: "stage" });
+    items.push({ label: t("git.stage"), action: "stage" });
     items.push({ separator: true });
-    items.push({ label: "Discard changes", action: "discard", danger: true });
+    items.push({ label: t("git.reset.hard"), action: "discard", danger: true });
   } else if (section === "untracked") {
-    items.push({ label: "Stage file", action: "stage" });
+    items.push({ label: t("git.stage"), action: "stage" });
     items.push({ separator: true });
-    items.push({ label: "Delete file", action: "delete", danger: true });
+    items.push({ label: t("fc.delete"), action: "delete", danger: true });
   }
   contextMenuHandlers["view-diff"] = () => {
     const header = block.querySelector(".git-file-diff-header");
@@ -1822,7 +1822,7 @@ blockEditor.addEventListener("click", (e) => {
   // External links (http, https, mailto, etc.)
   if (/^(https?:|mailto:|ftp:|tel:)/i.test(href)) {
     // Ask user for confirmation before opening external link.
-    const confirmed = confirm(`Open external link?\n\n${href}\n\nThis will open in your default browser.`);
+    const confirmed = confirm(t("msg.external.link", { url: href }));
     if (!confirmed) return;
     // Use tauri-plugin-opener to open in default browser.
     const tauri = window.__TAURI__;
@@ -1867,7 +1867,7 @@ async function openRelativeFile(relativePath) {
     await refreshTabs();
     refreshGitAll();
   } catch (e) {
-    alert("Could not open file: " + relativePath + "\n\n" + e);
+    alert(t("msg.open.fail", { path: relativePath, err: e }));
   }
 }
 
@@ -1961,7 +1961,7 @@ document.getElementById("btn-tree-open-folder").addEventListener("click", async 
       const selected = await tauri.dialog.open({ directory: true });
       if (selected) setFileTreeRoot(selected);
     }
-  } catch (e) { alert("Could not open folder: " + e); }
+  } catch (e) { alert(t("msg.open.fail", { path: "", err: e })); }
 });
 
 /// Go to parent directory.
@@ -1976,15 +1976,15 @@ document.getElementById("btn-tree-up").addEventListener("click", async () => {
 /// Refresh the file tree content.
 async function refreshFileTree() {
   if (!fileTreeRoot) {
-    fileTreeContent.innerHTML = '<div class="file-tree-empty">No folder open.<br>Click 📂 to open a folder.</div>';
+    fileTreeContent.innerHTML = `<div class="file-tree-empty">${t("ft.empty")}</div>`;
     return;
   }
   const filter = fileTreeFilter.value.trim().toLowerCase();
-  fileTreeContent.innerHTML = '<div class="file-tree-empty">Loading...</div>';
+  fileTreeContent.innerHTML = `<div class="file-tree-empty">${t("ft.loading")}</div>`;
   try {
     await renderFileTreeLevel(fileTreeRoot, fileTreeContent, 0, filter);
     if (fileTreeContent.children.length === 0) {
-      fileTreeContent.innerHTML = '<div class="file-tree-empty">No files found.</div>';
+      fileTreeContent.innerHTML = `<div class="file-tree-empty">${t("ft.no.files")}</div>`;
     }
   } catch (e) {
     fileTreeContent.innerHTML = `<div class="file-tree-empty">Error: ${escapeHtml(String(e))}</div>`;
@@ -2095,7 +2095,7 @@ async function openFileFromTree(filePath) {
     await refreshTabs();
     refreshGitAll();
   } catch (e) {
-    alert("Could not open file: " + filePath + "\n\n" + e);
+    alert(t("msg.open.fail", { path: filePath, err: e }));
   }
 }
 
@@ -2108,14 +2108,14 @@ window.setAsRoot = function(dirPath) {
 function showFileContextMenu(x, y, entry) {
   fileContextMenu.innerHTML = "";
   const items = [
-    { label: "Open", action: () => { if (entry.is_dir) setFileTreeRoot(entry.path); else openFileFromTree(entry.path); } },
-    ...(entry.is_dir ? [{ label: "Set as root folder", action: () => setFileTreeRoot(entry.path) }] : []),
+    { label: t("fc.open"), action: () => { if (entry.is_dir) setFileTreeRoot(entry.path); else openFileFromTree(entry.path); } },
+    ...(entry.is_dir ? [{ label: t("fc.set.root"), action: () => setFileTreeRoot(entry.path) }] : []),
     { separator: true },
-    { label: "Copy", action: () => { fileTreeClipboard = { path: entry.path, isDir: entry.isDir, operation: "copy" }; } },
-    { label: "Cut", action: () => { fileTreeClipboard = { path: entry.path, isDir: entry.isDir, operation: "cut" }; } },
+    { label: t("fc.copy"), action: () => { fileTreeClipboard = { path: entry.path, isDir: entry.isDir, operation: "copy" }; } },
+    { label: t("fc.cut"), action: () => { fileTreeClipboard = { path: entry.path, isDir: entry.isDir, operation: "cut" }; } },
     { separator: true },
-    { label: "Rename...", action: () => renameFileEntry(entry) },
-    { label: "Delete...", danger: true, action: () => deleteFileEntry(entry) },
+    { label: t("fc.rename"), action: () => renameFileEntry(entry) },
+    { label: t("fc.delete"), danger: true, action: () => deleteFileEntry(entry) },
   ];
   for (const item of items) {
     if (item.separator) {
@@ -2140,7 +2140,7 @@ function showFileContextMenu(x, y, entry) {
     fileContextMenu.appendChild(sep);
     const pasteEl = document.createElement("div");
     pasteEl.className = "fc-menu-item";
-    pasteEl.textContent = `Paste (${fileTreeClipboard.operation})`;
+    pasteEl.textContent = `${t("fc.paste")} (${fileTreeClipboard.operation})`;
     pasteEl.addEventListener("click", () => {
       fileContextMenu.classList.add("hidden");
       pasteFileEntry(entry);
@@ -2158,19 +2158,19 @@ document.addEventListener("click", () => fileContextMenu.classList.add("hidden")
 /// Delete a file or directory with confirmation.
 async function deleteFileEntry(entry) {
   const typeStr = entry.isDir ? "folder" : "file";
-  const msg = `Are you sure you want to delete this ${typeStr}?\n\n${entry.name}\n\nThis action cannot be undone.`;
+  const msg = t("msg.delete.confirm", { type: typeStr, name: entry.name });
   if (!confirm(msg)) return;
   try {
     await tauriInvoke("delete_file", { path: entry.path });
     refreshFileTree();
   } catch (e) {
-    alert("Delete failed: " + e);
+    alert(t("msg.delete.fail", { err: e }));
   }
 }
 
 /// Rename a file or directory.
 async function renameFileEntry(entry) {
-  const newName = prompt(`Rename "${entry.name}" to:`, entry.name);
+  const newName = prompt(t("msg.rename.prompt", { name: entry.name }), entry.name);
   if (!newName || newName === entry.name) return;
   const parent = entry.path.substring(0, entry.path.lastIndexOf(/[/\\]/.test(entry.path) ? (entry.path.includes("\\") ? "\\" : "/") : "/"));
   const dest = parent + (entry.path.includes("\\") ? "\\" : "/") + newName;
@@ -2178,7 +2178,7 @@ async function renameFileEntry(entry) {
     await tauriInvoke("move_file", { srcPath: entry.path, destPath: dest });
     refreshFileTree();
   } catch (e) {
-    alert("Rename failed: " + e);
+    alert(t("msg.rename.fail", { err: e }));
   }
 }
 
@@ -2189,7 +2189,7 @@ async function pasteFileEntry(targetEntry) {
   const srcName = fileTreeClipboard.path.split(/[\\/]/).filter(Boolean).pop();
   const destPath = targetDir + (targetDir.includes("\\") ? "\\" : "/") + srcName;
   if (fileTreeClipboard.path === destPath) {
-    alert("Source and destination are the same.");
+    alert(t("msg.paste.same"));
     return;
   }
   try {
@@ -2201,7 +2201,7 @@ async function pasteFileEntry(targetEntry) {
     }
     refreshFileTree();
   } catch (e) {
-    alert("Paste failed: " + e);
+    alert(t("msg.paste.fail", { err: e }));
   }
 }
 
@@ -2243,6 +2243,13 @@ function waitForTauri(maxRetries) {
 
 async function init() {
   try {
+    // Load saved language preference.
+    try {
+      const savedLang = localStorage.getItem("womd_lang");
+      if (savedLang && I18N_STRINGS[savedLang]) currentLang = savedLang;
+    } catch {}
+    applyI18n();
+
     await waitForTauri(50);
     // Check if this is a torn-off window — look for a file path in localStorage.
     // The parent window stores it with key "tear_off_<label>" before creating this window.
@@ -2286,7 +2293,7 @@ async function init() {
     }
   } catch (e) {
     console.error("init failed:", e);
-    blockEditor.innerHTML = '<div style="padding:24px;color:#f38ba8;font-family:monospace"><h2>Failed to initialize</h2><p>' + escapeHtml(e.message) + '</p></div>';
+    blockEditor.innerHTML = `<div style="padding:24px;color:#f38ba8;font-family:monospace"><h2>${t("msg.init.fail")}</h2><p>${escapeHtml(e.message)}</p></div>`;
   }
 }
 
@@ -2302,7 +2309,7 @@ async function openDocument(path) {
     refreshGitAll();
   } catch (e) {
     console.error("openDocument failed:", e);
-    alert("Could not open file: " + path + "\n\n" + e);
+    alert(t("msg.open.fail", { path: path, err: e }));
     await newDocument();
   }
 }
@@ -2341,8 +2348,35 @@ document.querySelectorAll(".settings-tab").forEach(btn => {
     document.querySelectorAll(".settings-panel").forEach(p => p.classList.add("hidden"));
     document.getElementById("settings-" + tabName).classList.remove("hidden");
     if (tabName === "github") refreshGithubStatus();
+    if (tabName === "language") renderLanguageGrid();
   });
 });
+
+/// Render the language selection grid.
+function renderLanguageGrid() {
+  const grid = document.getElementById("language-grid");
+  if (!grid) return;
+  let html = "";
+  for (const lang of I18N_LANGUAGES) {
+    const selected = currentLang === lang.code ? " selected" : "";
+    html += `<div class="lang-card${selected}" data-lang-code="${escapeAttr(lang.code)}" onclick="selectLanguage('${escapeAttr(lang.code)}')">
+      <span class="lang-card-flag">${lang.flag}</span>
+      <span class="lang-card-name">${escapeHtml(lang.name)}</span>
+    </div>`;
+  }
+  grid.innerHTML = html;
+}
+
+/// Select interface language.
+window.selectLanguage = function(code) {
+  setLanguage(code);
+  renderLanguageGrid();
+  // Re-render dynamic UI that uses t().
+  renderThemeGrid();
+  renderSyntaxGrid();
+  renderGitChanges();
+  refreshFileTree();
+};
 
 /// Render the interface theme grid.
 function renderThemeGrid() {

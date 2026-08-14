@@ -11,20 +11,20 @@
     <!-- Tab bar -->
     <div id="tab-bar">
       <div id="tab-list"></div>
-      <button id="tab-new" title="New tab">+</button>
+      <button id="tab-new" data-i18n-title="tb.new.tab">+</button>
     </div>
 
     <!-- Toolbar -->
     <div id="toolbar">
-      <button id="btn-new" title="New (Ctrl+N)">New</button>
-      <button id="btn-open" title="Open (Ctrl+O)">Open</button>
-      <button id="btn-save" title="Save (Ctrl+S)">Save</button>
+      <button id="btn-new" data-i18n="tb.new" data-i18n-title="tb.new">New</button>
+      <button id="btn-open" data-i18n="tb.open" data-i18n-title="tb.open">Open</button>
+      <button id="btn-save" data-i18n="tb.save" data-i18n-title="tb.save">Save</button>
       <span class="separator"></span>
-      <button id="btn-undo" title="Undo (Ctrl+Z)">Undo</button>
-      <button id="btn-redo" title="Redo (Ctrl+Y)">Redo</button>
+      <button id="btn-undo" data-i18n="tb.undo" data-i18n-title="tb.undo">Undo</button>
+      <button id="btn-redo" data-i18n="tb.redo" data-i18n-title="tb.redo">Redo</button>
       <span class="separator"></span>
-      <select id="sel-heading" title="Heading level">
-        <option value="0">Normal text</option>
+      <select id="sel-heading" data-i18n-title="tb.heading">
+        <option value="0" data-i18n-option="tb.heading.normal">Normal text</option>
         <option value="1">Heading 1</option>
         <option value="2">Heading 2</option>
         <option value="3">Heading 3</option>
@@ -33,30 +33,30 @@
         <option value="6">Heading 6</option>
       </select>
       <span class="separator"></span>
-      <button id="btn-bold" title="Bold (Ctrl+B)" style="font-weight:bold">B</button>
-      <button id="btn-italic" title="Italic (Ctrl+I)" style="font-style:italic">I</button>
-      <button id="btn-strike" title="Strikethrough" style="text-decoration:line-through">S</button>
-      <button id="btn-code" title="Inline code" style="font-family:monospace">&lt;/&gt;</button>
-      <button id="btn-link" title="Link (Ctrl+K)">Link</button>
+      <button id="btn-bold" data-i18n-title="tb.bold" style="font-weight:bold">B</button>
+      <button id="btn-italic" data-i18n-title="tb.italic" style="font-style:italic">I</button>
+      <button id="btn-strike" data-i18n-title="tb.strike" style="text-decoration:line-through">S</button>
+      <button id="btn-code" data-i18n-title="tb.code" style="font-family:monospace">&lt;/&gt;</button>
+      <button id="btn-link" data-i18n="tb.link" data-i18n-title="tb.link">Link</button>
       <span class="separator"></span>
-      <button id="btn-ul" title="Bullet list">• List</button>
-      <button id="btn-ol" title="Numbered list">1. List</button>
-      <button id="btn-quote" title="Block quote">❝</button>
-      <button id="btn-hr" title="Horizontal rule">―</button>
-      <button id="btn-codeblock" title="Code block">{ }</button>
+      <button id="btn-ul" data-i18n="tb.ul" data-i18n-title="tb.ul">• List</button>
+      <button id="btn-ol" data-i18n="tb.ol" data-i18n-title="tb.ol">1. List</button>
+      <button id="btn-quote" data-i18n-title="tb.quote">❝</button>
+      <button id="btn-hr" data-i18n-title="tb.hr">―</button>
+      <button id="btn-codeblock" data-i18n-title="tb.codeblock">{ }</button>
       <span class="separator"></span>
-      <button id="btn-task" title="Task list">☐</button>
+      <button id="btn-task" data-i18n-title="tb.task">☐</button>
       <span class="separator"></span>
-      <button id="btn-tree-toggle" title="Toggle file tree sidebar (Ctrl+Shift+E)">☰</button>
-      <button id="btn-view-toggle" title="Toggle Markdown source view (Ctrl+Shift+M)">MD</button>
-      <button id="btn-git" title="Toggle Git panel">Git</button>
+      <button id="btn-tree-toggle" data-i18n-title="tb.tree">☰</button>
+      <button id="btn-view-toggle" data-i18n-title="tb.view">MD</button>
+      <button id="btn-git" data-i18n="tb.git" data-i18n-title="tb.git">Git</button>
       <span class="separator"></span>
       <span id="file-name">untitled.md</span>
       <span id="dirty-indicator" class="dirty-dot"></span>
       <span class="spacer"></span>
       <span id="git-branch-info"></span>
       <span class="separator"></span>
-      <button id="btn-settings" title="Settings">⚙</button>
+      <button id="btn-settings" data-i18n-title="tb.settings">⚙</button>
     </div>
 
     <!-- Main area -->
@@ -64,16 +64,16 @@
       <!-- File tree sidebar -->
       <div id="file-tree-panel" class="hidden">
         <div id="file-tree-header">
-          <span id="file-tree-root-name">No folder open</span>
+          <span id="file-tree-root-name" data-i18n="ft.no.folder">No folder open</span>
           <div id="file-tree-actions">
-            <button id="btn-tree-open-folder" title="Open folder as root">📂</button>
-            <button id="btn-tree-set-root" title="Set selected folder as root">📁→</button>
-            <button id="btn-tree-up" title="Go to parent folder">↑</button>
-            <button id="btn-tree-close" title="Close sidebar">×</button>
+            <button id="btn-tree-open-folder" data-i18n-title="ft.open.folder">📂</button>
+            <button id="btn-tree-set-root" data-i18n-title="ft.set.root">📁→</button>
+            <button id="btn-tree-up" data-i18n-title="ft.parent">↑</button>
+            <button id="btn-tree-close" data-i18n-title="ft.close">×</button>
           </div>
         </div>
         <div id="file-tree-search">
-          <input type="text" id="file-tree-filter" placeholder="Filter files..." />
+          <input type="text" id="file-tree-filter" placeholder="Filter files..." data-i18n-placeholder="ft.filter" />
         </div>
         <div id="file-tree-content"></div>
       </div>
@@ -84,13 +84,13 @@
       <div id="git-divider" class="hidden"></div>
       <div id="git-panel" class="hidden">
         <div id="git-panel-tabs">
-          <button class="git-tab active" data-tab="changes">Changes</button>
-          <button class="git-tab" data-tab="branches">Branches</button>
-          <button class="git-tab" data-tab="history">History</button>
-          <button class="git-tab" data-tab="diff">Diff</button>
-          <button class="git-tab" data-tab="stash">Stash</button>
-          <button class="git-tab" data-tab="tags">Tags</button>
-          <button class="git-tab" data-tab="remotes">Remotes</button>
+          <button class="git-tab active" data-tab="changes" data-i18n="git.changes">Changes</button>
+          <button class="git-tab" data-tab="branches" data-i18n="git.branches">Branches</button>
+          <button class="git-tab" data-tab="history" data-i18n="git.history">History</button>
+          <button class="git-tab" data-tab="diff" data-i18n="git.diff">Diff</button>
+          <button class="git-tab" data-tab="stash" data-i18n="git.stash">Stash</button>
+          <button class="git-tab" data-tab="tags" data-i18n="git.tags">Tags</button>
+          <button class="git-tab" data-tab="remotes" data-i18n="git.remotes">Remotes</button>
         </div>
         <div id="git-panel-content">
           <div id="git-changes" class="git-section"></div>
@@ -114,35 +114,40 @@
     <div id="settings-modal" class="modal-overlay hidden">
       <div class="modal-dialog">
         <div class="modal-header">
-          <span class="modal-title">Settings</span>
-          <button id="settings-close" class="modal-close" title="Close">×</button>
+          <span class="modal-title" data-i18n="set.title">Settings</span>
+          <button id="settings-close" class="modal-close" data-i18n-title="set.close">×</button>
         </div>
         <div class="modal-body">
           <div class="settings-tabs">
-            <button class="settings-tab active" data-stab="themes">Themes</button>
-            <button class="settings-tab" data-stab="github">GitHub</button>
+            <button class="settings-tab active" data-stab="themes" data-i18n="set.themes">Themes</button>
+            <button class="settings-tab" data-stab="language" data-i18n="set.language">Language</button>
+            <button class="settings-tab" data-stab="github" data-i18n="set.github">GitHub</button>
           </div>
           <div id="settings-themes" class="settings-panel">
-            <div class="settings-section-title">Interface Theme</div>
+            <div class="settings-section-title" data-i18n="set.interface.theme">Interface Theme</div>
             <div id="theme-grid" class="theme-grid"></div>
-            <div class="settings-section-title" style="margin-top:16px">Code Syntax Palette</div>
+            <div class="settings-section-title" style="margin-top:16px" data-i18n="set.syntax.palette">Code Syntax Palette</div>
             <div id="syntax-grid" class="theme-grid"></div>
-            <div class="settings-section-title" style="margin-top:16px">Preview</div>
+            <div class="settings-section-title" style="margin-top:16px" data-i18n="set.preview">Preview</div>
             <div id="theme-preview" class="theme-preview"></div>
           </div>
+          <div id="settings-language" class="settings-panel hidden">
+            <div class="settings-section-title" data-i18n="set.language">Interface Language</div>
+            <div id="language-grid" class="language-grid"></div>
+          </div>
           <div id="settings-github" class="settings-panel hidden">
-            <div class="settings-section-title">GitHub Authentication</div>
+            <div class="settings-section-title" data-i18n="set.gh.auth">GitHub Authentication</div>
             <div id="github-auth-status" class="github-auth-status"></div>
             <div class="github-actions">
-              <button id="btn-gh-login" class="git-action-btn">Login with gh CLI</button>
-              <button id="btn-gh-refresh" class="git-action-btn">Refresh status</button>
-              <button id="btn-gh-logout" class="git-action-btn danger">Logout</button>
+              <button id="btn-gh-login" class="git-action-btn" data-i18n="set.gh.login">Login with gh CLI</button>
+              <button id="btn-gh-refresh" class="git-action-btn" data-i18n="set.gh.refresh">Refresh status</button>
+              <button id="btn-gh-logout" class="git-action-btn danger" data-i18n="set.gh.logout">Logout</button>
             </div>
-            <div class="settings-section-title" style="margin-top:16px">Repository</div>
+            <div class="settings-section-title" style="margin-top:16px" data-i18n="set.gh.repo">Repository</div>
             <div id="github-repo-info" class="github-repo-info"></div>
             <div class="github-actions">
-              <button id="btn-gh-prs" class="git-action-btn">Load Pull Requests</button>
-              <button id="btn-gh-branches" class="git-action-btn">Load Remote Branches</button>
+              <button id="btn-gh-prs" class="git-action-btn" data-i18n="set.gh.prs">Load Pull Requests</button>
+              <button id="btn-gh-branches" class="git-action-btn" data-i18n="set.gh.branches">Load Remote Branches</button>
             </div>
             <div id="github-prs" class="github-prs"></div>
             <div id="github-branches" class="github-branches"></div>
@@ -157,7 +162,7 @@
       <span class="spacer"></span>
       <span id="block-count">0 blocks</span>
       <span class="separator"></span>
-      <span id="autosave-status">Autosave: On</span>
+      <span id="autosave-status" data-i18n="status.autosave">Autosave: On</span>
       <span class="separator"></span>
       <span id="encoding">UTF-8</span>
       <span class="separator"></span>
@@ -165,6 +170,7 @@
     </div>
   </div>
 
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
