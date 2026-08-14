@@ -660,6 +660,15 @@ fn git_diff_file_commits(state: tauri::State<'_, Mutex<AppState>>, file_path: St
     Ok(GitFileDiff { path: file_path, old_path: None, hunks })
 }
 
+/// Get unified diff for a single file between working tree and a commit.
+#[tauri::command]
+fn git_diff_file_vs_commit(state: tauri::State<'_, Mutex<AppState>>, file_path: String, commit: String) -> Result<GitFileDiff, String> {
+    let git = open_git_for_active(&state)?;
+    let text = git.exec_text(&["diff", &commit, "--", &file_path]).map_err(|e| e.to_string())?;
+    let hunks = parse_unified_diff(&text);
+    Ok(GitFileDiff { path: file_path, old_path: None, hunks })
+}
+
 /// Discard changes to a file (restore from HEAD). Equivalent to `git checkout -- <file>`.
 #[tauri::command]
 fn git_discard_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
@@ -1477,6 +1486,7 @@ pub fn run() {
             git_log,
             git_diff_file,
             git_diff_file_commits,
+            git_diff_file_vs_commit,
             git_discard_file,
             git_remove_untracked,
             git_diff_commits,

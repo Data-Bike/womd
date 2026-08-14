@@ -1341,7 +1341,17 @@ window.gitShowDiff = async function() {
     } else {
       for (const file of diffs) {
         html += `<div class="diff-file-header">${escapeHtml(file.path)}</div>`;
-        html += renderDiffHtml(file);
+        // Fetch line-level diff for this specific file.
+        let fileDiff;
+        if (mode === "wt-vs-commit") {
+          const commit = document.getElementById("diff-commit-a").value;
+          fileDiff = await tauriInvoke("git_diff_file_vs_commit", { filePath: file.path, commit });
+        } else {
+          const a = document.getElementById("diff-commit-a").value;
+          const b = document.getElementById("diff-commit-b").value;
+          fileDiff = await tauriInvoke("git_diff_file_commits", { filePath: file.path, commitA: a, commitB: b });
+        }
+        html += renderDiffHtml(fileDiff);
       }
     }
     resultDiv.innerHTML = html;

@@ -259,6 +259,7 @@ body {
 .git-file-entry:hover { background: rgba(137, 180, 250, 0.08); }
 .git-file-entry.selected { background: rgba(137, 180, 250, 0.15); }
 .git-file-diff-inline { border-top: 1px solid var(--border); background: var(--bg); max-height: 400px; overflow-y: auto; }
+.git-file-diff-inline.hidden { display: none; }
 .git-file-diff-header { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: var(--bg-tab); cursor: pointer; font-size: 13px; user-select: none; }
 .git-file-diff-header:hover { background: rgba(137, 180, 250, 0.08); }
 .git-file-diff-header .chevron { transition: transform 0.15s; color: var(--fg-muted); }

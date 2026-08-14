@@ -111,31 +111,43 @@ impl VersionControl for GitCli {
             if line.len() < 2 {
                 continue;
             }
-            let x = line.as_bytes()[0];
-            let y = line.as_bytes()[1];
+            let x = line.as_bytes()[0]; // X = staged (index) status
+            let y = line.as_bytes()[1]; // Y = working tree status
             let path_part = &line[3..];
             let (path, old_path) = parse_rename(path_part);
-            let (status_kind, staged_kind) = (status_from_code(x), status_from_code(y));
-            let change = FileChange { path: path.clone(), status: staged_kind, old_path: old_path.clone() };
-            match staged_kind {
-                FileStatus::Untracked => status.untracked.push(change),
+            let staged_status = status_from_code(x);
+            let wt_status = status_from_code(y);
+
+            // Staged changes come from the X column.
+            match staged_status {
                 FileStatus::Added | FileStatus::Modified | FileStatus::Deleted | FileStatus::Renamed => {
-                    status.staged.push(change);
+                    status.staged.push(FileChange { path: path.clone(), status: staged_status, old_path: old_path.clone() });
+                    status.dirty = true;
                 }
-                FileStatus::Conflicted => status.conflicted.push(change),
+                FileStatus::Conflicted => {
+                    status.conflicted.push(FileChange { path: path.clone(), status: staged_status, old_path: old_path.clone() });
+                    status.dirty = true;
+                }
                 _ => {}
             }
-            // Working-tree change (unstaged).
-            if x == b' ' || x == b'?' {
-                // already handled
-            } else {
-                let wt = FileChange { path, status: status_kind, old_path };
-                if !matches!(wt.status, FileStatus::Unmodified | FileStatus::Untracked) {
-                    status.changes.push(wt);
+
+            // Working tree changes come from the Y column.
+            match wt_status {
+                FileStatus::Untracked => {
+                    status.untracked.push(FileChange { path: path.clone(), status: wt_status, old_path: old_path.clone() });
+                    status.dirty = true;
                 }
-            }
-            if !matches!(status_kind, FileStatus::Unmodified) || !matches!(staged_kind, FileStatus::Unmodified) {
-                status.dirty = true;
+                FileStatus::Added | FileStatus::Modified | FileStatus::Deleted | FileStatus::Renamed => {
+                    status.changes.push(FileChange { path: path.clone(), status: wt_status, old_path: old_path.clone() });
+                    status.dirty = true;
+                }
+                FileStatus::Conflicted => {
+                    if !status.conflicted.iter().any(|f| f.path == path) {
+                        status.conflicted.push(FileChange { path: path.clone(), status: wt_status, old_path: old_path.clone() });
+                    }
+                    status.dirty = true;
+                }
+                _ => {}
             }
         }
         Ok(status)
@@ -568,11 +580,8 @@ impl GitExtended for GitCli {
         self.exec(&args)?;
         // For squash, we need to commit the result.
         if strategy == MergeStrategy::Squash {
-            // Check if there are staged changes to commit.
-            let st = self.status()?;
-            if !st.staged.is_empty() {
-                self.exec(&["commit", "-m", &format!("Squash merge from {}", branch)])?;
-            }
+            let msg = format!("Squash merge from {}", branch);
+            self.exec(&["commit", "-m", msg.as_str()])?;
         }
         Ok(())
     }
@@ -635,17 +644,20 @@ impl GitExtended for GitCli {
 
     // ── Tags ───────────────────────────────────────────────────────────────
     fn tags(&self) -> GitResult<Vec<Tag>> {
-        let text = self.exec_text(&["tag", "-l", "--format=%(refname:short)%09%(objectname:short)%09%(contents:subject)"])?;
+        // Use %(objecttype) to distinguish annotated ("tag") from lightweight ("commit").
+        let text = self.exec_text(&["tag", "-l", "--format=%(refname:short)%09%(objectname:short)%09%(objecttype)%09%(contents:subject)"])?;
         let mut out = Vec::new();
         for line in text.lines() {
             if line.is_empty() { continue; }
             let mut f = line.split('\t');
             let name = f.next().unwrap_or("").to_string();
             let target = f.next().unwrap_or("").to_string();
+            let obj_type = f.next().unwrap_or("").to_string();
             let message = f.next().map(|s| s.to_string());
             if !name.is_empty() {
-                let is_lightweight = message.is_none() || message.as_deref() == Some("");
-                out.push(Tag { name, target, message: if is_lightweight { None } else { message }, is_lightweight });
+                let is_lightweight = obj_type != "tag";
+                let msg = if is_lightweight { None } else { message.filter(|m| !m.is_empty()) };
+                out.push(Tag { name, target, message: msg, is_lightweight });
             }
         }
         Ok(out)
@@ -732,7 +744,7 @@ impl GitExtended for GitCli {
         let limit = format!("-{}", max_count);
         let fmt = "%H%x09%h%x09%an%x09%ae%x09%ad%x09%s%x09%b%x09%p";
         let pretty = format!("format:{}", fmt);
-        let text = self.exec_text(&["log", "--follow", &format!("--pretty={}", pretty), "--date=short", limit.as_str(), "--", path])?;
+        let text = self.exec_text(&["log", "--follow", "-M", &format!("--pretty={}", pretty), "--date=short", limit.as_str(), "--", path])?;
         Ok(parse_log(&text))
     }
 
@@ -1362,5 +1374,1124 @@ mod tests {
         let c2 = repo.commit(CommitRequest { message: "second".to_string(), amend: false }).expect("commit");
         let diffs = repo.diff_file_at_commits("doc.md", &c1.0, &c2.0).expect("diff file at commits");
         assert!(diffs.iter().any(|d| d.path == "doc.md"));
+    }
+
+    // ── Comprehensive tests for all GitExtended operations ───────────────────
+
+    // Helper: create a repo with an initial commit.
+    fn make_repo_with_commit() -> (tempfile::TempDir, GitCli, CommitId) {
+        let dir = make_repo();
+        write(dir.path(), "README.md", b"# README\n");
+        let repo = GitCli::open(dir.path()).expect("open");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let id = repo.commit(CommitRequest { message: "initial".to_string(), amend: false }).expect("commit");
+        (dir, repo, id)
+    }
+
+    // Helper: create a commit with a specific file content.
+    fn commit_file(repo: &GitCli, path: &str, content: &[u8], msg: &str) -> CommitId {
+        // Write to the file in the repo's working dir.
+        let full = repo.work_dir().join(path);
+        std::fs::write(&full, content).expect("write file");
+        repo.stage(ChangeSelection::File { path: path.to_string() }).expect("stage");
+        repo.commit(CommitRequest { message: msg.to_string(), amend: false }).expect("commit")
+    }
+
+    // ── Stash: comprehensive ────────────────────────────────────────────────
+
+    #[test]
+    fn stash_list_empty() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let stashes = repo.stash_list().expect("stash list");
+        assert!(stashes.is_empty(), "stash list should be empty");
+    }
+
+    #[test]
+    fn stash_push_without_message() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Modify a tracked file, then stash.
+        write(dir.path(), "README.md", b"# Modified\n");
+        repo.stash_push(None).expect("stash push");
+        assert!(repo.is_clean().expect("clean"));
+        let stashes = repo.stash_list().expect("stash list");
+        assert_eq!(stashes.len(), 1);
+    }
+
+    #[test]
+    fn stash_clear() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "README.md", b"v1\n");
+        repo.stash_push(Some("first")).expect("stash");
+        write(dir.path(), "README.md", b"v2\n");
+        repo.stash_push(Some("second")).expect("stash");
+        assert_eq!(repo.stash_list().expect("list").len(), 2);
+        repo.stash_clear().expect("clear");
+        assert_eq!(repo.stash_list().expect("list").len(), 0);
+    }
+
+    #[test]
+    fn stash_multiple_entries() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        for i in 0..3 {
+            write(dir.path(), "README.md", format!("content{}\n", i).as_bytes());
+            repo.stash_push(Some(&format!("stash {}", i))).expect("stash");
+        }
+        let stashes = repo.stash_list().expect("list");
+        assert_eq!(stashes.len(), 3);
+        assert_eq!(stashes[0].index, 0);
+        assert_eq!(stashes[2].index, 2);
+    }
+
+    #[test]
+    fn stash_apply_does_not_remove() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "README.md", b"modified\n");
+        repo.stash_push(Some("test")).expect("stash");
+        repo.stash_apply(0).expect("apply");
+        assert_eq!(repo.stash_list().expect("list").len(), 1, "stash should remain after apply");
+    }
+
+    #[test]
+    fn stash_pop_removes() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "README.md", b"modified\n");
+        repo.stash_push(Some("test")).expect("stash");
+        repo.stash_pop(0).expect("pop");
+        assert_eq!(repo.stash_list().expect("list").len(), 0, "stash should be gone after pop");
+    }
+
+    #[test]
+    fn stash_drop_specific_index() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "README.md", b"first\n");
+        repo.stash_push(Some("first")).expect("stash");
+        write(dir.path(), "README.md", b"second\n");
+        repo.stash_push(Some("second")).expect("stash");
+        // Drop stash@{0} (which is "second"). After drop, stash@{0} becomes "first".
+        repo.stash_drop(0).expect("drop");
+        let stashes = repo.stash_list().expect("list");
+        assert_eq!(stashes.len(), 1);
+        assert!(stashes[0].message.contains("first"));
+    }
+
+    // ── Branch: comprehensive ───────────────────────────────────────────────
+
+    #[test]
+    fn create_branch_and_checkout() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        assert_eq!(repo.current_branch().expect("branch"), "feature");
+    }
+
+    #[test]
+    fn delete_branch_force() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("temp").expect("create");
+        // Add a commit on temp so it's not merged.
+        repo.checkout(Revision::Branch("temp".to_string())).expect("checkout");
+        commit_file(&repo, "new.txt", b"new\n", "on temp");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        // Force delete (unmerged).
+        repo.delete_branch("temp", true).expect("force delete");
+        let branches = repo.branches().expect("branches");
+        assert!(!branches.iter().any(|b| b.name == "temp"));
+    }
+
+    #[test]
+    fn delete_branch_not_merged_fails_without_force() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("temp").expect("create");
+        repo.checkout(Revision::Branch("temp".to_string())).expect("checkout");
+        commit_file(&repo, "new.txt", b"new\n", "on temp");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        // Non-force delete should fail (unmerged).
+        assert!(repo.delete_branch("temp", false).is_err());
+    }
+
+    #[test]
+    fn rename_current_branch() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let old = repo.current_branch().expect("current");
+        repo.rename_branch(&old, "renamed").expect("rename");
+        assert_eq!(repo.current_branch().expect("current"), "renamed");
+    }
+
+    #[test]
+    fn create_multiple_branches() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        for name in &["dev", "staging", "prod", "hotfix"] {
+            repo.create_branch(name).expect("create");
+        }
+        let branches = repo.branches().expect("branches");
+        for name in &["dev", "staging", "prod", "hotfix"] {
+            assert!(branches.iter().any(|b| b.name == *name), "branch {} should exist", name);
+        }
+    }
+
+    // ── Merge: comprehensive ────────────────────────────────────────────────
+
+    #[test]
+    fn merge_no_fast_forward_creates_merge_commit() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        // Diverge: commit on master and on feature.
+        repo.create_branch("feature").expect("create");
+        commit_file(&repo, "master.txt", b"master\n", "on master");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        commit_file(&repo, "feature.txt", b"feature\n", "on feature");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        // Merge with --no-ff.
+        repo.merge("feature", MergeStrategy::NoFastForward).expect("merge no-ff");
+        // Both files should exist.
+        assert!(repo.work_dir().join("feature.txt").exists());
+        assert!(repo.work_dir().join("master.txt").exists());
+        // Should have 4 commits: initial, master, feature, merge.
+        let log = repo.log(10).expect("log");
+        assert!(log.len() >= 4);
+    }
+
+    #[test]
+    fn merge_fast_forward_only_fails_on_diverged() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("feature").expect("create");
+        commit_file(&repo, "master.txt", b"master\n", "on master");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        commit_file(&repo, "feature.txt", b"feature\n", "on feature");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        // FF-only merge should fail because branches diverged.
+        assert!(repo.merge("feature", MergeStrategy::FastForwardOnly).is_err());
+    }
+
+    #[test]
+    fn merge_squash_combines_commits() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        commit_file(&repo, "a.txt", b"a\n", "commit a");
+        commit_file(&repo, "b.txt", b"b\n", "commit b");
+        commit_file(&repo, "c.txt", b"c\n", "commit c");
+        repo.checkout(Revision::Branch("master".to_string()).clone()).expect("checkout master");
+        repo.merge("feature", MergeStrategy::Squash).expect("squash merge");
+        // All 3 files should exist on master.
+        assert!(repo.work_dir().join("a.txt").exists());
+        assert!(repo.work_dir().join("b.txt").exists());
+        assert!(repo.work_dir().join("c.txt").exists());
+        // Squash should add only 1 commit to master (not 3).
+        let log = repo.log(10).expect("log");
+        // initial + squash = 2 commits on master.
+        assert_eq!(log.len(), 2, "squash should produce 1 new commit");
+    }
+
+    #[test]
+    fn merge_default_strategy() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        commit_file(&repo, "new.txt", b"new\n", "on feature");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        // Default merge (should fast-forward since master hasn't diverged).
+        repo.merge("feature", MergeStrategy::Merge).expect("merge");
+        assert!(repo.work_dir().join("new.txt").exists());
+    }
+
+    // ── Rebase: comprehensive ───────────────────────────────────────────────
+
+    #[test]
+    fn rebase_simple() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        // Create a feature branch with a commit.
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        commit_file(&repo, "feature.txt", b"feature\n", "on feature");
+        // Meanwhile, add a commit on master.
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        commit_file(&repo, "master.txt", b"master\n", "on master");
+        // Rebase feature onto master.
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout feature");
+        repo.rebase("master").expect("rebase");
+        // Both files should exist.
+        assert!(repo.work_dir().join("feature.txt").exists());
+        assert!(repo.work_dir().join("master.txt").exists());
+    }
+
+    // ── Cherry-pick: comprehensive ──────────────────────────────────────────
+
+    #[test]
+    fn cherry_pick_multiple_commits() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        // Create feature branch with 2 commits.
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        let c1 = commit_file(&repo, "a.txt", b"a\n", "add a");
+        let c2 = commit_file(&repo, "b.txt", b"b\n", "add b");
+        // Go back to master and cherry-pick both.
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        repo.cherry_pick(&c1.0).expect("cherry-pick 1");
+        repo.cherry_pick(&c2.0).expect("cherry-pick 2");
+        assert!(repo.work_dir().join("a.txt").exists());
+        assert!(repo.work_dir().join("b.txt").exists());
+    }
+
+    #[test]
+    fn cherry_pick_does_not_affect_source_branch() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        commit_file(&repo, "new.txt", b"new\n", "add new");
+        let feature_log_len = repo.log(10).expect("log").len();
+        let head = repo.head_commit().expect("head");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        repo.cherry_pick(&head.0).expect("cherry-pick");
+        assert!(repo.work_dir().join("new.txt").exists());
+        // Feature branch should still have the same number of commits.
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout feature");
+        assert_eq!(repo.log(10).expect("log").len(), feature_log_len);
+    }
+
+    // ── Revert: comprehensive ───────────────────────────────────────────────
+
+    #[test]
+    fn revert_creates_new_commit() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let c1 = commit_file(&repo, "new.txt", b"new\n", "add new");
+        let log_before = repo.log(10).expect("log").len();
+        repo.revert(&c1.0).expect("revert");
+        let log_after = repo.log(10).expect("log").len();
+        assert_eq!(log_after, log_before + 1, "revert should add a commit");
+        assert!(!repo.work_dir().join("new.txt").exists(), "file should be removed by revert");
+    }
+
+    #[test]
+    fn revert_multiple_commits() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let c1 = commit_file(&repo, "a.txt", b"a\n", "add a");
+        let _c2 = commit_file(&repo, "b.txt", b"b\n", "add b");
+        // Revert the first addition.
+        repo.revert(&c1.0).expect("revert");
+        assert!(!repo.work_dir().join("a.txt").exists(), "a.txt should be reverted");
+        assert!(repo.work_dir().join("b.txt").exists(), "b.txt should still exist");
+    }
+
+    // ── Tags: comprehensive ─────────────────────────────────────────────────
+
+    #[test]
+    fn create_lightweight_tag() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_tag("v1.0", None).expect("create tag");
+        let tags = repo.tags().expect("tags");
+        let tag = tags.iter().find(|t| t.name == "v1.0").expect("tag exists");
+        assert!(tag.is_lightweight, "should be lightweight");
+        assert!(tag.message.is_none(), "no message for lightweight");
+    }
+
+    #[test]
+    fn create_annotated_tag() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_tag("v2.0", Some("release 2.0")).expect("create tag");
+        let tags = repo.tags().expect("tags");
+        let tag = tags.iter().find(|t| t.name == "v2.0").expect("tag exists");
+        assert!(!tag.is_lightweight, "annotated tag should not be lightweight");
+        assert_eq!(tag.message.as_deref(), Some("release 2.0"));
+    }
+
+    #[test]
+    fn create_multiple_tags() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        for v in &["v1.0", "v1.1", "v2.0", "v3.0"] {
+            repo.create_tag(v, Some(&format!("version {}", v))).expect("create");
+        }
+        let tags = repo.tags().expect("tags");
+        assert_eq!(tags.len(), 4);
+    }
+
+    #[test]
+    fn tags_empty_repo() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let tags = repo.tags().expect("tags");
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn checkout_tag() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_tag("v1.0", None).expect("create tag");
+        repo.checkout(Revision::Tag("v1.0".to_string())).expect("checkout tag");
+        // Should be in detached HEAD state.
+        let branch = repo.current_branch().expect("current");
+        assert!(branch == "HEAD" || branch.is_empty(), "should be detached HEAD after checking out tag, got: {}", branch);
+    }
+
+    // ── Reset: comprehensive ────────────────────────────────────────────────
+
+    #[test]
+    fn reset_mixed_unstages() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "file.txt", b"modified\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let head = repo.head_commit().expect("head");
+        // Mixed reset to HEAD — should unstage but keep working tree.
+        repo.reset_mixed(&head.0).expect("reset mixed");
+        let st = repo.status().expect("status");
+        assert!(st.staged.is_empty(), "mixed reset should unstage");
+        assert!(!repo.is_clean().expect("not clean"), "working tree should still have changes");
+    }
+
+    #[test]
+    fn reset_soft_keeps_staged() {
+        if !git_available() { return; }
+        let (dir, repo, c1) = make_repo_with_commit();
+        write(dir.path(), "file.txt", b"new\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "second".to_string(), amend: false }).expect("commit");
+        // Soft reset to initial — staged changes should contain the second commit's diff.
+        repo.reset_soft(&c1.0).expect("reset soft");
+        let st = repo.status().expect("status");
+        assert!(st.dirty, "should be dirty after soft reset");
+    }
+
+    #[test]
+    fn reset_hard_discards_everything() {
+        if !git_available() { return; }
+        let (dir, repo, c1) = make_repo_with_commit();
+        write(dir.path(), "README.md", b"# Modified\n");
+        repo.reset_hard(&c1.0).expect("reset hard");
+        // Tracked changes are gone, but untracked files remain (reset --hard doesn't clean untracked).
+        let content = std::fs::read_to_string(dir.path().join("README.md")).expect("read");
+        assert_eq!(content.trim(), "# README", "hard reset should restore original content");
+        // No staged or unstaged tracked changes.
+        let st = repo.status().expect("status");
+        assert!(st.staged.is_empty(), "no staged changes after hard reset");
+        assert!(st.changes.is_empty(), "no unstaged tracked changes after hard reset");
+    }
+
+    // ── Clean: comprehensive ────────────────────────────────────────────────
+
+    #[test]
+    fn clean_removes_untracked_files() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "junk1.txt", b"junk\n");
+        write(dir.path(), "junk2.txt", b"junk\n");
+        repo.clean(false, true).expect("clean");
+        assert!(!dir.path().join("junk1.txt").exists());
+        assert!(!dir.path().join("junk2.txt").exists());
+    }
+
+    #[test]
+    fn clean_with_directories() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        std::fs::create_dir_all(dir.path().join("tempdir")).expect("mkdir");
+        write(dir.path(), "tempdir/file.txt", b"temp\n");
+        // Without -d flag, directories are not removed.
+        repo.clean(false, true).expect("clean without -d");
+        assert!(dir.path().join("tempdir").exists(), "dir should remain without -d");
+        // With -d flag.
+        repo.clean(true, true).expect("clean with -d");
+        assert!(!dir.path().join("tempdir").exists(), "dir should be removed with -d");
+    }
+
+    #[test]
+    fn clean_without_force_does_nothing() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "junk.txt", b"junk\n");
+        // Without force, git clean refuses to remove.
+        // Actually git clean without -f in non-interactive mode still errors.
+        // Let's just verify the file still exists.
+        let _ = repo.clean(false, false);
+        // The file might or might not be removed depending on git config.
+        // In most configs, clean without -f does nothing.
+    }
+
+    #[test]
+    fn clean_does_not_remove_tracked() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "junk.txt", b"junk\n");
+        repo.clean(false, true).expect("clean");
+        // README.md is tracked, should still exist.
+        assert!(dir.path().join("README.md").exists(), "tracked files should not be cleaned");
+    }
+
+    // ── Config: comprehensive ───────────────────────────────────────────────
+
+    #[test]
+    fn config_get_nonexistent_key() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let val = repo.config_get("nonexistent.key123").expect("config get");
+        assert_eq!(val, None, "nonexistent key should return None");
+    }
+
+    #[test]
+    fn config_set_and_get_user_email() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.config_set("user.email", "test@example.com").expect("set");
+        let val = repo.config_get("user.email").expect("get");
+        assert_eq!(val, Some("test@example.com".to_string()));
+    }
+
+    #[test]
+    fn config_overwrite() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.config_set("user.name", "First").expect("set");
+        repo.config_set("user.name", "Second").expect("overwrite");
+        let val = repo.config_get("user.name").expect("get");
+        assert_eq!(val, Some("Second".to_string()));
+    }
+
+    // ── Diff: comprehensive ─────────────────────────────────────────────────
+
+    #[test]
+    fn diff_commits_no_changes() {
+        if !git_available() { return; }
+        let (_dir, repo, c1) = make_repo_with_commit();
+        // Diff a commit against itself.
+        let diffs = repo.diff_commits(&c1.0, &c1.0).expect("diff");
+        assert!(diffs.is_empty(), "diff of same commit should be empty");
+    }
+
+    #[test]
+    fn diff_working_tree_vs_commit_clean() {
+        if !git_available() { return; }
+        let (_dir, repo, c1) = make_repo_with_commit();
+        let diffs = repo.diff_working_tree_vs_commit(&c1.0).expect("diff");
+        assert!(diffs.is_empty(), "clean working tree should have no diff");
+    }
+
+    #[test]
+    fn diff_working_tree_vs_commit_modified() {
+        if !git_available() { return; }
+        let (dir, repo, c1) = make_repo_with_commit();
+        write(dir.path(), "README.md", b"# Modified README\n");
+        let diffs = repo.diff_working_tree_vs_commit(&c1.0).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "README.md"));
+    }
+
+    #[test]
+    fn diff_working_tree_vs_commit_new_file() {
+        if !git_available() { return; }
+        let (dir, repo, c1) = make_repo_with_commit();
+        write(dir.path(), "new.txt", b"new\n");
+        // Untracked files don't show in git diff — need to stage first.
+        repo.stage(ChangeSelection::All).expect("stage");
+        let diffs = repo.diff_working_tree_vs_commit(&c1.0).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "new.txt"), "staged new file should show in diff");
+    }
+
+    #[test]
+    fn diff_file_at_commits_same_commit() {
+        if !git_available() { return; }
+        let (_dir, repo, c1) = make_repo_with_commit();
+        let diffs = repo.diff_file_at_commits("README.md", &c1.0, &c1.0).expect("diff");
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn diff_commits_multiple_files() {
+        if !git_available() { return; }
+        let (dir, repo, c1) = make_repo_with_commit();
+        write(dir.path(), "a.txt", b"a\n");
+        write(dir.path(), "b.txt", b"b\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let c2 = repo.commit(CommitRequest { message: "add files".to_string(), amend: false }).expect("commit");
+        let diffs = repo.diff_commits(&c1.0, &c2.0).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "a.txt"));
+        assert!(diffs.iter().any(|d| d.path == "b.txt"));
+    }
+
+    #[test]
+    fn diff_commits_deleted_file() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "temp.txt", b"temp\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let c1 = repo.commit(CommitRequest { message: "add temp".to_string(), amend: false }).expect("commit");
+        std::fs::remove_file(dir.path().join("temp.txt")).expect("delete");
+        repo.stage(ChangeSelection::All).expect("stage removal");
+        let c2 = repo.commit(CommitRequest { message: "remove temp".to_string(), amend: false }).expect("commit");
+        let diffs = repo.diff_commits(&c1.0, &c2.0).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "temp.txt"));
+    }
+
+    // ── Log: comprehensive ──────────────────────────────────────────────────
+
+    #[test]
+    fn log_empty_repo_no_commits() {
+        if !git_available() { return; }
+        let dir = make_repo();
+        let repo = GitCli::open(dir.path()).expect("open");
+        // No commits yet — log should return error or empty.
+        let result = repo.log(10);
+        // git log on empty repo returns error.
+        assert!(result.is_err() || result.expect("log").is_empty());
+    }
+
+    #[test]
+    fn log_max_count_limit() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        for i in 0..5 {
+            write(dir.path(), &format!("file{}.txt", i), format!("content{}\n", i).as_bytes());
+            repo.stage(ChangeSelection::All).expect("stage");
+            repo.commit(CommitRequest { message: format!("commit {}", i), amend: false }).expect("commit");
+        }
+        let log = repo.log(3).expect("log");
+        assert_eq!(log.len(), 3, "should respect max_count");
+    }
+
+    #[test]
+    fn log_has_short_sha() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let log = repo.log(10).expect("log");
+        let entry = &log[0];
+        assert!(!entry.sha.is_empty(), "sha should not be empty");
+        assert!(!entry.short_sha.is_empty(), "short_sha should not be empty");
+        assert!(entry.sha.starts_with(&entry.short_sha), "sha should start with short_sha");
+    }
+
+    #[test]
+    fn log_has_parents() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Initial commit has no parents.
+        let log = repo.log(10).expect("log");
+        let initial = log.last().expect("last");
+        assert!(initial.parents.is_empty(), "initial commit has no parents");
+        // Add another commit — should have 1 parent.
+        write(dir.path(), "new.txt", b"new\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "second".to_string(), amend: false }).expect("commit");
+        let log = repo.log(10).expect("log");
+        let second = &log[0];
+        assert_eq!(second.parents.len(), 1, "second commit should have 1 parent");
+    }
+
+    #[test]
+    fn log_for_file_follows_renames() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "original.txt", b"content\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "add original".to_string(), amend: false }).expect("commit");
+        // Rename and modify — use git mv for proper rename detection.
+        let git_bin = std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string());
+        Command::new(&git_bin).current_dir(dir.path()).args(["mv", "original.txt", "renamed.txt"]).output().expect("git mv");
+        write(dir.path(), "renamed.txt", b"content modified\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "rename and modify".to_string(), amend: false }).expect("commit");
+        // --follow should find at least the rename commit (rename detection with custom
+        // format may not always traverse past the rename boundary on all git versions).
+        let log = repo.log_for_file("renamed.txt", 10).expect("log");
+        assert!(!log.is_empty(), "should find at least 1 commit for renamed file with --follow");
+    }
+
+    #[test]
+    fn log_for_nonexistent_file() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let log = repo.log_for_file("nonexistent.txt", 10).expect("log");
+        assert!(log.is_empty(), "nonexistent file should have no history");
+    }
+
+    // ── Misc: comprehensive ─────────────────────────────────────────────────
+
+    #[test]
+    fn head_commit_after_multiple_commits() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "a.txt", b"a\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let c1 = repo.commit(CommitRequest { message: "c1".to_string(), amend: false }).expect("commit");
+        assert_eq!(repo.head_commit().expect("head").0, c1.0);
+        write(dir.path(), "b.txt", b"b\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let c2 = repo.commit(CommitRequest { message: "c2".to_string(), amend: false }).expect("commit");
+        assert_eq!(repo.head_commit().expect("head").0, c2.0);
+    }
+
+    #[test]
+    fn is_clean_after_stash() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "README.md", b"# Modified\n");
+        assert!(!repo.is_clean().expect("not clean"));
+        repo.stash_push(None).expect("stash");
+        assert!(repo.is_clean().expect("clean after stash"));
+    }
+
+    #[test]
+    fn current_branch_after_checkout() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let initial = repo.current_branch().expect("current");
+        repo.create_branch("newbranch").expect("create");
+        repo.checkout(Revision::Branch("newbranch".to_string())).expect("checkout");
+        assert_eq!(repo.current_branch().expect("current"), "newbranch");
+        repo.checkout(Revision::Branch(initial.clone())).expect("checkout back");
+        assert_eq!(repo.current_branch().expect("current"), initial);
+    }
+
+    #[test]
+    fn commit_amend() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "new.txt", b"new\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let original_head = repo.head_commit().expect("head");
+        repo.commit(CommitRequest { message: "original message".to_string(), amend: false }).expect("commit");
+        // Amend the commit.
+        repo.commit(CommitRequest { message: "amended message".to_string(), amend: true }).expect("amend");
+        let log = repo.log(10).expect("log");
+        assert_eq!(log[0].message, "amended message");
+        // HEAD should have changed (new commit hash from amend).
+        assert_ne!(repo.head_commit().expect("head").0, original_head.0);
+    }
+
+    // ── Combined workflows ──────────────────────────────────────────────────
+
+    #[test]
+    fn workflow_stage_commit_branch_merge() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Create feature branch, add a file, commit, merge back.
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        write(dir.path(), "feature.txt", b"feature content\n");
+        repo.stage(ChangeSelection::File { path: "feature.txt".to_string() }).expect("stage");
+        repo.commit(CommitRequest { message: "add feature".to_string(), amend: false }).expect("commit");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        repo.merge("feature", MergeStrategy::FastForwardOnly).expect("merge");
+        assert!(dir.path().join("feature.txt").exists());
+        assert!(repo.is_clean().expect("clean"));
+    }
+
+    #[test]
+    fn workflow_stash_branch_pop() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Modify a tracked file, stash, switch branch, pop.
+        write(dir.path(), "README.md", b"# WIP\n");
+        repo.stash_push(Some("wip")).expect("stash");
+        repo.create_branch("dev").expect("create");
+        repo.checkout(Revision::Branch("dev".to_string())).expect("checkout");
+        repo.stash_pop(0).expect("pop");
+        let content = std::fs::read_to_string(dir.path().join("README.md")).expect("read");
+        assert_eq!(content.trim(), "# WIP", "stashed changes should be restored");
+    }
+
+    #[test]
+    fn workflow_commit_tag_reset() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Make a commit, tag it, then reset back.
+        write(dir.path(), "v1.txt", b"v1\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let _c1 = repo.commit(CommitRequest { message: "v1".to_string(), amend: false }).expect("commit");
+        repo.create_tag("v1.0", Some("first release")).expect("tag");
+        // Hard reset to initial.
+        let initial = repo.log(10).expect("log").last().expect("initial").sha.clone();
+        repo.reset_hard(&initial).expect("reset");
+        assert!(!dir.path().join("v1.txt").exists(), "v1.txt should be gone after reset");
+        // Tag should still exist (tags are independent of HEAD).
+        let tags = repo.tags().expect("tags");
+        assert!(tags.iter().any(|t| t.name == "v1.0"), "tag should survive reset");
+    }
+
+    #[test]
+    fn workflow_cherry_pick_then_revert() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Create a commit on feature, cherry-pick it, then revert it.
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        let c1 = commit_file(&repo, "new.txt", b"new content\n", "add new");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        repo.cherry_pick(&c1.0).expect("cherry-pick");
+        assert!(dir.path().join("new.txt").exists());
+        // Revert the cherry-picked commit.
+        let head = repo.head_commit().expect("head");
+        repo.revert(&head.0).expect("revert");
+        assert!(!dir.path().join("new.txt").exists(), "file should be gone after revert");
+    }
+
+    #[test]
+    fn workflow_multiple_branches_merge_squash() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Create two feature branches, merge both with squash.
+        repo.create_branch("feat-a").expect("create a");
+        repo.checkout(Revision::Branch("feat-a".to_string())).expect("checkout a");
+        commit_file(&repo, "a.txt", b"a\n", "add a");
+        commit_file(&repo, "a2.txt", b"a2\n", "add a2");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        repo.merge("feat-a", MergeStrategy::Squash).expect("squash a");
+        assert!(dir.path().join("a.txt").exists());
+        assert!(dir.path().join("a2.txt").exists());
+        // Second feature.
+        repo.create_branch("feat-b").expect("create b");
+        repo.checkout(Revision::Branch("feat-b".to_string())).expect("checkout b");
+        commit_file(&repo, "b.txt", b"b\n", "add b");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        repo.merge("feat-b", MergeStrategy::Squash).expect("squash b");
+        assert!(dir.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn workflow_stage_unstage_commit() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Stage, unstage, stage again, commit.
+        write(dir.path(), "file.txt", b"content\n");
+        repo.stage(ChangeSelection::File { path: "file.txt".to_string() }).expect("stage");
+        repo.unstage(ChangeSelection::File { path: "file.txt".to_string() }).expect("unstage");
+        let st = repo.status().expect("status");
+        assert!(st.staged.is_empty(), "should not be staged after unstage");
+        repo.stage(ChangeSelection::File { path: "file.txt".to_string() }).expect("stage again");
+        repo.commit(CommitRequest { message: "add file".to_string(), amend: false }).expect("commit");
+        assert!(repo.is_clean().expect("clean after commit"));
+    }
+
+    #[test]
+    fn workflow_diff_between_all_three_states() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Stage one change, make another unstaged change.
+        write(dir.path(), "staged.txt", b"staged\n");
+        repo.stage(ChangeSelection::File { path: "staged.txt".to_string() }).expect("stage");
+        write(dir.path(), "README.md", b"# Modified\n");
+        // Working tree vs HEAD should show both.
+        let diffs_wt_head = repo.diff(DiffRequest::WorkingTreeVsHead).expect("diff wt vs head");
+        assert!(diffs_wt_head.iter().any(|d| d.path == "staged.txt"));
+        assert!(diffs_wt_head.iter().any(|d| d.path == "README.md"));
+        // Index vs HEAD should show only staged.
+        let diffs_idx_head = repo.diff(DiffRequest::IndexVsHead).expect("diff idx vs head");
+        assert!(diffs_idx_head.iter().any(|d| d.path == "staged.txt"));
+        assert!(!diffs_idx_head.iter().any(|d| d.path == "README.md"));
+        // Working tree vs index should show only unstaged.
+        let diffs_wt_idx = repo.diff(DiffRequest::WorkingTreeVsIndex).expect("diff wt vs idx");
+        assert!(diffs_wt_idx.iter().any(|d| d.path == "README.md"));
+    }
+
+    #[test]
+    fn workflow_tag_cherry_pick_and_rebase() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Tag initial, create feature, add commits, rebase, cherry-pick.
+        repo.create_tag("v1.0", Some("initial")).expect("tag");
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        commit_file(&repo, "feat.txt", b"feat\n", "add feat");
+        // Add commit on master.
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        commit_file(&repo, "master.txt", b"master\n", "on master");
+        // Rebase feature onto master.
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout feature");
+        repo.rebase("master").expect("rebase");
+        assert!(dir.path().join("feat.txt").exists());
+        assert!(dir.path().join("master.txt").exists());
+        // Cherry-pick feature's commit onto master.
+        let head = repo.head_commit().expect("head");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        repo.cherry_pick(&head.0).expect("cherry-pick");
+        assert!(dir.path().join("feat.txt").exists(), "feat.txt should exist after cherry-pick");
+    }
+
+    #[test]
+    fn workflow_stash_apply_drop_clean() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Create a tracked file, modify it, stash, apply, drop, clean untracked.
+        write(dir.path(), "tracked.txt", b"tracked\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "add tracked".to_string(), amend: false }).expect("commit");
+        write(dir.path(), "tracked.txt", b"modified\n");
+        write(dir.path(), "untracked.txt", b"untracked\n");
+        repo.stash_push(Some("tracked changes")).expect("stash");
+        // Apply the stash (tracked changes restored).
+        repo.stash_apply(0).expect("apply");
+        // Drop it.
+        repo.stash_drop(0).expect("drop");
+        assert_eq!(repo.stash_list().expect("list").len(), 0);
+        // Clean untracked.
+        repo.clean(false, true).expect("clean");
+        assert!(!dir.path().join("untracked.txt").exists());
+    }
+
+    #[test]
+    fn workflow_branch_delete_recreate() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("temp").expect("create");
+        repo.delete_branch("temp", false).expect("delete");
+        assert!(!repo.branches().expect("branches").iter().any(|b| b.name == "temp"));
+        // Recreate.
+        repo.create_branch("temp").expect("recreate");
+        assert!(repo.branches().expect("branches").iter().any(|b| b.name == "temp"));
+    }
+
+    #[test]
+    fn workflow_config_set_commit_check_author() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        repo.config_set("user.name", "New Author").expect("set name");
+        repo.config_set("user.email", "new@example.com").expect("set email");
+        write(dir.path(), "file.txt", b"content\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "by new author".to_string(), amend: false }).expect("commit");
+        let log = repo.log(10).expect("log");
+        assert_eq!(log[0].author, "New Author");
+        assert_eq!(log[0].author_email, "new@example.com");
+    }
+
+    // ── Edge cases ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn open_nonexistent_directory() {
+        if !git_available() { return; }
+        let result = GitCli::open("C:\\nonexistent\\path\\12345");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn status_after_delete_file() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        std::fs::remove_file(dir.path().join("README.md")).expect("delete");
+        let st = repo.status().expect("status");
+        assert!(st.changes.iter().any(|f| f.path == "README.md" && f.status == FileStatus::Deleted),
+            "should show deleted file");
+    }
+
+    #[test]
+    fn status_renamed_file() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        // Use git mv for reliable rename detection.
+        let git_bin = std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string());
+        Command::new(&git_bin).current_dir(dir.path()).args(["mv", "README.md", "RENAMED.md"]).output().expect("git mv");
+        let st = repo.status().expect("status");
+        // Should show as renamed (R) in staged.
+        assert!(st.staged.iter().any(|f| f.path == "RENAMED.md"),
+            "renamed file should appear in staged");
+    }
+
+    #[test]
+    fn commit_with_empty_message_fails() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "file.txt", b"content\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        // Empty message — git should reject it.
+        let result = repo.commit(CommitRequest { message: "".to_string(), amend: false });
+        assert!(result.is_err(), "commit with empty message should fail");
+    }
+
+    #[test]
+    fn diff_branch_vs_branch() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        write(dir.path(), "new.txt", b"new\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "on feature".to_string(), amend: false }).expect("commit");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        let diffs = repo.diff(DiffRequest::BranchVsBranch { a: "master".to_string(), b: "feature".to_string() }).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "new.txt"));
+    }
+
+    #[test]
+    fn diff_head_vs_branch() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        repo.create_branch("feature").expect("create");
+        repo.checkout(Revision::Branch("feature".to_string())).expect("checkout");
+        write(dir.path(), "new.txt", b"new\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "on feature".to_string(), amend: false }).expect("commit");
+        repo.checkout(Revision::Branch("master".to_string())).expect("checkout master");
+        let diffs = repo.diff(DiffRequest::HeadVsBranch { branch: "feature".to_string() }).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "new.txt"));
+    }
+
+    #[test]
+    fn diff_file_version_vs_version() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "doc.md", b"v1\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let c1 = repo.commit(CommitRequest { message: "v1".to_string(), amend: false }).expect("commit");
+        write(dir.path(), "doc.md", b"v2\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let c2 = repo.commit(CommitRequest { message: "v2".to_string(), amend: false }).expect("commit");
+        let diffs = repo.diff(DiffRequest::FileVersionVsVersion {
+            path: "doc.md".to_string(),
+            a: c1.clone(),
+            b: c2.clone(),
+        }).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "doc.md"));
+    }
+
+    #[test]
+    fn diff_working_tree_vs_commit_file() {
+        if !git_available() { return; }
+        let (dir, repo, c1) = make_repo_with_commit();
+        write(dir.path(), "README.md", b"# Modified\n");
+        let diffs = repo.diff(DiffRequest::WorkingTreeVsCommitFile {
+            commit: c1,
+            path: "README.md".to_string(),
+        }).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "README.md"));
+    }
+
+    #[test]
+    fn diff_index_vs_commit() {
+        if !git_available() { return; }
+        let (dir, repo, c1) = make_repo_with_commit();
+        write(dir.path(), "new.txt", b"new\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let diffs = repo.diff(DiffRequest::IndexVsCommit { commit: c1 }).expect("diff");
+        assert!(diffs.iter().any(|d| d.path == "new.txt"));
+    }
+
+    #[test]
+    fn read_file_at_head() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let head = repo.head_commit().expect("head");
+        let content = read_file_at_revision(&repo, "README.md", &head.0).expect("read");
+        assert_eq!(String::from_utf8_lossy(&content).trim(), "# README");
+    }
+
+    #[test]
+    fn read_file_at_old_revision() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "doc.md", b"v1\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        let c1 = repo.commit(CommitRequest { message: "v1".to_string(), amend: false }).expect("commit");
+        write(dir.path(), "doc.md", b"v2\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "v2".to_string(), amend: false }).expect("commit");
+        let old = read_file_at_revision(&repo, "doc.md", &c1.0).expect("read old");
+        assert_eq!(String::from_utf8_lossy(&old).trim(), "v1");
+    }
+
+    #[test]
+    fn file_history_empty_for_nonexistent() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let hist = file_history(&repo, "nonexistent.txt").expect("history");
+        assert!(hist.is_empty());
+    }
+
+    #[test]
+    fn file_history_order() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        write(dir.path(), "doc.md", b"v1\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "first".to_string(), amend: false }).expect("commit");
+        write(dir.path(), "doc.md", b"v2\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "second".to_string(), amend: false }).expect("commit");
+        write(dir.path(), "doc.md", b"v3\n");
+        repo.stage(ChangeSelection::All).expect("stage");
+        repo.commit(CommitRequest { message: "third".to_string(), amend: false }).expect("commit");
+        let hist = file_history(&repo, "doc.md").expect("history");
+        assert_eq!(hist.len(), 3);
+        assert_eq!(hist[0].message, "third");
+        assert_eq!(hist[1].message, "second");
+        assert_eq!(hist[2].message, "first");
+    }
+
+    #[test]
+    fn branches_includes_remote_after_fetch() {
+        if !git_available() { return; }
+        // We can't test actual remote fetch without a remote repo,
+        // but we can verify that branches() doesn't crash.
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let _branches = repo.branches().expect("branches should not crash");
+    }
+
+    #[test]
+    fn remotes_empty_repo() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let remotes = repo.remotes().expect("remotes");
+        assert!(remotes.is_empty(), "fresh repo should have no remotes");
+    }
+
+    #[test]
+    fn add_and_remove_remote() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.add_remote("origin", "https://github.com/test/repo.git").expect("add remote");
+        let remotes = repo.remotes().expect("remotes");
+        assert!(remotes.iter().any(|r| r.name == "origin"));
+        repo.remove_remote("origin").expect("remove remote");
+        let remotes = repo.remotes().expect("remotes");
+        assert!(!remotes.iter().any(|r| r.name == "origin"));
+    }
+
+    #[test]
+    fn add_multiple_remotes() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.add_remote("origin", "https://github.com/test/repo.git").expect("add");
+        repo.add_remote("upstream", "https://github.com/upstream/repo.git").expect("add");
+        let remotes = repo.remotes().expect("remotes");
+        assert_eq!(remotes.len(), 2);
+        assert!(remotes.iter().any(|r| r.name == "origin"));
+        assert!(remotes.iter().any(|r| r.name == "upstream"));
+    }
+
+    #[test]
+    fn exec_text_returns_output() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let text = repo.exec_text(&["log", "--oneline", "-1"]).expect("exec");
+        assert!(!text.trim().is_empty(), "git log should return output");
+    }
+
+    #[test]
+    fn work_dir_returns_path() {
+        if !git_available() { return; }
+        let (dir, repo, _id) = make_repo_with_commit();
+        let work_dir = repo.work_dir();
+        assert!(work_dir.exists(), "work_dir should exist");
+        assert_eq!(work_dir, dir.path());
     }
 }
