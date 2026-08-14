@@ -57,6 +57,9 @@ const gitChanges = document.getElementById("git-changes");
 const gitBranches = document.getElementById("git-branches");
 const gitHistory = document.getElementById("git-history");
 const gitDiff = document.getElementById("git-diff");
+const gitStash = document.getElementById("git-stash");
+const gitTags = document.getElementById("git-tags");
+const gitRemotes = document.getElementById("git-remotes");
 
 // ── File dialog ─────────────────────────────────────────────────────────────
 async function openFileDialog() {
@@ -1005,7 +1008,7 @@ function renderTabs() {
 // ── Git panel ───────────────────────────────────────────────────────────────
 
 async function refreshGitAll() {
-  await Promise.all([refreshGitStatus(), refreshGitBranches(), refreshGitLog(), refreshGitDiff()]);
+  await Promise.all([refreshGitStatus(), refreshGitBranches(), refreshGitLog(), refreshGitDiff(), refreshGitStash(), refreshGitTags(), refreshGitRemotes()]);
 }
 
 async function refreshGitStatus() {
@@ -1060,8 +1063,10 @@ function renderGitChanges() {
 function renderGitBranches() {
   if (!gitData.branches || gitData.branches.length === 0) { gitBranches.innerHTML = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No branches</div>'; return; }
   let html = '<div class="git-section-title">Branches</div>';
+  html += '<div class="git-inline-form"><input type="text" id="new-branch-name" placeholder="New branch name..." /><button class="git-action-btn" onclick="gitCreateBranch()">Create</button></div>';
   for (const b of gitData.branches) {
-    html += `<div class="git-branch-entry ${b.is_current ? 'current' : ''}" onclick="gitCheckout('${escapeAttr(b.name)}')"><span class="git-branch-icon">${b.is_current ? '●' : '○'}</span><span class="git-branch-name">${escapeHtml(b.name)}</span>${b.ahead > 0 ? `<span class="git-branch-ahead">↓${b.ahead}</span>` : ''}${b.behind > 0 ? `<span class="git-branch-behind">↑${b.behind}</span>` : ''}</div>`;
+    const actions = b.is_current ? '' : `<div class="git-branch-actions"><button class="git-mini-btn" onclick="event.stopPropagation();gitCheckout('${escapeAttr(b.name)}')">Checkout</button><button class="git-mini-btn" onclick="event.stopPropagation();gitMergeBranch('${escapeAttr(b.name)}')">Merge</button><button class="git-mini-btn" onclick="event.stopPropagation();gitRebaseBranch('${escapeAttr(b.name)}')">Rebase</button><button class="git-mini-btn git-mini-danger" onclick="event.stopPropagation();gitDeleteBranch('${escapeAttr(b.name)}')">Delete</button></div>`;
+    html += `<div class="git-branch-entry ${b.is_current ? 'current' : ''}"><div class="git-branch-row" onclick="gitCheckout('${escapeAttr(b.name)}')"><span class="git-branch-icon">${b.is_current ? '●' : '○'}</span><span class="git-branch-name">${escapeHtml(b.name)}</span>${b.ahead > 0 ? `<span class="git-branch-ahead">↓${b.ahead}</span>` : ''}${b.behind > 0 ? `<span class="git-branch-behind">↑${b.behind}</span>` : ''}</div>${actions}</div>`;
   }
   gitBranches.innerHTML = html;
 }
@@ -1070,7 +1075,7 @@ function renderGitHistory() {
   if (!gitData.log || gitData.log.length === 0) { gitHistory.innerHTML = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No commits</div>'; return; }
   let html = '<div class="git-section-title">Commit History</div>';
   for (const c of gitData.log) {
-    html += `<div class="git-commit-entry"><div class="git-commit-sha">${escapeHtml(c.sha.substring(0, 8))}</div><div class="git-commit-msg">${escapeHtml(c.message)}</div><div class="git-commit-meta">${escapeHtml(c.author)} · ${escapeHtml(c.date)}</div></div>`;
+    html += `<div class="git-commit-entry"><div class="git-commit-row"><div class="git-commit-sha">${escapeHtml(c.sha.substring(0, 8))}</div><div class="git-commit-msg">${escapeHtml(c.message)}</div><div class="git-commit-meta">${escapeHtml(c.author)} · ${escapeHtml(c.date)}</div></div><div class="git-commit-actions"><button class="git-mini-btn" onclick="event.stopPropagation();gitCherryPick('${escapeAttr(c.sha)}')">Cherry-pick</button><button class="git-mini-btn" onclick="event.stopPropagation();gitRevertCommit('${escapeAttr(c.sha)}')">Revert</button><button class="git-mini-btn" onclick="event.stopPropagation();gitResetSoft('${escapeAttr(c.sha)}')">Reset soft</button><button class="git-mini-btn git-mini-danger" onclick="event.stopPropagation();gitResetHard('${escapeAttr(c.sha)}')">Reset hard</button></div></div>`;
   }
   gitHistory.innerHTML = html;
 }
@@ -1092,6 +1097,181 @@ function renderGitDiff() {
   gitDiff.innerHTML = html;
 }
 
+// ── Git panel: Stash / Tags / Remotes / Diff viewer ────────────────────────
+
+async function refreshGitStash() {
+  try { gitData.stash = await tauriInvoke("git_stash_list"); renderGitStash(); }
+  catch (e) { gitData.stash = []; renderGitStash(); }
+}
+
+async function refreshGitTags() {
+  try { gitData.tags = await tauriInvoke("git_tags"); renderGitTags(); }
+  catch (e) { gitData.tags = []; renderGitTags(); }
+}
+
+async function refreshGitRemotes() {
+  try { gitData.remotes = await tauriInvoke("git_remotes"); renderGitRemotes(); }
+  catch (e) { gitData.remotes = []; renderGitRemotes(); }
+}
+
+function renderGitStash() {
+  let html = '<div class="git-section-title">Stash</div>';
+  html += '<button class="git-action-btn" onclick="gitStashPush()">Stash current changes</button>';
+  const stash = gitData.stash || [];
+  if (stash.length === 0) {
+    html += '<div style="padding:16px;color:var(--fg-muted);text-align:center">No stashed changes</div>';
+  } else {
+    for (const s of stash) {
+      html += `<div class="git-stash-entry"><div class="git-stash-info"><span class="git-stash-idx">stash@{${s.index}}</span><span class="git-stash-msg">${escapeHtml(s.message)}</span></div><div class="git-stash-actions"><button class="git-mini-btn" onclick="gitStashApply(${s.index})">Apply</button><button class="git-mini-btn" onclick="gitStashPop(${s.index})">Pop</button><button class="git-mini-btn git-mini-danger" onclick="gitStashDrop(${s.index})">Drop</button></div></div>`;
+    }
+  }
+  gitStash.innerHTML = html;
+}
+
+function renderGitTags() {
+  let html = '<div class="git-section-title">Tags</div>';
+  html += '<div class="git-inline-form"><input type="text" id="tag-name-input" placeholder="Tag name (e.g. v1.0)" /><input type="text" id="tag-msg-input" placeholder="Message (optional)" /><button class="git-action-btn" onclick="gitCreateTag()">Create</button></div>';
+  const tags = gitData.tags || [];
+  if (tags.length === 0) {
+    html += '<div style="padding:16px;color:var(--fg-muted);text-align:center">No tags</div>';
+  } else {
+    for (const t of tags) {
+      html += `<div class="git-tag-entry"><span class="git-tag-icon">🏷</span><span class="git-tag-name">${escapeHtml(t.name)}</span><span class="git-tag-target">${escapeHtml(t.target)}</span>${t.message ? `<span class="git-tag-msg">${escapeHtml(t.message)}</span>` : ''}<button class="git-mini-btn git-mini-danger" onclick="gitDeleteTag('${escapeAttr(t.name)}')">Delete</button></div>`;
+    }
+  }
+  gitTags.innerHTML = html;
+}
+
+function renderGitRemotes() {
+  let html = '<div class="git-section-title">Remotes</div>';
+  html += '<div class="git-inline-form"><input type="text" id="remote-name-input" placeholder="Remote name" /><input type="text" id="remote-url-input" placeholder="URL" /><button class="git-action-btn" onclick="gitAddRemote()">Add</button></div>';
+  const remotes = gitData.remotes || [];
+  if (remotes.length === 0) {
+    html += '<div style="padding:16px;color:var(--fg-muted);text-align:center">No remotes</div>';
+  } else {
+    for (const r of remotes) {
+      html += `<div class="git-remote-entry"><div class="git-remote-info"><span class="git-remote-name">${escapeHtml(r.name)}</span><span class="git-remote-url">${escapeHtml(r.fetch_url || r.url)}</span></div><div class="git-remote-actions"><button class="git-mini-btn" onclick="gitFetchRemote('${escapeAttr(r.name)}')">Fetch</button></div></div>`;
+    }
+  }
+  html += '<div class="git-section-title" style="margin-top:12px">Push / Pull</div>';
+  html += '<div class="git-inline-form"><input type="text" id="push-remote-input" placeholder="remote" /><input type="text" id="push-branch-input" placeholder="branch" /><button class="git-action-btn" onclick="gitPushToRemote(false)">Push</button><button class="git-action-btn git-mini-danger" onclick="gitPushToRemote(true)">Force</button><button class="git-action-btn" onclick="gitPullFromRemote()">Pull</button></div>';
+  gitRemotes.innerHTML = html;
+}
+
+// ── Git panel: Diff viewer (commit vs commit / working tree vs commit) ─────
+
+function renderDiffViewer() {
+  const log = gitData.log || [];
+  let html = '<div class="git-section-title">Diff Viewer</div>';
+  html += '<div class="git-diff-viewer-form">';
+  html += '<select id="diff-mode-select"><option value="wt-vs-commit">Working tree vs commit</option><option value="commit-vs-commit">Commit vs commit</option></select>';
+  // Commit dropdowns populated from log.
+  const opts = log.map(c => `<option value="${escapeAttr(c.sha)}">${escapeHtml(c.sha.substring(0,8))} - ${escapeHtml(c.message.substring(0,40))}</option>`).join("");
+  html += `<select id="diff-commit-a">${opts}</select>`;
+  html += `<select id="diff-commit-b">${opts}</select>`;
+  html += '<button class="git-action-btn" onclick="gitShowDiff()">Show diff</button>';
+  html += '</div>';
+  html += '<div id="diff-viewer-result"></div>';
+  gitDiff.innerHTML = html;
+}
+
+// ── Git actions (extended) ─────────────────────────────────────────────────
+
+window.gitStashPush = async function() {
+  const msg = prompt("Stash message (optional):");
+  try { await tauriInvoke("git_stash_push", { message: msg || null }); await refreshGitAll(); }
+  catch (e) { alert("Stash failed: " + e); }
+};
+window.gitStashPop = async function(index) { try { await tauriInvoke("git_stash_pop", { index }); await refreshGitAll(); } catch (e) { alert("Stash pop failed: " + e); } };
+window.gitStashApply = async function(index) { try { await tauriInvoke("git_stash_apply", { index }); await refreshGitAll(); } catch (e) { alert("Stash apply failed: " + e); } };
+window.gitStashDrop = async function(index) { if (!confirm(`Drop stash@{${index}}?`)) return; try { await tauriInvoke("git_stash_drop", { index }); await refreshGitAll(); } catch (e) { alert("Stash drop failed: " + e); } };
+
+window.gitCreateBranch = async function() {
+  const name = document.getElementById("new-branch-name")?.value?.trim();
+  if (!name) { alert("Enter a branch name"); return; }
+  try { await tauriInvoke("git_create_branch", { name }); await refreshGitAll(); }
+  catch (e) { alert("Create branch failed: " + e); }
+};
+window.gitDeleteBranch = async function(name) { if (!confirm(`Delete branch "${name}"?`)) return; try { await tauriInvoke("git_delete_branch", { name, force: false }); await refreshGitAll(); } catch (e) { alert("Delete branch failed: " + e); } };
+window.gitMergeBranch = async function(branch) {
+  const strategy = prompt("Merge strategy: merge / ff-only / no-ff / squash", "merge");
+  if (!strategy) return;
+  try { await tauriInvoke("git_merge", { branch, strategy }); await refreshGitAll(); }
+  catch (e) { alert("Merge failed: " + e); }
+};
+window.gitRebaseBranch = async function(branch) { if (!confirm(`Rebase onto "${branch}"?`)) return; try { await tauriInvoke("git_rebase", { branch }); await refreshGitAll(); } catch (e) { alert("Rebase failed: " + e); } };
+window.gitCherryPick = async function(sha) { if (!confirm(`Cherry-pick ${sha.substring(0,8)}?`)) return; try { await tauriInvoke("git_cherry_pick", { commit: sha }); await refreshGitAll(); } catch (e) { alert("Cherry-pick failed: " + e); } };
+window.gitRevertCommit = async function(sha) { if (!confirm(`Revert ${sha.substring(0,8)}?`)) return; try { await tauriInvoke("git_revert", { commit: sha }); await refreshGitAll(); } catch (e) { alert("Revert failed: " + e); } };
+window.gitResetSoft = async function(sha) { if (!confirm(`Soft reset to ${sha.substring(0,8)}?`)) return; try { await tauriInvoke("git_reset_soft", { commit: sha }); await refreshGitAll(); } catch (e) { alert("Reset failed: " + e); } };
+window.gitResetHard = async function(sha) { if (!confirm(`⚠ HARD reset to ${sha.substring(0,8)}? This discards all uncommitted changes!`)) return; try { await tauriInvoke("git_reset_hard", { commit: sha }); await refreshGitAll(); } catch (e) { alert("Reset failed: " + e); } };
+
+window.gitCreateTag = async function() {
+  const name = document.getElementById("tag-name-input")?.value?.trim();
+  if (!name) { alert("Enter a tag name"); return; }
+  const msg = document.getElementById("tag-msg-input")?.value?.trim() || null;
+  try { await tauriInvoke("git_create_tag", { name, message: msg }); await refreshGitAll(); }
+  catch (e) { alert("Create tag failed: " + e); }
+};
+window.gitDeleteTag = async function(name) { if (!confirm(`Delete tag "${name}"?`)) return; try { await tauriInvoke("git_delete_tag", { name }); await refreshGitAll(); } catch (e) { alert("Delete tag failed: " + e); } };
+
+window.gitAddRemote = async function() {
+  const name = document.getElementById("remote-name-input")?.value?.trim();
+  const url = document.getElementById("remote-url-input")?.value?.trim();
+  if (!name || !url) { alert("Enter remote name and URL"); return; }
+  try { await tauriInvoke("git_add_remote", { name, url }); await refreshGitAll(); }
+  catch (e) { alert("Add remote failed: " + e); }
+};
+window.gitFetchRemote = async function(remote) { try { await tauriInvoke("git_fetch_remote", { remote }); await refreshGitAll(); } catch (e) { alert("Fetch failed: " + e); } };
+window.gitPushToRemote = async function(force) {
+  const remote = document.getElementById("push-remote-input")?.value?.trim();
+  const branch = document.getElementById("push-branch-input")?.value?.trim();
+  if (!remote || !branch) { alert("Enter remote and branch"); return; }
+  if (force && !confirm(`⚠ Force push to ${remote}/${branch}?`)) return;
+  try { await tauriInvoke("git_push_to_remote", { remote, branch, force }); await refreshGitAll(); }
+  catch (e) { alert("Push failed: " + e); }
+};
+window.gitPullFromRemote = async function() {
+  const remote = document.getElementById("push-remote-input")?.value?.trim();
+  const branch = document.getElementById("push-branch-input")?.value?.trim();
+  if (!remote || !branch) { alert("Enter remote and branch"); return; }
+  try { await tauriInvoke("git_pull_from_remote", { remote, branch }); await refreshGitAll(); }
+  catch (e) { alert("Pull failed: " + e); }
+};
+
+window.gitShowDiff = async function() {
+  const mode = document.getElementById("diff-mode-select").value;
+  const resultDiv = document.getElementById("diff-viewer-result");
+  resultDiv.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">Loading diff...</div>';
+  try {
+    let diffs;
+    if (mode === "wt-vs-commit") {
+      const commit = document.getElementById("diff-commit-a").value;
+      diffs = await tauriInvoke("git_diff_vs_commit", { commit });
+    } else {
+      const a = document.getElementById("diff-commit-a").value;
+      const b = document.getElementById("diff-commit-b").value;
+      diffs = await tauriInvoke("git_diff_commits", { commitA: a, commitB: b });
+    }
+    let html = "";
+    if (!diffs || diffs.length === 0) {
+      html = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No differences</div>';
+    } else {
+      for (const file of diffs) {
+        html += `<div class="diff-file-header">${escapeHtml(file.path)}</div>`;
+        for (const hunk of file.hunks) {
+          html += `<div class="diff-hunk-header">@@ -${hunk.old_start} +${hunk.new_start} @@</div>`;
+          for (const line of hunk.lines) {
+            const cls = line.kind === "insert" ? "insert" : line.kind === "delete" ? "delete" : "equal";
+            const sign = line.kind === "insert" ? "+" : line.kind === "delete" ? "-" : " ";
+            html += `<div class="diff-line ${cls}"><span class="diff-line-num">${line.old_no || ""}</span><span class="diff-line-num">${line.new_no || ""}</span><span class="diff-line-sign">${sign}</span><span class="diff-line-content">${escapeHtml(line.text)}</span></div>`;
+          }
+        }
+      }
+    }
+    resultDiv.innerHTML = html;
+  } catch (e) { resultDiv.innerHTML = `<div style="padding:8px;color:#f44">Diff error: ${escapeHtml(String(e))}</div>`; }
+};
+
 window.gitStageFile = async function(path) { try { await tauriInvoke("git_stage_file", { filePath: path }); await refreshGitAll(); } catch (e) { alert("Stage failed: " + e); } };
 window.gitUnstageFile = async function(path) { try { await tauriInvoke("git_unstage_file", { filePath: path }); await refreshGitAll(); } catch (e) { alert("Unstage failed: " + e); } };
 window.gitCommit = async function() { const msg = document.getElementById("commit-msg")?.value?.trim(); if (!msg) { alert("Enter a commit message"); return; } try { await tauriInvoke("git_commit", { message: msg }); await refreshGitAll(); } catch (e) { alert("Commit failed: " + e); } };
@@ -1104,6 +1284,8 @@ document.querySelectorAll(".git-tab").forEach(btn => {
     const tabName = btn.dataset.tab;
     document.querySelectorAll(".git-section").forEach(s => s.classList.add("hidden"));
     document.getElementById("git-" + tabName).classList.remove("hidden");
+    // Diff tab shows the diff viewer (commit vs commit).
+    if (tabName === "diff") renderDiffViewer();
   });
 });
 

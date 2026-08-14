@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use editor_core::{DocumentBuffer, EditTransaction, TextEdit};
 use editor_domain::{ByteOffset, ByteRange, MarkdownProfile, ids::DocumentId};
-use editor_git::VersionControl;
+use editor_git::{GitExtended, VersionControl};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -209,6 +209,41 @@ struct GitCommitInfo {
     author: String,
     date: String,
     message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GitCommitEntry {
+    sha: String,
+    short_sha: String,
+    author: String,
+    author_email: String,
+    date: String,
+    message: String,
+    body: String,
+    parents: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GitStashInfo {
+    index: usize,
+    message: String,
+    branch: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GitTagInfo {
+    name: String,
+    target: String,
+    message: Option<String>,
+    is_lightweight: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GitRemoteInfo {
+    name: String,
+    url: String,
+    fetch_url: String,
+    push_url: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -704,6 +739,312 @@ fn git_log(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitCommitInfo
     Ok(commits)
 }
 
+// ---------------------------------------------------------------------------
+// Tauri commands — extended Git operations
+// ---------------------------------------------------------------------------
+
+/// Helper to open git for the active tab's directory.
+fn open_git_for_active(state: &tauri::State<'_, Mutex<AppState>>) -> Result<editor_git::GitCli, String> {
+    let dir = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        let tab = s.active_tab()?;
+        let path = tab.file_path.as_ref().ok_or("no file open")?;
+        let dir = path.parent().ok_or("no parent directory")?;
+        dir.to_path_buf()
+    };
+    editor_git::GitCli::open(dir).map_err(|e| e.to_string())
+}
+
+/// Diff between two commits.
+#[tauri::command]
+fn git_diff_commits(state: tauri::State<'_, Mutex<AppState>>, commit_a: String, commit_b: String) -> Result<Vec<GitFileDiff>, String> {
+    let git = open_git_for_active(&state)?;
+    let diffs = git.diff_commits(&commit_a, &commit_b).map_err(|e| e.to_string())?;
+    Ok(diffs.iter().map(|fd| GitFileDiff {
+        path: fd.path.clone(),
+        old_path: fd.old_path.clone(),
+        hunks: fd.hunks.iter().map(|h| GitHunkInfo {
+            old_start: h.old_start,
+            new_start: h.new_start,
+            lines: h.lines.iter().map(|lc| line_change_to_info(lc)).collect(),
+        }).collect(),
+    }).collect())
+}
+
+/// Diff between working tree and a specific commit.
+#[tauri::command]
+fn git_diff_vs_commit(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<Vec<GitFileDiff>, String> {
+    let git = open_git_for_active(&state)?;
+    let diffs = git.diff_working_tree_vs_commit(&commit).map_err(|e| e.to_string())?;
+    Ok(diffs.iter().map(|fd| GitFileDiff {
+        path: fd.path.clone(),
+        old_path: fd.old_path.clone(),
+        hunks: fd.hunks.iter().map(|h| GitHunkInfo {
+            old_start: h.old_start,
+            new_start: h.new_start,
+            lines: h.lines.iter().map(|lc| line_change_to_info(lc)).collect(),
+        }).collect(),
+    }).collect())
+}
+
+/// Get detailed commit log (with short SHA, body, parents).
+#[tauri::command]
+fn git_log_detailed(state: tauri::State<'_, Mutex<AppState>>, max_count: Option<usize>) -> Result<Vec<GitCommitEntry>, String> {
+    let git = open_git_for_active(&state)?;
+    let log = git.log(max_count.unwrap_or(100)).map_err(|e| e.to_string())?;
+    Ok(log.iter().map(|c| GitCommitEntry {
+        sha: c.sha.clone(),
+        short_sha: c.short_sha.clone(),
+        author: c.author.clone(),
+        author_email: c.author_email.clone(),
+        date: c.date.clone(),
+        message: c.message.clone(),
+        body: c.body.clone(),
+        parents: c.parents.clone(),
+    }).collect())
+}
+
+/// Stash operations.
+#[tauri::command]
+fn git_stash_list(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitStashInfo>, String> {
+    let git = open_git_for_active(&state)?;
+    let stashes = git.stash_list().map_err(|e| e.to_string())?;
+    Ok(stashes.iter().map(|s| GitStashInfo {
+        index: s.index,
+        message: s.message.clone(),
+        branch: s.branch.clone(),
+    }).collect())
+}
+
+#[tauri::command]
+fn git_stash_push(state: tauri::State<'_, Mutex<AppState>>, message: Option<String>) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.stash_push(message.as_deref()).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_stash_pop(state: tauri::State<'_, Mutex<AppState>>, index: usize) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.stash_pop(index).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_stash_apply(state: tauri::State<'_, Mutex<AppState>>, index: usize) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.stash_apply(index).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_stash_drop(state: tauri::State<'_, Mutex<AppState>>, index: usize) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.stash_drop(index).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Branch management.
+#[tauri::command]
+fn git_create_branch(state: tauri::State<'_, Mutex<AppState>>, name: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.create_branch(&name).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_delete_branch(state: tauri::State<'_, Mutex<AppState>>, name: String, force: bool) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.delete_branch(&name, force).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_rename_branch(state: tauri::State<'_, Mutex<AppState>>, old_name: String, new_name: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.rename_branch(&old_name, &new_name).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Merge.
+#[tauri::command]
+fn git_merge(state: tauri::State<'_, Mutex<AppState>>, branch: String, strategy: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    let strat = match strategy.as_str() {
+        "ff-only" => editor_git::MergeStrategy::FastForwardOnly,
+        "no-ff" => editor_git::MergeStrategy::NoFastForward,
+        "squash" => editor_git::MergeStrategy::Squash,
+        _ => editor_git::MergeStrategy::Merge,
+    };
+    git.merge(&branch, strat).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_merge_abort(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.merge_abort().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Rebase.
+#[tauri::command]
+fn git_rebase(state: tauri::State<'_, Mutex<AppState>>, branch: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.rebase(&branch).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_rebase_abort(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.rebase_abort().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_rebase_continue(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.rebase_continue().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Cherry-pick / Revert.
+#[tauri::command]
+fn git_cherry_pick(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.cherry_pick(&commit).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_revert(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.revert(&commit).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Tags.
+#[tauri::command]
+fn git_tags(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitTagInfo>, String> {
+    let git = open_git_for_active(&state)?;
+    let tags = git.tags().map_err(|e| e.to_string())?;
+    Ok(tags.iter().map(|t| GitTagInfo {
+        name: t.name.clone(),
+        target: t.target.clone(),
+        message: t.message.clone(),
+        is_lightweight: t.is_lightweight,
+    }).collect())
+}
+
+#[tauri::command]
+fn git_create_tag(state: tauri::State<'_, Mutex<AppState>>, name: String, message: Option<String>) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.create_tag(&name, message.as_deref()).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_delete_tag(state: tauri::State<'_, Mutex<AppState>>, name: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.delete_tag(&name).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Remotes.
+#[tauri::command]
+fn git_remotes(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitRemoteInfo>, String> {
+    let git = open_git_for_active(&state)?;
+    let remotes = git.remotes().map_err(|e| e.to_string())?;
+    Ok(remotes.iter().map(|r| GitRemoteInfo {
+        name: r.name.clone(),
+        url: r.url.clone(),
+        fetch_url: r.fetch_url.clone(),
+        push_url: r.push_url.clone(),
+    }).collect())
+}
+
+#[tauri::command]
+fn git_add_remote(state: tauri::State<'_, Mutex<AppState>>, name: String, url: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.add_remote(&name, &url).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_push_to_remote(state: tauri::State<'_, Mutex<AppState>>, remote: String, branch: String, force: bool) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.push_to_remote(&remote, &branch, force).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_pull_from_remote(state: tauri::State<'_, Mutex<AppState>>, remote: String, branch: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.pull_from_remote(&remote, &branch).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_fetch_remote(state: tauri::State<'_, Mutex<AppState>>, remote: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.fetch_remote(&remote).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Reset.
+#[tauri::command]
+fn git_reset_soft(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.reset_soft(&commit).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_reset_mixed(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.reset_mixed(&commit).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn git_reset_hard(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.reset_hard(&commit).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Clean untracked files.
+#[tauri::command]
+fn git_clean(state: tauri::State<'_, Mutex<AppState>>, directories: bool, force: bool) -> Result<bool, String> {
+    let git = open_git_for_active(&state)?;
+    git.clean(directories, force).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Get current branch name.
+#[tauri::command]
+fn git_current_branch(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, String> {
+    let git = open_git_for_active(&state)?;
+    git.current_branch().map_err(|e| e.to_string())
+}
+
+/// Get HEAD commit id.
+#[tauri::command]
+fn git_head_commit(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, String> {
+    let git = open_git_for_active(&state)?;
+    let id = git.head_commit().map_err(|e| e.to_string())?;
+    Ok(id.0)
+}
+
+/// Read a file at a specific revision.
+#[tauri::command]
+fn git_read_file_at_revision(state: tauri::State<'_, Mutex<AppState>>, file_path: String, revision: String) -> Result<String, String> {
+    let git = open_git_for_active(&state)?;
+    let bytes = editor_git::read_file_at_revision(&git, &file_path, &revision).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
 /// Check if the active document has unsaved changes.
 #[tauri::command]
 fn is_dirty(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
@@ -727,7 +1068,7 @@ fn open_relative_file(
     state: tauri::State<'_, Mutex<AppState>>,
     relative_path: String,
 ) -> Result<DocumentInfo, String> {
-    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let s = state.lock().map_err(|e| e.to_string())?;
     let active = s.active_tab()?;
     let base_dir = active.file_path.as_ref()
         .and_then(|p| p.parent())
@@ -1011,6 +1352,39 @@ pub fn run() {
             git_checkout,
             git_file_history,
             git_log,
+            git_diff_commits,
+            git_diff_vs_commit,
+            git_log_detailed,
+            git_stash_list,
+            git_stash_push,
+            git_stash_pop,
+            git_stash_apply,
+            git_stash_drop,
+            git_create_branch,
+            git_delete_branch,
+            git_rename_branch,
+            git_merge,
+            git_merge_abort,
+            git_rebase,
+            git_rebase_abort,
+            git_rebase_continue,
+            git_cherry_pick,
+            git_revert,
+            git_tags,
+            git_create_tag,
+            git_delete_tag,
+            git_remotes,
+            git_add_remote,
+            git_push_to_remote,
+            git_pull_from_remote,
+            git_fetch_remote,
+            git_reset_soft,
+            git_reset_mixed,
+            git_reset_hard,
+            git_clean,
+            git_current_branch,
+            git_head_commit,
+            git_read_file_at_revision,
             is_dirty,
             get_file_name,
             open_relative_file,
