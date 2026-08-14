@@ -53,6 +53,8 @@
       <span id="dirty-indicator" class="dirty-dot"></span>
       <span class="spacer"></span>
       <span id="git-branch-info"></span>
+      <span class="separator"></span>
+      <button id="btn-settings" title="Settings">⚙</button>
     </div>
 
     <!-- Main area -->
@@ -85,6 +87,47 @@
 
     <!-- Context menu (right-click on files in Changes) -->
     <div id="context-menu" class="hidden"></div>
+
+    <!-- Settings modal -->
+    <div id="settings-modal" class="modal-overlay hidden">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <span class="modal-title">Settings</span>
+          <button id="settings-close" class="modal-close" title="Close">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="settings-tabs">
+            <button class="settings-tab active" data-stab="themes">Themes</button>
+            <button class="settings-tab" data-stab="github">GitHub</button>
+          </div>
+          <div id="settings-themes" class="settings-panel">
+            <div class="settings-section-title">Interface Theme</div>
+            <div id="theme-grid" class="theme-grid"></div>
+            <div class="settings-section-title" style="margin-top:16px">Code Syntax Palette</div>
+            <div id="syntax-grid" class="theme-grid"></div>
+            <div class="settings-section-title" style="margin-top:16px">Preview</div>
+            <div id="theme-preview" class="theme-preview"></div>
+          </div>
+          <div id="settings-github" class="settings-panel hidden">
+            <div class="settings-section-title">GitHub Authentication</div>
+            <div id="github-auth-status" class="github-auth-status"></div>
+            <div class="github-actions">
+              <button id="btn-gh-login" class="git-action-btn">Login with gh CLI</button>
+              <button id="btn-gh-refresh" class="git-action-btn">Refresh status</button>
+              <button id="btn-gh-logout" class="git-action-btn danger">Logout</button>
+            </div>
+            <div class="settings-section-title" style="margin-top:16px">Repository</div>
+            <div id="github-repo-info" class="github-repo-info"></div>
+            <div class="github-actions">
+              <button id="btn-gh-prs" class="git-action-btn">Load Pull Requests</button>
+              <button id="btn-gh-branches" class="git-action-btn">Load Remote Branches</button>
+            </div>
+            <div id="github-prs" class="github-prs"></div>
+            <div id="github-branches" class="github-branches"></div>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- Status bar -->
     <div id="status-bar">

@@ -25,6 +25,41 @@ let suppressRender = false;
 let suppressBlur = false;  // prevent exitEditMode when clicking toolbar buttons
 let isTearOffWindow = false; // true for torn-off windows — show only their own tab
 
+// ── Settings state ─────────────────────────────────────────────────────────
+const SETTINGS_KEY = "womd_settings";
+const settings = loadSettings();
+
+/// Available interface themes.
+const THEMES = [
+  { id: "mocha", name: "Catppuccin Mocha", dark: true, swatches: ["#1e1e2e", "#cdd6f4", "#89b4fa", "#a6e3a1", "#f38ba8"] },
+  { id: "latte", name: "Catppuccin Latte", dark: false, swatches: ["#eff1f5", "#4c4f69", "#1e66f5", "#40a02b", "#d20f39"] },
+  { id: "monokai", name: "Monokai", dark: true, swatches: ["#272822", "#f8f8f2", "#66d9ef", "#a6e22e", "#f92672"] },
+  { id: "solarized-dark", name: "Solarized Dark", dark: true, swatches: ["#002b36", "#93a1a1", "#268bd2", "#859900", "#dc322f"] },
+  { id: "github-dark", name: "GitHub Dark", dark: true, swatches: ["#0d1117", "#c9d1d9", "#58a6ff", "#7ee787", "#f85149"] },
+  { id: "dracula", name: "Dracula", dark: true, swatches: ["#282a36", "#f8f8f2", "#bd93f9", "#50fa7b", "#ff5555"] },
+  { id: "one-dark", name: "One Dark", dark: true, swatches: ["#282c34", "#abb2bf", "#61afef", "#98c379", "#e06c75"] },
+];
+
+/// Available syntax palettes (same as themes — each theme has its own syntax colors).
+const SYNTAX_PALETTES = THEMES; // 1:1 mapping for now
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return { theme: "mocha", syntaxTheme: "mocha" };
+}
+
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+}
+
+/// Apply the current theme to the document.
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", settings.theme);
+}
+
 // ── DOM ─────────────────────────────────────────────────────────────────────
 const blockEditor = document.getElementById("block-editor");
 const fileNameEl = document.getElementById("file-name");
@@ -62,6 +97,9 @@ const gitTags = document.getElementById("git-tags");
 const gitRemotes = document.getElementById("git-remotes");
 const gitDivider = document.getElementById("git-divider");
 const contextMenu = document.getElementById("context-menu");
+const btnSettings = document.getElementById("btn-settings");
+const settingsModal = document.getElementById("settings-modal");
+const settingsClose = document.getElementById("settings-close");
 
 // ── File dialog ─────────────────────────────────────────────────────────────
 async function openFileDialog() {
@@ -1910,3 +1948,212 @@ async function openDocument(path) {
 
 if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", init); }
 else { init(); }
+
+// ── Settings modal ─────────────────────────────────────────────────────────
+
+/// Open settings modal.
+function openSettings() {
+  settingsModal.classList.remove("hidden");
+  renderThemeGrid();
+  renderSyntaxGrid();
+  renderThemePreview();
+  refreshGithubStatus();
+}
+
+/// Close settings modal.
+function closeSettings() {
+  settingsModal.classList.add("hidden");
+}
+
+btnSettings.addEventListener("click", openSettings);
+settingsClose.addEventListener("click", closeSettings);
+settingsModal.addEventListener("click", (e) => {
+  if (e.target === settingsModal) closeSettings();
+});
+
+// Settings tab switching.
+document.querySelectorAll(".settings-tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".settings-tab").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    const tabName = btn.dataset.stab;
+    document.querySelectorAll(".settings-panel").forEach(p => p.classList.add("hidden"));
+    document.getElementById("settings-" + tabName).classList.remove("hidden");
+    if (tabName === "github") refreshGithubStatus();
+  });
+});
+
+/// Render the interface theme grid.
+function renderThemeGrid() {
+  const grid = document.getElementById("theme-grid");
+  let html = "";
+  for (const t of THEMES) {
+    const selected = settings.theme === t.id ? " selected" : "";
+    const swatches = t.swatches.map(c => `<div class="theme-swatch" style="background:${c}"></div>`).join("");
+    html += `<div class="theme-card${selected}" data-theme-id="${escapeAttr(t.id)}" onclick="selectTheme('${escapeAttr(t.id)}')">
+      <div class="theme-card-name">${escapeHtml(t.name)}</div>
+      <div class="theme-card-swatches">${swatches}</div>
+    </div>`;
+  }
+  grid.innerHTML = html;
+}
+
+/// Render the syntax palette grid.
+function renderSyntaxGrid() {
+  const grid = document.getElementById("syntax-grid");
+  let html = "";
+  for (const t of SYNTAX_PALETTES) {
+    const selected = settings.syntaxTheme === t.id ? " selected" : "";
+    const swatches = t.swatches.map(c => `<div class="theme-swatch" style="background:${c}"></div>`).join("");
+    html += `<div class="theme-card${selected}" data-syntax-id="${escapeAttr(t.id)}" onclick="selectSyntaxTheme('${escapeAttr(t.id)}')">
+      <div class="theme-card-name">${escapeHtml(t.name)}</div>
+      <div class="theme-card-swatches">${swatches}</div>
+    </div>`;
+  }
+  grid.innerHTML = html;
+}
+
+/// Select an interface theme.
+window.selectTheme = function(themeId) {
+  settings.theme = themeId;
+  // Also update syntax theme to match if they're in sync.
+  settings.syntaxTheme = themeId;
+  applyTheme();
+  saveSettings();
+  renderThemeGrid();
+  renderSyntaxGrid();
+  renderThemePreview();
+};
+
+/// Select a syntax palette independently.
+window.selectSyntaxTheme = function(themeId) {
+  settings.syntaxTheme = themeId;
+  // For now, syntax colors are tied to the interface theme's data-theme attribute.
+  // To support independent syntax palettes, we'd need a separate attribute.
+  // For now, just update the interface theme to match.
+  settings.theme = themeId;
+  applyTheme();
+  saveSettings();
+  renderThemeGrid();
+  renderSyntaxGrid();
+  renderThemePreview();
+};
+
+/// Render a preview of the current theme.
+function renderThemePreview() {
+  const preview = document.getElementById("theme-preview");
+  if (!preview) return;
+  preview.innerHTML = `
+    <div class="pv-heading">Heading Example</div>
+    <p class="syn-plain">This is a paragraph with <span class="pv-link">a link</span>,
+      <span class="pv-emphasis">emphasized text</span>, and <span class="pv-code">inline code</span>.</p>
+    <div class="pv-quote">This is a blockquote.</div>
+    <div class="pv-syntax">
+<span class="syn-cmt">// Example code</span>
+<span class="syn-kw">fn</span> <span class="syn-fn">main</span>() {
+  <span class="syn-kw">let</span> <span class="syn-var">x</span>: <span class="syn-type">i32</span> <span class="syn-op">=</span> <span class="syn-num">42</span>;
+  <span class="syn-fn">println!</span>(<span class="syn-str">"Hello, world!"</span>);
+}
+    </div>
+  `;
+}
+
+// Apply theme on load.
+applyTheme();
+
+// ── GitHub integration ─────────────────────────────────────────────────────
+
+/// Refresh GitHub auth status and repo info.
+async function refreshGithubStatus() {
+  const statusDiv = document.getElementById("github-auth-status");
+  const repoDiv = document.getElementById("github-repo-info");
+  if (!statusDiv) return;
+  statusDiv.innerHTML = '<div class="gh-status-line"><span class="gh-status-icon">⏳</span> Checking GitHub authentication...</div>';
+  try {
+    const result = await tauriInvoke("github_auth_status");
+    if (result.authenticated) {
+      statusDiv.innerHTML = `<div class="gh-status-line"><span class="gh-status-icon">✓</span> Authenticated as <span class="gh-user">${escapeHtml(result.user)}</span></div>
+        <div class="gh-status-line" style="color:var(--fg-muted);font-size:11px">via gh CLI</div>`;
+    } else {
+      statusDiv.innerHTML = `<div class="gh-status-line"><span class="gh-status-icon">✗</span> <span class="gh-error">Not authenticated</span></div>
+        <div class="gh-status-line" style="color:var(--fg-muted);font-size:11px">Click "Login with gh CLI" to authenticate</div>`;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<div class="gh-status-line"><span class="gh-status-icon">✗</span> <span class="gh-error">Error: ${escapeHtml(String(e))}</span></div>`;
+  }
+  // Try to load repo info.
+  if (repoDiv) {
+    try {
+      const repo = await tauriInvoke("github_repo_metadata");
+      if (repo && repo.full_name) {
+        repoDiv.innerHTML = `<div class="gh-repo-name">${escapeHtml(repo.full_name)}</div>
+          <div class="gh-repo-branch">Default branch: ${escapeHtml(repo.default_branch || "unknown")}</div>
+          <div class="gh-repo-url">${escapeHtml(repo.html_url || "")}</div>`;
+      } else {
+        repoDiv.innerHTML = '<div style="color:var(--fg-muted)">No repository metadata available. Make sure you are in a GitHub repo.</div>';
+      }
+    } catch (e) {
+      repoDiv.innerHTML = `<div style="color:var(--fg-muted)">No repository metadata available.</div>`;
+    }
+  }
+}
+
+document.getElementById("btn-gh-login").addEventListener("click", async () => {
+  try {
+    await tauriInvoke("github_login");
+    refreshGithubStatus();
+  } catch (e) { alert("GitHub login failed: " + e); }
+});
+
+document.getElementById("btn-gh-refresh").addEventListener("click", refreshGithubStatus);
+
+document.getElementById("btn-gh-logout").addEventListener("click", async () => {
+  if (!confirm("Logout from GitHub?")) return;
+  try {
+    await tauriInvoke("github_logout");
+    refreshGithubStatus();
+  } catch (e) { alert("Logout failed: " + e); }
+});
+
+document.getElementById("btn-gh-prs").addEventListener("click", async () => {
+  const div = document.getElementById("github-prs");
+  div.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">Loading PRs...</div>';
+  try {
+    const prs = await tauriInvoke("github_pull_requests");
+    if (!prs || prs.length === 0) {
+      div.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">No pull requests</div>';
+    } else {
+      let html = '<div class="settings-section-title">Pull Requests</div>';
+      for (const pr of prs) {
+        const stateClass = pr.state === "open" ? "open" : "closed";
+        html += `<div class="github-pr-entry">
+          <span class="pr-number">#${pr.number}</span>
+          <span class="pr-title">${escapeHtml(pr.title)}</span>
+          <span class="pr-state ${stateClass}">${escapeHtml(pr.state)}</span>
+        </div>`;
+      }
+      div.innerHTML = html;
+    }
+  } catch (e) {
+    div.innerHTML = `<div style="padding:8px;color:var(--diff-del)">${escapeHtml(String(e))}</div>`;
+  }
+});
+
+document.getElementById("btn-gh-branches").addEventListener("click", async () => {
+  const div = document.getElementById("github-branches");
+  div.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">Loading branches...</div>';
+  try {
+    const branches = await tauriInvoke("github_remote_branches");
+    if (!branches || branches.length === 0) {
+      div.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">No remote branches</div>';
+    } else {
+      let html = '<div class="settings-section-title">Remote Branches</div>';
+      for (const br of branches) {
+        html += `<div class="github-branch-entry"><span class="br-name">${escapeHtml(br.name)}</span></div>`;
+      }
+      div.innerHTML = html;
+    }
+  } catch (e) {
+    div.innerHTML = `<div style="padding:8px;color:var(--diff-del)">${escapeHtml(String(e))}</div>`;
+  }
+});

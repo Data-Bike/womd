@@ -1156,6 +1156,209 @@ fn git_repo_root(state: tauri::State<'_, Mutex<AppState>>) -> Result<Option<Stri
     }
 }
 
+// ── GitHub integration (via gh CLI) ────────────────────────────────────────
+// We shell out to `gh` directly (like editor-git shells out to `git`).
+// This avoids depending on the adapters/github crate (Invariant 3,4).
+
+/// Run `gh` in the active document's directory and return stdout.
+fn gh_exec_text(state: &tauri::State<'_, Mutex<AppState>>, args: &[&str]) -> Result<String, String> {
+    let dir = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        let tab = s.active_tab()?;
+        let path = tab.file_path.as_ref().ok_or("no file open")?;
+        let dir = path.parent().ok_or("no parent directory")?;
+        dir.to_path_buf()
+    };
+    let gh_bin = std::env::var("GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    let out = std::process::Command::new(&gh_bin)
+        .current_dir(&dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("gh CLI not available: {}", e))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(stderr)
+    }
+}
+
+/// GitHub auth status response.
+#[derive(Serialize, Deserialize)]
+struct GithubAuthStatus {
+    authenticated: bool,
+    user: String,
+}
+
+/// GitHub repo metadata response.
+#[derive(Serialize, Deserialize)]
+struct GithubRepoMetadata {
+    full_name: String,
+    default_branch: String,
+    html_url: String,
+}
+
+/// GitHub PR response.
+#[derive(Serialize, Deserialize)]
+struct GithubPullRequest {
+    number: i64,
+    title: String,
+    state: String,
+    html_url: String,
+}
+
+/// GitHub remote branch response.
+#[derive(Serialize, Deserialize)]
+struct GithubRemoteBranch {
+    name: String,
+}
+
+/// Check GitHub auth status via `gh auth status`.
+#[tauri::command]
+fn github_auth_status(state: tauri::State<'_, Mutex<AppState>>) -> Result<GithubAuthStatus, String> {
+    let text = gh_exec_text(&state, &["auth", "status"]);
+    match text {
+        Ok(t) => {
+            // Parse "Logged in to github.com as <user>" or similar.
+            let user = t
+                .lines()
+                .find_map(|l| {
+                    if l.contains("Logged in") {
+                        // Try "account <user>" or "as <user>"
+                        if let Some(idx) = l.find("account ") {
+                            Some(l[idx + 8..].split(' ').next().unwrap_or("").trim().to_string())
+                        } else if let Some(idx) = l.find("as ") {
+                            Some(l[idx + 3..].split(' ').next().unwrap_or("").trim().to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            Ok(GithubAuthStatus { authenticated: true, user })
+        }
+        Err(_) => Ok(GithubAuthStatus { authenticated: false, user: String::new() }),
+    }
+}
+
+/// Login via `gh auth login` (interactive — opens browser).
+#[tauri::command]
+fn github_login(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    // gh auth login is interactive — we can't run it in a non-interactive context.
+    // Instead, we'll try `gh auth login --web` which opens a browser.
+    // If that fails, we tell the user to run it manually.
+    let _dir = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        let tab = s.active_tab()?;
+        let path = tab.file_path.as_ref().ok_or("no file open")?;
+        let dir = path.parent().ok_or("no parent directory")?;
+        dir.to_path_buf()
+    };
+    let gh_bin = std::env::var("GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    // Check if gh is installed.
+    let check = std::process::Command::new(&gh_bin).arg("--version").output();
+    if check.is_err() {
+        return Err("gh CLI is not installed. Please install it from https://cli.github.com/".to_string());
+    }
+    // Open a terminal-like prompt — we can't do interactive login from Tauri.
+    // Instead, instruct the user.
+    Err("Please run 'gh auth login' in a terminal to authenticate with GitHub.".to_string())
+}
+
+/// Logout via `gh auth logout`.
+#[tauri::command]
+fn github_logout(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    let _ = gh_exec_text(&state, &["auth", "logout", "--yes"])?;
+    Ok(true)
+}
+
+/// Get repository metadata via `gh repo view`.
+#[tauri::command]
+fn github_repo_metadata(state: tauri::State<'_, Mutex<AppState>>) -> Result<GithubRepoMetadata, String> {
+    let text = gh_exec_text(&state, &["repo", "view", "--json", "nameWithOwner,defaultBranchRef,url"])?;
+    let full_name = extract_json_field(&text, "nameWithOwner");
+    let default_branch = extract_json_field(&text, "defaultBranchRef");
+    let html_url = extract_json_field(&text, "url");
+    Ok(GithubRepoMetadata { full_name, default_branch, html_url })
+}
+
+/// List pull requests via `gh pr list`.
+#[tauri::command]
+fn github_pull_requests(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GithubPullRequest>, String> {
+    let text = gh_exec_text(&state, &["pr", "list", "--json", "number,title,state,url", "--limit", "30"])?;
+    let mut prs = Vec::new();
+    // Parse JSON lines — gh outputs a JSON array.
+    for line in text.lines() {
+        if line.contains("\"number\"") {
+            let number = extract_json_int(line, "number");
+            let title = extract_json_field(line, "title");
+            let state = extract_json_field(line, "state");
+            let html_url = extract_json_field(line, "url");
+            prs.push(GithubPullRequest { number, title, state, html_url });
+        }
+    }
+    Ok(prs)
+}
+
+/// List remote branches via `git branch -r`.
+#[tauri::command]
+fn github_remote_branches(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GithubRemoteBranch>, String> {
+    let git = open_git_for_active(&state)?;
+    let text = git.exec_text(&["branch", "-r", "--list"]).map_err(|e| e.to_string())?;
+    let mut branches = Vec::new();
+    for line in text.lines() {
+        let name = line.trim().to_string();
+        if !name.is_empty() && !name.contains(" -> ") {
+            branches.push(GithubRemoteBranch { name });
+        }
+    }
+    Ok(branches)
+}
+
+/// Extract a JSON string field value (simple parser — no serde dependency on gh output).
+fn extract_json_field(text: &str, field: &str) -> String {
+    let needle = format!("\"{}\":", field);
+    if let Some(idx) = text.find(&needle) {
+        let rest = &text[idx + needle.len()..];
+        let rest = rest.trim_start();
+        if rest.starts_with('"') {
+            let inner = &rest[1..];
+            if let Some(end) = inner.find('"') {
+                return inner[..end].to_string();
+            }
+        } else if rest.starts_with('{') {
+            // Nested object — extract "name" sub-field for defaultBranchRef.
+            if let Some(name_idx) = rest.find("\"name\":") {
+                let name_rest = &rest[name_idx + 7..];
+                let name_rest = name_rest.trim_start();
+                if name_rest.starts_with('"') {
+                    let inner = &name_rest[1..];
+                    if let Some(end) = inner.find('"') {
+                        return inner[..end].to_string();
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Extract a JSON integer field value.
+fn extract_json_int(text: &str, field: &str) -> i64 {
+    let needle = format!("\"{}\":", field);
+    if let Some(idx) = text.find(&needle) {
+        let rest = &text[idx + needle.len()..];
+        let rest = rest.trim_start();
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+        if let Ok(n) = num_str.parse() {
+            return n;
+        }
+    }
+    0
+}
+
 /// Open a file by relative path (resolved against the active document's directory).
 /// Used for `[link](other.md)` navigation — opens in a new tab.
 #[tauri::command]
@@ -1566,6 +1769,12 @@ pub fn run() {
             get_file_name,
             get_active_file_path,
             git_repo_root,
+            github_auth_status,
+            github_login,
+            github_logout,
+            github_repo_metadata,
+            github_pull_requests,
+            github_remote_branches,
             open_relative_file,
             get_tear_off_file,
         ])
@@ -1849,5 +2058,47 @@ mod tests {
     #[test]
     fn test_root_pathspec_empty() {
         assert_eq!(root_pathspec(""), ":/");
+    }
+
+    /// extract_json_field should parse string values.
+    #[test]
+    fn test_extract_json_field_string() {
+        let json = r#"{"nameWithOwner":"user/repo","url":"https://github.com/user/repo"}"#;
+        assert_eq!(extract_json_field(json, "nameWithOwner"), "user/repo");
+        assert_eq!(extract_json_field(json, "url"), "https://github.com/user/repo");
+    }
+
+    /// extract_json_field should handle nested objects (defaultBranchRef).
+    #[test]
+    fn test_extract_json_field_nested() {
+        let json = r#"{"defaultBranchRef":{"name":"main","ref":"refs/heads/main"}}"#;
+        assert_eq!(extract_json_field(json, "defaultBranchRef"), "main");
+    }
+
+    /// extract_json_field should return empty for missing fields.
+    #[test]
+    fn test_extract_json_field_missing() {
+        let json = r#"{"foo":"bar"}"#;
+        assert_eq!(extract_json_field(json, "baz"), "");
+    }
+
+    /// extract_json_int should parse integer values.
+    #[test]
+    fn test_extract_json_int() {
+        let json = r#"{"number":42,"title":"test"}"#;
+        assert_eq!(extract_json_int(json, "number"), 42);
+    }
+
+    /// extract_json_int should handle zero and negative.
+    #[test]
+    fn test_extract_json_int_edge() {
+        assert_eq!(extract_json_int(r#"{"n":0}"#, "n"), 0);
+        assert_eq!(extract_json_int(r#"{"n":-5}"#, "n"), -5);
+    }
+
+    /// extract_json_int should return 0 for missing fields.
+    #[test]
+    fn test_extract_json_int_missing() {
+        assert_eq!(extract_json_int(r#"{"foo":"bar"}"#, "n"), 0);
     }
 }
