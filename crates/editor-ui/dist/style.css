@@ -265,22 +265,67 @@ body {
 #tab-new:hover { color: var(--accent); background: rgba(137, 180, 250, 0.1); }
 
 /* Toolbar */
-#toolbar { display: flex; align-items: center; gap: 4px; padding: 6px 12px; background: var(--bg-toolbar); border-bottom: 1px solid var(--border); font-size: 13px; }
-#toolbar button { background: transparent; border: 1px solid transparent; color: var(--fg); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 13px; min-width: 28px; }
+#toolbar { display: flex; align-items: center; gap: 4px; padding: 6px 12px; background: var(--bg-toolbar); border-bottom: 1px solid var(--border); font-size: 13px; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+#toolbar::-webkit-scrollbar { height: 4px; }
+#toolbar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+#toolbar button { background: transparent; border: 1px solid transparent; color: var(--fg); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 13px; min-width: 28px; flex-shrink: 0; }
 #toolbar button:hover:not(:disabled) { background: rgba(137, 180, 250, 0.15); border-color: var(--accent); }
 #toolbar button:disabled { opacity: 0.4; cursor: default; }
 #toolbar button.active { background: rgba(137, 180, 250, 0.25); border-color: var(--accent); color: var(--accent); }
-#toolbar select { background: var(--bg-toolbar); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; font-size: 13px; cursor: pointer; }
-#toolbar .separator { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
-#toolbar .spacer { flex: 1; }
-#file-name { font-weight: 600; color: var(--accent); margin-left: 8px; }
-.dirty-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: transparent; margin-left: 4px; }
+#toolbar select { background: var(--bg-toolbar); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; font-size: 13px; cursor: pointer; flex-shrink: 0; }
+#toolbar .separator { width: 1px; height: 20px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
+#toolbar .spacer { flex: 1 0 auto; min-width: 20px; }
+#file-name { font-weight: 600; color: var(--accent); margin-left: 8px; flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dirty-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: transparent; margin-left: 4px; flex-shrink: 0; }
 .dirty-dot.active { background: var(--dirty); }
-#git-branch-info { color: var(--accent); font-size: 12px; font-weight: 600; }
+#git-branch-info { color: var(--accent); font-size: 12px; font-weight: 600; flex-shrink: 0; }
 
 /* Main area */
 #main-area { flex: 1; display: flex; overflow: hidden; min-height: 0; }
 #editor-container { flex: 1; overflow: hidden; position: relative; min-width: 200px; }
+
+/* File tree sidebar */
+#file-tree-panel { width: 260px; min-width: 180px; max-width: 500px; background: var(--bg-tab); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
+#file-tree-panel.hidden { display: none; }
+#file-tree-header { display: flex; align-items: center; gap: 4px; padding: 6px 8px; background: var(--bg-toolbar); border-bottom: 1px solid var(--border); font-size: 12px; }
+#file-tree-root-name { flex: 1; color: var(--accent); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#file-tree-actions { display: flex; gap: 2px; flex-shrink: 0; }
+#file-tree-actions button { background: transparent; border: none; color: var(--fg-muted); cursor: pointer; padding: 2px 4px; border-radius: 3px; font-size: 14px; }
+#file-tree-actions button:hover { background: var(--bg-tab-active); color: var(--fg); }
+#file-tree-search { padding: 4px 8px; border-bottom: 1px solid var(--border); }
+#file-tree-filter { width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 12px; }
+#file-tree-filter:focus { outline: none; border-color: var(--accent); }
+#file-tree-content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 0; font-size: 13px; }
+#file-tree-content::-webkit-scrollbar { width: 6px; }
+#file-tree-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+.file-tree-item { display: flex; align-items: center; gap: 4px; padding: 2px 8px; cursor: pointer; user-select: none; white-space: nowrap; color: var(--fg); line-height: 1.6; }
+.file-tree-item:hover { background: rgba(137, 180, 250, 0.08); }
+.file-tree-item.selected { background: rgba(137, 180, 250, 0.15); }
+.file-tree-item .ft-icon { width: 16px; text-align: center; flex-shrink: 0; font-size: 13px; }
+.file-tree-item .ft-name { overflow: hidden; text-overflow: ellipsis; }
+.file-tree-item .ft-chevron { width: 12px; text-align: center; flex-shrink: 0; color: var(--fg-muted); font-size: 10px; transition: transform 0.1s; }
+.file-tree-item.expanded .ft-chevron { transform: rotate(90deg); }
+.file-tree-item.folder .ft-name { font-weight: 500; }
+.file-tree-item.file .ft-name { color: var(--fg); }
+.file-tree-item.file .ft-icon { color: var(--accent); }
+.file-tree-children { overflow: hidden; }
+.file-tree-children.collapsed { display: none; }
+.file-tree-empty { padding: 16px 12px; color: var(--fg-muted); font-size: 12px; text-align: center; }
+
+/* File tree divider (resizable) */
+#file-tree-divider { width: 5px; min-width: 5px; max-width: 5px; background: var(--border); cursor: col-resize; flex-shrink: 0; transition: background 0.15s; }
+#file-tree-divider:hover, #file-tree-divider.dragging { background: var(--accent); }
+#file-tree-divider.hidden { display: none; }
+
+/* File context menu */
+#file-context-menu { position: fixed; z-index: 10002; background: var(--bg-toolbar); border: 1px solid var(--border); border-radius: 6px; padding: 4px; min-width: 160px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
+#file-context-menu.hidden { display: none; }
+.fc-menu-item { padding: 6px 12px; cursor: pointer; border-radius: 4px; font-size: 13px; color: var(--fg); display: flex; align-items: center; gap: 8px; }
+.fc-menu-item:hover { background: rgba(137, 180, 250, 0.15); }
+.fc-menu-item.danger { color: var(--diff-del); }
+.fc-menu-item.danger:hover { background: rgba(243, 139, 168, 0.15); }
+.fc-menu-separator { height: 1px; background: var(--border); margin: 4px 0; }
 
 /* Resizable divider between editor and git panel */
 #git-divider {

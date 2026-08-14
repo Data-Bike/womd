@@ -47,6 +47,7 @@
       <span class="separator"></span>
       <button id="btn-task" title="Task list">☐</button>
       <span class="separator"></span>
+      <button id="btn-tree-toggle" title="Toggle file tree sidebar (Ctrl+Shift+E)">☰</button>
       <button id="btn-view-toggle" title="Toggle Markdown source view (Ctrl+Shift+M)">MD</button>
       <button id="btn-git" title="Toggle Git panel">Git</button>
       <span class="separator"></span>
@@ -60,6 +61,23 @@
 
     <!-- Main area -->
     <div id="main-area">
+      <!-- File tree sidebar -->
+      <div id="file-tree-panel" class="hidden">
+        <div id="file-tree-header">
+          <span id="file-tree-root-name">No folder open</span>
+          <div id="file-tree-actions">
+            <button id="btn-tree-open-folder" title="Open folder as root">📂</button>
+            <button id="btn-tree-set-root" title="Set selected folder as root">📁→</button>
+            <button id="btn-tree-up" title="Go to parent folder">↑</button>
+            <button id="btn-tree-close" title="Close sidebar">×</button>
+          </div>
+        </div>
+        <div id="file-tree-search">
+          <input type="text" id="file-tree-filter" placeholder="Filter files..." />
+        </div>
+        <div id="file-tree-content"></div>
+      </div>
+      <div id="file-tree-divider" class="hidden"></div>
       <div id="editor-container">
         <div id="block-editor"></div>
       </div>
@@ -88,6 +106,9 @@
 
     <!-- Context menu (right-click on files in Changes) -->
     <div id="context-menu" class="hidden"></div>
+
+    <!-- File tree context menu -->
+    <div id="file-context-menu" class="hidden"></div>
 
     <!-- Settings modal -->
     <div id="settings-modal" class="modal-overlay hidden">

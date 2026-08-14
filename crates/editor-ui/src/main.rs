@@ -1410,6 +1410,146 @@ fn open_relative_file(
     Ok(info)
 }
 
+// ── File tree commands ─────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct FileTreeEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: u64,
+}
+
+/// List directory contents (non-recursive). Returns folders first, then files.
+#[tauri::command]
+fn list_directory(dir_path: String) -> Result<Vec<FileTreeEntry>, String> {
+    let path = std::path::Path::new(&dir_path);
+    if !path.exists() {
+        return Err(format!("Path does not exist: {}", dir_path));
+    }
+    if !path.is_dir() {
+        return Err(format!("Not a directory: {}", dir_path));
+    }
+    let mut entries = Vec::new();
+    let read = std::fs::read_dir(path).map_err(|e| e.to_string())?;
+    for entry in read {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        // Skip hidden files/dirs (starting with '.') on all platforms.
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        entries.push(FileTreeEntry {
+            name,
+            path: entry.path().to_string_lossy().to_string(),
+            is_dir: file_type.is_dir(),
+            size,
+        });
+    }
+    // Sort: directories first, then alphabetically.
+    entries.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+/// Get the parent directory of a path.
+#[tauri::command]
+fn get_parent_dir(dir_path: String) -> Result<Option<String>, String> {
+    let path = std::path::Path::new(&dir_path);
+    Ok(path.parent().map(|p| p.to_string_lossy().to_string()))
+}
+
+/// Copy a file or directory to a destination.
+#[tauri::command]
+fn copy_file(src_path: String, dest_path: String) -> Result<bool, String> {
+    let src = std::path::Path::new(&src_path);
+    let dest = std::path::Path::new(&dest_path);
+    if !src.exists() {
+        return Err(format!("Source does not exist: {}", src_path));
+    }
+    if dest.exists() {
+        return Err(format!("Destination already exists: {}", dest_path));
+    }
+    if src.is_dir() {
+        copy_dir_recursive(src, dest).map_err(|e| e.to_string())?;
+    } else {
+        std::fs::copy(src, dest).map_err(|e| e.to_string())?;
+    }
+    Ok(true)
+}
+
+/// Move/rename a file or directory.
+#[tauri::command]
+fn move_file(src_path: String, dest_path: String) -> Result<bool, String> {
+    let src = std::path::Path::new(&src_path);
+    let dest = std::path::Path::new(&dest_path);
+    if !src.exists() {
+        return Err(format!("Source does not exist: {}", src_path));
+    }
+    if dest.exists() {
+        return Err(format!("Destination already exists: {}", dest_path));
+    }
+    std::fs::rename(src, dest).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Delete a file or directory.
+#[tauri::command]
+fn delete_file(path: String) -> Result<bool, String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+    if p.is_dir() {
+        std::fs::remove_dir_all(p).map_err(|e| e.to_string())?;
+    } else {
+        std::fs::remove_file(p).map_err(|e| e.to_string())?;
+    }
+    Ok(true)
+}
+
+/// Create a new file (with empty content).
+#[tauri::command]
+fn create_file(path: String) -> Result<bool, String> {
+    let p = std::path::Path::new(&path);
+    if p.exists() {
+        return Err(format!("File already exists: {}", path));
+    }
+    std::fs::write(p, b"").map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Create a new directory.
+#[tauri::command]
+fn create_directory(path: String) -> Result<bool, String> {
+    let p = std::path::Path::new(&path);
+    if p.exists() {
+        return Err(format!("Directory already exists: {}", path));
+    }
+    std::fs::create_dir(p).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Recursively copy a directory.
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else {
+            std::fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Retrieve the tear-off file path for the current window.
 /// Called by the new window's init() to know which file to open.
 /// Returns None if this is not a torn-off window.
@@ -1776,6 +1916,13 @@ pub fn run() {
             github_pull_requests,
             github_remote_branches,
             open_relative_file,
+            list_directory,
+            get_parent_dir,
+            copy_file,
+            move_file,
+            delete_file,
+            create_file,
+            create_directory,
             get_tear_off_file,
         ])
         .setup(|_app| {
@@ -2100,5 +2247,109 @@ mod tests {
     #[test]
     fn test_extract_json_int_missing() {
         assert_eq!(extract_json_int(r#"{"foo":"bar"}"#, "n"), 0);
+    }
+
+    /// list_directory should return entries sorted (dirs first).
+    #[test]
+    fn test_list_directory_sorts_dirs_first() {
+        let dir = std::env::temp_dir().join("womd_test_list_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("z.txt"), b"z").unwrap();
+        std::fs::create_dir(dir.join("subfolder")).unwrap();
+        // Call the command logic directly (not via Tauri).
+        let entries = list_directory(dir.to_string_lossy().to_string()).unwrap();
+        assert!(entries.len() >= 3);
+        // First entry should be the directory.
+        assert!(entries[0].is_dir, "first entry should be a directory");
+        assert_eq!(entries[0].name, "subfolder");
+        // Files should be sorted alphabetically.
+        assert_eq!(entries[1].name, "a.txt");
+        assert_eq!(entries[2].name, "z.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// list_directory should skip hidden files.
+    #[test]
+    fn test_list_directory_skips_hidden() {
+        let dir = std::env::temp_dir().join("womd_test_hidden");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join(".hidden"), b"x").unwrap();
+        std::fs::write(dir.join("visible.txt"), b"y").unwrap();
+        let entries = list_directory(dir.to_string_lossy().to_string()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "visible.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// get_parent_dir should return the parent path.
+    #[test]
+    fn test_get_parent_dir() {
+        let parent = get_parent_dir("C:\\Users\\test\\docs".to_string()).unwrap();
+        assert_eq!(parent, Some("C:\\Users\\test".to_string()));
+    }
+
+    /// create_file and delete_file should work.
+    #[test]
+    fn test_create_and_delete_file() {
+        let dir = std::env::temp_dir().join("womd_test_create_delete");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        create_file(file_path.to_string_lossy().to_string()).unwrap();
+        assert!(file_path.exists());
+        // Creating again should fail.
+        assert!(create_file(file_path.to_string_lossy().to_string()).is_err());
+        delete_file(file_path.to_string_lossy().to_string()).unwrap();
+        assert!(!file_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// create_directory and delete_file (dir) should work.
+    #[test]
+    fn test_create_and_delete_directory() {
+        let dir = std::env::temp_dir().join("womd_test_create_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let new_dir = dir.join("newfolder");
+        create_directory(new_dir.to_string_lossy().to_string()).unwrap();
+        assert!(new_dir.is_dir());
+        delete_file(new_dir.to_string_lossy().to_string()).unwrap();
+        assert!(!new_dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// copy_file should copy a file to a new location.
+    #[test]
+    fn test_copy_file() {
+        let dir = std::env::temp_dir().join("womd_test_copy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let src = dir.join("src.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let dest = dir.join("dest.txt");
+        copy_file(src.to_string_lossy().to_string(), dest.to_string_lossy().to_string()).unwrap();
+        assert!(dest.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        // Copy to existing should fail.
+        assert!(copy_file(src.to_string_lossy().to_string(), dest.to_string_lossy().to_string()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// move_file should rename/move a file.
+    #[test]
+    fn test_move_file() {
+        let dir = std::env::temp_dir().join("womd_test_move");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let src = dir.join("old.txt");
+        std::fs::write(&src, b"data").unwrap();
+        let dest = dir.join("new.txt");
+        move_file(src.to_string_lossy().to_string(), dest.to_string_lossy().to_string()).unwrap();
+        assert!(!src.exists());
+        assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

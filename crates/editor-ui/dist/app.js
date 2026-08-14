@@ -25,6 +25,9 @@ let suppressRender = false;
 let suppressBlur = false;  // prevent exitEditMode when clicking toolbar buttons
 let isTearOffWindow = false; // true for torn-off windows — show only their own tab
 let viewMode = "rendered"; // "rendered" | "source"
+let fileTreeRoot = null; // current root directory path for the file tree
+let fileTreeExpanded = new Set(); // expanded folder paths
+let fileTreeClipboard = null; // { path, isDir, operation: "copy" | "cut" }
 
 // ── Settings state ─────────────────────────────────────────────────────────
 const SETTINGS_KEY = "womd_settings";
@@ -86,6 +89,13 @@ const btnCodeblock = document.getElementById("btn-codeblock");
 const btnTask = document.getElementById("btn-task");
 const btnGit = document.getElementById("btn-git");
 const btnViewToggle = document.getElementById("btn-view-toggle");
+const btnTreeToggle = document.getElementById("btn-tree-toggle");
+const fileTreePanel = document.getElementById("file-tree-panel");
+const fileTreeDivider = document.getElementById("file-tree-divider");
+const fileTreeContent = document.getElementById("file-tree-content");
+const fileTreeRootName = document.getElementById("file-tree-root-name");
+const fileTreeFilter = document.getElementById("file-tree-filter");
+const fileContextMenu = document.getElementById("file-context-menu");
 const selHeading = document.getElementById("sel-heading");
 const tabList = document.getElementById("tab-list");
 const tabNewBtn = document.getElementById("tab-new");
@@ -1877,6 +1887,12 @@ document.addEventListener("keydown", (e) => {
       toggleViewMode();
       return;
     }
+    // Ctrl+Shift+E — toggle file tree sidebar.
+    if (e.shiftKey && (e.key === "E" || e.key === "e")) {
+      e.preventDefault();
+      toggleFileTree();
+      return;
+    }
     switch (e.key) {
       case "n": e.preventDefault(); newDocument(); break;
       case "o": e.preventDefault(); btnOpen.click(); break;
@@ -1896,6 +1912,320 @@ document.addEventListener("keydown", (e) => {
     }
   }
 });
+
+// ── File tree sidebar ──────────────────────────────────────────────────────
+
+/// Toggle file tree sidebar visibility.
+function toggleFileTree() {
+  const visible = !fileTreePanel.classList.contains("hidden");
+  if (visible) {
+    fileTreePanel.classList.add("hidden");
+    fileTreeDivider.classList.add("hidden");
+    btnTreeToggle.classList.remove("active");
+  } else {
+    fileTreePanel.classList.remove("hidden");
+    fileTreeDivider.classList.remove("hidden");
+    btnTreeToggle.classList.add("active");
+    // If no root set, try to use the active file's directory.
+    if (!fileTreeRoot) {
+      const activeTab = openTabs.find(t => t.id === activeTabId);
+      if (activeTab && activeTab.file_path) {
+        const path = activeTab.file_path;
+        const dir = path.substring(0, path.lastIndexOf(/[/\\]/.test(path) ? (path.includes("\\") ? "\\" : "/") : "/"));
+        if (dir) setFileTreeRoot(dir);
+      }
+    }
+    if (fileTreeRoot) refreshFileTree();
+  }
+}
+
+btnTreeToggle.addEventListener("click", toggleFileTree);
+document.getElementById("btn-tree-close").addEventListener("click", toggleFileTree);
+
+/// Set the file tree root directory.
+function setFileTreeRoot(dirPath) {
+  fileTreeRoot = dirPath;
+  fileTreeExpanded.clear();
+  fileTreeExpanded.add(dirPath);
+  const name = dirPath.split(/[\\/]/).filter(Boolean).pop() || dirPath;
+  fileTreeRootName.textContent = name;
+  fileTreeRootName.title = dirPath;
+  refreshFileTree();
+}
+
+/// Open folder dialog to set root.
+document.getElementById("btn-tree-open-folder").addEventListener("click", async () => {
+  try {
+    const tauri = window.__TAURI__;
+    if (tauri?.dialog?.open) {
+      const selected = await tauri.dialog.open({ directory: true });
+      if (selected) setFileTreeRoot(selected);
+    }
+  } catch (e) { alert("Could not open folder: " + e); }
+});
+
+/// Go to parent directory.
+document.getElementById("btn-tree-up").addEventListener("click", async () => {
+  if (!fileTreeRoot) return;
+  try {
+    const parent = await tauriInvoke("get_parent_dir", { dirPath: fileTreeRoot });
+    if (parent) setFileTreeRoot(parent);
+  } catch (e) { /* at root, ignore */ }
+});
+
+/// Refresh the file tree content.
+async function refreshFileTree() {
+  if (!fileTreeRoot) {
+    fileTreeContent.innerHTML = '<div class="file-tree-empty">No folder open.<br>Click 📂 to open a folder.</div>';
+    return;
+  }
+  const filter = fileTreeFilter.value.trim().toLowerCase();
+  fileTreeContent.innerHTML = '<div class="file-tree-empty">Loading...</div>';
+  try {
+    await renderFileTreeLevel(fileTreeRoot, fileTreeContent, 0, filter);
+    if (fileTreeContent.children.length === 0) {
+      fileTreeContent.innerHTML = '<div class="file-tree-empty">No files found.</div>';
+    }
+  } catch (e) {
+    fileTreeContent.innerHTML = `<div class="file-tree-empty">Error: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+/// Render a single level of the file tree.
+async function renderFileTreeLevel(dirPath, container, depth, filter) {
+  let entries;
+  try {
+    entries = await tauriInvoke("list_directory", { dirPath });
+  } catch (e) {
+    container.innerHTML = `<div class="file-tree-empty">Error: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  container.innerHTML = "";
+  for (const entry of entries) {
+    if (filter && !entry.name.toLowerCase().includes(filter) && !entry.is_dir) continue;
+    const item = document.createElement("div");
+    item.className = "file-tree-item " + (entry.is_dir ? "folder" : "file");
+    item.dataset.path = entry.path;
+    item.dataset.isDir = entry.is_dir;
+    item.style.paddingLeft = (8 + depth * 16) + "px";
+
+    const chevron = entry.is_dir ? '<span class="ft-chevron">▶</span>' : '<span class="ft-chevron"></span>';
+    const icon = entry.is_dir ? "📁" : getFileIcon(entry.name);
+    item.innerHTML = `${chevron}<span class="ft-icon">${icon}</span><span class="ft-name">${escapeHtml(entry.name)}</span>`;
+
+    if (entry.is_dir) {
+      const expanded = fileTreeExpanded.has(entry.path);
+      if (expanded) item.classList.add("expanded");
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleFolder(entry.path, item, depth, filter);
+      });
+      item.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showFileContextMenu(e.clientX, e.clientY, entry);
+      });
+      // Auto-expand if in expanded set.
+      if (expanded) {
+        const childContainer = document.createElement("div");
+        childContainer.className = "file-tree-children";
+        container.appendChild(item);
+        container.appendChild(childContainer);
+        renderFileTreeLevel(entry.path, childContainer, depth + 1, filter);
+        continue;
+      }
+    } else {
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openFileFromTree(entry.path);
+      });
+      item.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showFileContextMenu(e.clientX, e.clientY, entry);
+      });
+    }
+    container.appendChild(item);
+  }
+}
+
+/// Toggle folder expansion.
+async function toggleFolder(dirPath, itemEl, depth, filter) {
+  const expanded = fileTreeExpanded.has(dirPath);
+  if (expanded) {
+    fileTreeExpanded.delete(dirPath);
+    itemEl.classList.remove("expanded");
+    // Remove children container that follows this item.
+    let next = itemEl.nextElementSibling;
+    while (next && next.classList.contains("file-tree-children")) {
+      const toRemove = next;
+      next = next.nextElementSibling;
+      toRemove.remove();
+    }
+  } else {
+    fileTreeExpanded.add(dirPath);
+    itemEl.classList.add("expanded");
+    const childContainer = document.createElement("div");
+    childContainer.className = "file-tree-children";
+    itemEl.after(childContainer);
+    await renderFileTreeLevel(dirPath, childContainer, depth + 1, filter);
+  }
+}
+
+/// Get file icon based on extension.
+function getFileIcon(name) {
+  const ext = name.split(".").pop()?.toLowerCase();
+  if (ext === "md" || ext === "markdown") return "📝";
+  if (ext === "rs") return "🦀";
+  if (ext === "js" || ext === "ts" || ext === "jsx" || ext === "tsx") return "📜";
+  if (ext === "json" || ext === "toml" || ext === "yaml" || ext === "yml") return "⚙";
+  if (ext === "html" || ext === "css") return "🎨";
+  if (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "svg") return "🖼";
+  return "📄";
+}
+
+/// Open a file from the tree.
+async function openFileFromTree(filePath) {
+  try {
+    const info = await tauriInvoke("open_document", { path: filePath });
+    currentText = info.text;
+    activeTabId = info.tab_id;
+    updateUI(info);
+    await refreshSyntax();
+    await refreshTabs();
+    refreshGitAll();
+  } catch (e) {
+    alert("Could not open file: " + filePath + "\n\n" + e);
+  }
+}
+
+/// Set selected folder as root.
+window.setAsRoot = function(dirPath) {
+  setFileTreeRoot(dirPath);
+};
+
+/// Show the file context menu.
+function showFileContextMenu(x, y, entry) {
+  fileContextMenu.innerHTML = "";
+  const items = [
+    { label: "Open", action: () => { if (entry.is_dir) setFileTreeRoot(entry.path); else openFileFromTree(entry.path); } },
+    ...(entry.is_dir ? [{ label: "Set as root folder", action: () => setFileTreeRoot(entry.path) }] : []),
+    { separator: true },
+    { label: "Copy", action: () => { fileTreeClipboard = { path: entry.path, isDir: entry.isDir, operation: "copy" }; } },
+    { label: "Cut", action: () => { fileTreeClipboard = { path: entry.path, isDir: entry.isDir, operation: "cut" }; } },
+    { separator: true },
+    { label: "Rename...", action: () => renameFileEntry(entry) },
+    { label: "Delete...", danger: true, action: () => deleteFileEntry(entry) },
+  ];
+  for (const item of items) {
+    if (item.separator) {
+      const sep = document.createElement("div");
+      sep.className = "fc-menu-separator";
+      fileContextMenu.appendChild(sep);
+      continue;
+    }
+    const el = document.createElement("div");
+    el.className = "fc-menu-item" + (item.danger ? " danger" : "");
+    el.textContent = item.label;
+    el.addEventListener("click", () => {
+      fileContextMenu.classList.add("hidden");
+      item.action();
+    });
+    fileContextMenu.appendChild(el);
+  }
+  // Also add "Paste" if clipboard has something.
+  if (fileTreeClipboard) {
+    const sep = document.createElement("div");
+    sep.className = "fc-menu-separator";
+    fileContextMenu.appendChild(sep);
+    const pasteEl = document.createElement("div");
+    pasteEl.className = "fc-menu-item";
+    pasteEl.textContent = `Paste (${fileTreeClipboard.operation})`;
+    pasteEl.addEventListener("click", () => {
+      fileContextMenu.classList.add("hidden");
+      pasteFileEntry(entry);
+    });
+    fileContextMenu.appendChild(pasteEl);
+  }
+  fileContextMenu.style.left = x + "px";
+  fileContextMenu.style.top = y + "px";
+  fileContextMenu.classList.remove("hidden");
+}
+
+/// Close file context menu on click outside.
+document.addEventListener("click", () => fileContextMenu.classList.add("hidden"));
+
+/// Delete a file or directory with confirmation.
+async function deleteFileEntry(entry) {
+  const typeStr = entry.isDir ? "folder" : "file";
+  const msg = `Are you sure you want to delete this ${typeStr}?\n\n${entry.name}\n\nThis action cannot be undone.`;
+  if (!confirm(msg)) return;
+  try {
+    await tauriInvoke("delete_file", { path: entry.path });
+    refreshFileTree();
+  } catch (e) {
+    alert("Delete failed: " + e);
+  }
+}
+
+/// Rename a file or directory.
+async function renameFileEntry(entry) {
+  const newName = prompt(`Rename "${entry.name}" to:`, entry.name);
+  if (!newName || newName === entry.name) return;
+  const parent = entry.path.substring(0, entry.path.lastIndexOf(/[/\\]/.test(entry.path) ? (entry.path.includes("\\") ? "\\" : "/") : "/"));
+  const dest = parent + (entry.path.includes("\\") ? "\\" : "/") + newName;
+  try {
+    await tauriInvoke("move_file", { srcPath: entry.path, destPath: dest });
+    refreshFileTree();
+  } catch (e) {
+    alert("Rename failed: " + e);
+  }
+}
+
+/// Paste (copy or cut) from clipboard into a folder.
+async function pasteFileEntry(targetEntry) {
+  if (!fileTreeClipboard) return;
+  const targetDir = targetEntry.isDir ? targetEntry.path : targetEntry.path.substring(0, targetEntry.path.lastIndexOf(/[/\\]/.test(targetEntry.path) ? (targetEntry.path.includes("\\") ? "\\" : "/") : "/"));
+  const srcName = fileTreeClipboard.path.split(/[\\/]/).filter(Boolean).pop();
+  const destPath = targetDir + (targetDir.includes("\\") ? "\\" : "/") + srcName;
+  if (fileTreeClipboard.path === destPath) {
+    alert("Source and destination are the same.");
+    return;
+  }
+  try {
+    if (fileTreeClipboard.operation === "copy") {
+      await tauriInvoke("copy_file", { srcPath: fileTreeClipboard.path, destPath });
+    } else {
+      await tauriInvoke("move_file", { srcPath: fileTreeClipboard.path, destPath });
+      fileTreeClipboard = null; // cut is one-time
+    }
+    refreshFileTree();
+  } catch (e) {
+    alert("Paste failed: " + e);
+  }
+}
+
+/// Filter input handler.
+fileTreeFilter.addEventListener("input", () => refreshFileTree());
+
+/// Resizable file tree divider.
+(function setupFileTreeDivider() {
+  let dragging = false;
+  fileTreeDivider.addEventListener("mousedown", (e) => {
+    dragging = true;
+    fileTreeDivider.classList.add("dragging");
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const rect = fileTreePanel.getBoundingClientRect();
+    const newWidth = Math.min(Math.max(e.clientX - rect.left, 180), 500);
+    fileTreePanel.style.width = newWidth + "px";
+  });
+  document.addEventListener("mouseup", () => {
+    if (dragging) { dragging = false; fileTreeDivider.classList.remove("dragging"); }
+  });
+})();
 
 // ── Initialize ──────────────────────────────────────────────────────────────
 
