@@ -226,6 +226,11 @@ body {
 .git-diff-viewer-form { display: flex; gap: 4px; padding: 8px; flex-wrap: wrap; align-items: center; }
 .git-diff-viewer-form select { padding: 4px 8px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; }
 .git-diff-viewer-form select:focus { outline: none; border-color: var(--accent); }
+.diff-filter-label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--fg); cursor: pointer; user-select: none; white-space: nowrap; }
+.diff-filter-label input { cursor: pointer; }
+.diff-current-file-name { font-size: 11px; color: var(--accent); font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+#diff-file-filter { padding: 4px 8px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; }
+#diff-file-filter:focus { outline: none; border-color: var(--accent); }
 
 /* Context menu (right-click) */
 #context-menu {

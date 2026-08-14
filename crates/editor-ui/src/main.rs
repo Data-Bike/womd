@@ -1116,6 +1116,27 @@ fn get_file_name(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, Str
     Ok(tab.file_name())
 }
 
+/// Get the absolute path of the active document (or None if unsaved).
+#[tauri::command]
+fn get_active_file_path(state: tauri::State<'_, Mutex<AppState>>) -> Result<Option<String>, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab()?;
+    Ok(tab.file_path.as_ref().map(|p| p.to_string_lossy().to_string()))
+}
+
+/// Get the git repository root directory (absolute path) for the active document.
+#[tauri::command]
+fn git_repo_root(state: tauri::State<'_, Mutex<AppState>>) -> Result<Option<String>, String> {
+    let git = open_git_for_active(&state);
+    match git {
+        Ok(g) => {
+            let root = g.work_dir().to_string_lossy().to_string();
+            Ok(Some(root))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 /// Open a file by relative path (resolved against the active document's directory).
 /// Used for `[link](other.md)` navigation — opens in a new tab.
 #[tauri::command]
@@ -1524,6 +1545,8 @@ pub fn run() {
             git_read_file_at_revision,
             is_dirty,
             get_file_name,
+            get_active_file_path,
+            git_repo_root,
             open_relative_file,
             get_tear_off_file,
         ])

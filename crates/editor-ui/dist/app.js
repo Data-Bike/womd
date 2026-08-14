@@ -142,6 +142,8 @@ async function openDocument(path) {
   await refreshTabs();
   await refreshSyntax();
   refreshGitAll();
+  // Sync diff tab if it's currently visible.
+  syncDiffTabIfVisible();
   editorFocusFirst();
 }
 
@@ -200,6 +202,8 @@ async function switchTab(tabId) {
   await refreshSyntax();
   await refreshTabs();
   refreshGitAll();
+  // Sync diff tab if it's currently visible.
+  syncDiffTabIfVisible();
   editorFocusFirst();
 }
 
@@ -1254,8 +1258,62 @@ function renderDiffViewer() {
   html += `<select id="diff-commit-b">${opts}</select>`;
   html += '<button class="git-action-btn" onclick="gitShowDiff()">Show diff</button>';
   html += '</div>';
+  // File filter row.
+  html += '<div class="git-diff-viewer-form">';
+  html += '<label class="diff-filter-label"><input type="checkbox" id="diff-current-file-only" onchange="gitShowDiff()" /> Current file only</label>';
+  html += '<input type="text" id="diff-file-filter" placeholder="Filter by path..." oninput="gitShowDiff()" style="flex:1;min-width:120px" />';
+  html += `<span class="diff-current-file-name" id="diff-current-file-name"></span>`;
+  html += '</div>';
   html += '<div id="diff-viewer-result"></div>';
   gitDiff.innerHTML = html;
+  // Auto-show diff for current file if checkbox is checked (default: checked).
+  // We pre-check the checkbox and auto-load on tab activation.
+  const cb = document.getElementById("diff-current-file-only");
+  if (cb) {
+    cb.checked = diffFilterState.currentFileOnly;
+    document.getElementById("diff-file-filter").value = diffFilterState.pathFilter;
+  }
+  // Update current file name display and auto-show.
+  updateDiffCurrentFileName();
+  // Auto-show diff on tab switch.
+  if (diffFilterState.currentFileOnly || diffFilterState.pathFilter) {
+    gitShowDiff();
+  }
+}
+
+// State for diff filtering.
+const diffFilterState = { currentFileOnly: true, pathFilter: "", currentFilePath: "" };
+
+/// If the Diff tab is currently visible, update the current-file name and re-show diff.
+async function syncDiffTabIfVisible() {
+  const diffSection = document.getElementById("git-diff");
+  if (!diffSection || diffSection.classList.contains("hidden")) return;
+  // Diff tab is visible — update current file name and re-show diff.
+  await updateDiffCurrentFileName();
+  // Only auto-refresh if the form is already rendered.
+  if (document.getElementById("diff-mode-select")) {
+    gitShowDiff();
+  }
+}
+
+/// Update the "current file" display and refresh diff if needed.
+async function updateDiffCurrentFileName() {
+  const span = document.getElementById("diff-current-file-name");
+  if (!span) return;
+  try {
+    const path = await tauriInvoke("get_active_file_path");
+    diffFilterState.currentFilePath = path || "";
+    if (path) {
+      // Show just the basename for readability.
+      const base = path.split(/[\\/]/).pop() || path;
+      span.textContent = "→ " + base;
+      span.title = path;
+    } else {
+      span.textContent = "→ (unsaved)";
+    }
+  } catch {
+    span.textContent = "";
+  }
 }
 
 // ── Git actions (extended) ─────────────────────────────────────────────────
@@ -1324,6 +1382,22 @@ window.gitPullFromRemote = async function() {
 window.gitShowDiff = async function() {
   const mode = document.getElementById("diff-mode-select").value;
   const resultDiv = document.getElementById("diff-viewer-result");
+  // Read filter state from UI.
+  const cb = document.getElementById("diff-current-file-only");
+  const filterInput = document.getElementById("diff-file-filter");
+  diffFilterState.currentFileOnly = cb ? cb.checked : false;
+  diffFilterState.pathFilter = filterInput ? filterInput.value.trim() : "";
+
+  // If "current file only" is checked, we need the active file's relative path.
+  let currentRelPath = null;
+  if (diffFilterState.currentFileOnly) {
+    currentRelPath = await resolveCurrentFileRelativePath();
+    if (!currentRelPath) {
+      resultDiv.innerHTML = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No active file or file is not in the repository</div>';
+      return;
+    }
+  }
+
   resultDiv.innerHTML = '<div style="padding:8px;color:var(--fg-muted)">Loading diff...</div>';
   try {
     let diffs;
@@ -1335,11 +1409,23 @@ window.gitShowDiff = async function() {
       const b = document.getElementById("diff-commit-b").value;
       diffs = await tauriInvoke("git_diff_commits", { commitA: a, commitB: b });
     }
+
+    // Apply filters.
+    let filtered = diffs || [];
+    if (diffFilterState.currentFileOnly && currentRelPath) {
+      filtered = filtered.filter(f => f.path === currentRelPath || f.path.endsWith("/" + currentRelPath) || f.path === currentRelPath.replace(/\\/g, "/"));
+    }
+    if (diffFilterState.pathFilter) {
+      const q = diffFilterState.pathFilter.toLowerCase();
+      filtered = filtered.filter(f => f.path.toLowerCase().includes(q));
+    }
+
     let html = "";
-    if (!diffs || diffs.length === 0) {
-      html = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No differences</div>';
+    if (filtered.length === 0) {
+      html = '<div style="padding:16px;color:var(--fg-muted);text-align:center">No differences' +
+        (diffFilterState.currentFileOnly ? ' for current file' : '') + '</div>';
     } else {
-      for (const file of diffs) {
+      for (const file of filtered) {
         html += `<div class="diff-file-header">${escapeHtml(file.path)}</div>`;
         // Fetch line-level diff for this specific file.
         let fileDiff;
@@ -1357,6 +1443,34 @@ window.gitShowDiff = async function() {
     resultDiv.innerHTML = html;
   } catch (e) { resultDiv.innerHTML = `<div style="padding:8px;color:#f44">Diff error: ${escapeHtml(String(e))}</div>`; }
 };
+
+/// Resolve the active file's path relative to the git repo root.
+async function resolveCurrentFileRelativePath() {
+  try {
+    const absPath = await tauriInvoke("get_active_file_path");
+    if (!absPath) return null;
+    // Get the git repo root.
+    const root = await tauriInvoke("git_repo_root");
+    if (!root) return null;
+    // Compute relative path.
+    const norm = (p) => p.replace(/\\/g, "/").toLowerCase();
+    const abs = norm(absPath);
+    const r = norm(root);
+    let rel;
+    if (abs.startsWith(r + "/")) {
+      rel = absPath.substring(r.length + 1);
+    } else if (abs === r) {
+      rel = "";
+    } else {
+      // Not in repo.
+      return null;
+    }
+    // Keep original separators from absPath for the relative part.
+    return rel.replace(/\\/g, "/");
+  } catch {
+    return null;
+  }
+}
 
 window.gitStageFile = async function(path) { try { await tauriInvoke("git_stage_file", { filePath: path }); await refreshGitAll(); } catch (e) { alert("Stage failed: " + e); } };
 window.gitUnstageFile = async function(path) { try { await tauriInvoke("git_unstage_file", { filePath: path }); await refreshGitAll(); } catch (e) { alert("Unstage failed: " + e); } };
@@ -1418,7 +1532,11 @@ document.querySelectorAll(".git-tab").forEach(btn => {
     document.querySelectorAll(".git-section").forEach(s => s.classList.add("hidden"));
     document.getElementById("git-" + tabName).classList.remove("hidden");
     // Diff tab shows the diff viewer (commit vs commit).
-    if (tabName === "diff") renderDiffViewer();
+    if (tabName === "diff") {
+      renderDiffViewer();
+      // Auto-show diff for current file (sync with active editor tab).
+      // renderDiffViewer already auto-shows if currentFileOnly is checked.
+    }
   });
 });
 
