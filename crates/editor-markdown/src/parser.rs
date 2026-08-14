@@ -708,7 +708,10 @@ fn is_setext_underline(s: &[u8]) -> bool {
 
 fn try_parse_table(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> Option<(Table, usize)> {
     let header_line = line_content(bytes, lines[idx]);
-    let hs = &header_line[leading_indent(header_line).min(header_line.len())..];
+    let hindent = leading_indent(header_line).min(header_line.len());
+    let hs = &header_line[hindent..];
+    // Base offset of hs within bytes (for converting relative cell offsets to absolute).
+    let hbase = lines[idx].start as usize + hindent;
     let delim_line = line_content(bytes, lines[idx + 1]);
     let ds = &delim_line[leading_indent(delim_line).min(delim_line.len())..];
     if !ds.contains(&b'|') && !ds.contains(&b':') && !ds.contains(&b'-') {
@@ -723,9 +726,13 @@ fn try_parse_table(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> Opt
     let hspan = SourceSpan::new(ByteOffset(lines[idx].start), ByteOffset(lines[idx].end));
     let hcells: Vec<TableCell> = header_cells
         .iter()
-        .map(|(s, e)| TableCell {
-            meta: NodeMeta { span: SourceSpan::new(ByteOffset(*s), ByteOffset(*e)), dirty: false },
-            inlines: parse_inlines(bytes, *s, *e, refs),
+        .map(|(s, e)| {
+            let abs_s = *s + hbase as u64;
+            let abs_e = *e + hbase as u64;
+            TableCell {
+                meta: NodeMeta { span: SourceSpan::new(ByteOffset(abs_s), ByteOffset(abs_e)), dirty: false },
+                inlines: parse_inlines(bytes, abs_s, abs_e, refs),
+            }
         })
         .collect();
     rows.push(TableRow { meta: NodeMeta { span: hspan, dirty: false }, header: true, cells: hcells });
@@ -735,17 +742,24 @@ fn try_parse_table(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> Opt
         if is_blank(c) {
             break;
         }
-        let cs = &c[leading_indent(c).min(c.len())..];
+        let cindent = leading_indent(c).min(c.len());
+        let cs = &c[cindent..];
         if !cs.contains(&b'|') {
             break;
         }
+        // Base offset of cs within bytes.
+        let cbase = lines[j].start as usize + cindent;
         let cells = split_table_cells(cs);
         let rspan = SourceSpan::new(ByteOffset(lines[j].start), ByteOffset(lines[j].end));
         let rcells: Vec<TableCell> = cells
             .iter()
-            .map(|(s, e)| TableCell {
-                meta: NodeMeta { span: SourceSpan::new(ByteOffset(*s), ByteOffset(*e)), dirty: false },
-                inlines: parse_inlines(bytes, *s, *e, refs),
+            .map(|(s, e)| {
+                let abs_s = *s + cbase as u64;
+                let abs_e = *e + cbase as u64;
+                TableCell {
+                    meta: NodeMeta { span: SourceSpan::new(ByteOffset(abs_s), ByteOffset(abs_e)), dirty: false },
+                    inlines: parse_inlines(bytes, abs_s, abs_e, refs),
+                }
             })
             .collect();
         rows.push(TableRow { meta: NodeMeta { span: rspan, dirty: false }, header: false, cells: rcells });
@@ -783,10 +797,11 @@ fn parse_delim_row(s: &[u8]) -> Option<Vec<TableAlign>> {
     }
 }
 
-/// Split a table row into (start,end) byte offsets of cell contents (absolute offsets
-/// relative to the document, since `s` is a slice of `bytes` starting at `bytes_start`).
+/// Split a table row into (start,end) byte offsets of cell contents (relative to `s`).
+/// Callers add the document offset of `s` to convert to absolute offsets.
 fn split_table_cells(s: &[u8]) -> Vec<(u64, u64)> {
-    // Strip a leading/trailing pipe for offset math.
+    // Trim trailing whitespace/CR so a trailing pipe is detected correctly.
+    let s = trim_end_bytes(s);
     let mut cells = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -795,7 +810,11 @@ fn split_table_cells(s: &[u8]) -> Vec<(u64, u64)> {
         start = 1;
         i = 1;
     }
-    while i < s.len() {
+    // If there is a trailing pipe, the last cell ends before it; otherwise the last
+    // cell runs to the end of the line.
+    let trailing_pipe = s.last() == Some(&b'|');
+    let end_limit = if trailing_pipe { s.len().saturating_sub(1) } else { s.len() };
+    while i < end_limit {
         let b = s[i];
         if b == b'\\' && i + 1 < s.len() {
             i += 2;
@@ -807,8 +826,11 @@ fn split_table_cells(s: &[u8]) -> Vec<(u64, u64)> {
         }
         i += 1;
     }
-    cells.push((start as u64, s.len() as u64));
-    // The offsets above are relative to `s`; callers add the document offset of `s`.
+    // Push the final cell only if it has content or there was a previous cell.
+    // (Avoids a spurious empty cell after a trailing pipe.)
+    if start < end_limit || cells.is_empty() {
+        cells.push((start as u64, end_limit as u64));
+    }
     cells
 }
 

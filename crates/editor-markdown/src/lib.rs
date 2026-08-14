@@ -81,6 +81,11 @@ mod tests {
         serialize(&doc, src)
     }
 
+    /// Extract text for a byte span from the source.
+    fn span_text(span: SourceSpan, src: &[u8]) -> &[u8] {
+        &src[span.start.0 as usize..span.end.0 as usize]
+    }
+
     #[test]
     fn roundtrip_paragraph() {
         assert_roundtrip(b"Hello world.\n");
@@ -179,6 +184,49 @@ mod tests {
     #[test]
     fn roundtrip_table() {
         assert_roundtrip(b"| Name | Value |\n| --- | ---: |\n| Foo | 100 |\n");
+    }
+
+    /// Table cell inlines must reference the correct byte ranges in the source.
+    /// Regression test for a bug where split_table_cells returned offsets relative
+    /// to the line slice, but they were used as absolute offsets in the document.
+    #[test]
+    fn table_cell_offsets_are_absolute() {
+        let src = b"# Course Syllabus\n\n## Section\n\n| Item | Specification |\n| --- | --- |\n| Credit value | 1 ECTS |\n| Total workload | 28 hours |\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let table = doc.blocks.iter().find_map(|b| match b {
+            crate::ast::Block::Table(t) => Some(t),
+            _ => None,
+        }).expect("no table found");
+
+        // Header row should have cells "Item" and "Specification".
+        let header = table.rows.iter().find(|r| r.header).expect("no header row");
+        assert_eq!(header.cells.len(), 2);
+        let h0_text = std::str::from_utf8(span_text(header.cells[0].meta.span, src)).unwrap();
+        assert_eq!(h0_text.trim(), "Item");
+        let h1_text = std::str::from_utf8(span_text(header.cells[1].meta.span, src)).unwrap();
+        assert_eq!(h1_text.trim(), "Specification");
+
+        // First data row: "Credit value" | "1 ECTS".
+        let r0 = table.rows.iter().find(|r| !r.header).expect("no data row");
+        assert_eq!(r0.cells.len(), 2);
+        let c0_text = std::str::from_utf8(span_text(r0.cells[0].meta.span, src)).unwrap();
+        assert_eq!(c0_text.trim(), "Credit value");
+        let c1_text = std::str::from_utf8(span_text(r0.cells[1].meta.span, src)).unwrap();
+        assert_eq!(c1_text.trim(), "1 ECTS");
+    }
+
+    /// Table with leading indentation — cell offsets must still be absolute.
+    #[test]
+    fn table_cell_offsets_with_indent() {
+        let src = b"| A | B |\n| - | - |\n| 1 | 2 |\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let table = doc.blocks.iter().find_map(|b| match b {
+            crate::ast::Block::Table(t) => Some(t),
+            _ => None,
+        }).expect("no table found");
+        let header = table.rows.iter().find(|r| r.header).expect("no header row");
+        let h0_text = std::str::from_utf8(span_text(header.cells[0].meta.span, src)).unwrap();
+        assert_eq!(h0_text.trim(), "A");
     }
 
     #[test]
