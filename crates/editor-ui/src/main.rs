@@ -637,15 +637,26 @@ fn git_diff(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitFileDiff>
     }).collect())
 }
 
+/// Convert a repo-root-relative path to a git pathspec that works from any subdirectory.
+/// Uses the `:/` magic prefix (relative to root of working tree).
+fn root_pathspec(path: &str) -> String {
+    if path.starts_with(":/") || path.starts_with("**/") {
+        path.to_string()
+    } else {
+        format!(":/{}", path)
+    }
+}
+
 /// Get unified diff for a single file (working tree vs HEAD) with parsed hunks and lines.
 #[tauri::command]
 fn git_diff_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
+    let ps = root_pathspec(&file_path);
     // Get the unified diff text for this file.
-    let text = git.exec_text(&["diff", "HEAD", "--", &file_path]).map_err(|e| e.to_string())?;
+    let text = git.exec_text(&["diff", "HEAD", "--", &ps]).map_err(|e| e.to_string())?;
     // If empty (no unstaged changes), try staged (index vs HEAD).
     let text = if text.trim().is_empty() {
-        git.exec_text(&["diff", "--cached", "HEAD", "--", &file_path]).map_err(|e| e.to_string())?
+        git.exec_text(&["diff", "--cached", "HEAD", "--", &ps]).map_err(|e| e.to_string())?
     } else { text };
     let hunks = parse_unified_diff(&text);
     Ok(GitFileDiff { path: file_path, old_path: None, hunks })
@@ -655,7 +666,8 @@ fn git_diff_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) ->
 #[tauri::command]
 fn git_diff_file_commits(state: tauri::State<'_, Mutex<AppState>>, file_path: String, commit_a: String, commit_b: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
-    let text = git.exec_text(&["diff", &commit_a, &commit_b, "--", &file_path]).map_err(|e| e.to_string())?;
+    let ps = root_pathspec(&file_path);
+    let text = git.exec_text(&["diff", &commit_a, &commit_b, "--", &ps]).map_err(|e| e.to_string())?;
     let hunks = parse_unified_diff(&text);
     Ok(GitFileDiff { path: file_path, old_path: None, hunks })
 }
@@ -664,7 +676,8 @@ fn git_diff_file_commits(state: tauri::State<'_, Mutex<AppState>>, file_path: St
 #[tauri::command]
 fn git_diff_file_vs_commit(state: tauri::State<'_, Mutex<AppState>>, file_path: String, commit: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
-    let text = git.exec_text(&["diff", &commit, "--", &file_path]).map_err(|e| e.to_string())?;
+    let ps = root_pathspec(&file_path);
+    let text = git.exec_text(&["diff", &commit, "--", &ps]).map_err(|e| e.to_string())?;
     let hunks = parse_unified_diff(&text);
     Ok(GitFileDiff { path: file_path, old_path: None, hunks })
 }
@@ -673,7 +686,8 @@ fn git_diff_file_vs_commit(state: tauri::State<'_, Mutex<AppState>>, file_path: 
 #[tauri::command]
 fn git_discard_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.exec_text(&["checkout", "--", &file_path]).map_err(|e| e.to_string())?;
+    let ps = root_pathspec(&file_path);
+    git.exec_text(&["checkout", "--", &ps]).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -681,7 +695,8 @@ fn git_discard_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String)
 #[tauri::command]
 fn git_remove_untracked(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.exec_text(&["clean", "-f", "--", &file_path]).map_err(|e| e.to_string())?;
+    let ps = root_pathspec(&file_path);
+    git.exec_text(&["clean", "-f", "--", &ps]).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -1091,7 +1106,11 @@ fn git_read_file_at_revision(state: tauri::State<'_, Mutex<AppState>>, file_path
     let git = open_git_for_active(&state)?;
     if revision.is_empty() {
         // Read from working tree (for untracked files).
-        let full = git.work_dir().join(&file_path);
+        // file_path is relative to repo root, but work_dir might be a subdirectory.
+        // Resolve via git rev-parse --show-toplevel to get the repo root.
+        let root = git.exec_text(&["rev-parse", "--show-toplevel"]).map_err(|e| e.to_string())?;
+        let root = root.trim();
+        let full = std::path::Path::new(root).join(&file_path);
         let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&bytes).to_string())
     } else {
@@ -1720,5 +1739,115 @@ mod tests {
         // 3. Entry is consumed — subsequent calls return None.
         let second_call = state.tear_off_files.remove(&label);
         assert_eq!(second_call, None);
+    }
+
+    /// parse_unified_diff should parse a standard git diff output with hunks.
+    #[test]
+    fn test_parse_unified_diff_basic() {
+        let diff = "diff --git a/file.txt b/file.txt\nindex abc..def 100644\n--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,4 @@\n line1\n line2\n+new line\n line3\n";
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 1, "should have 1 hunk");
+        assert_eq!(hunks[0].old_start, 1);
+        assert_eq!(hunks[0].new_start, 1);
+        assert_eq!(hunks[0].lines.len(), 4, "should have 4 lines");
+        assert_eq!(hunks[0].lines[0].kind, "equal");
+        assert_eq!(hunks[0].lines[1].kind, "equal");
+        assert_eq!(hunks[0].lines[2].kind, "insert");
+        assert_eq!(hunks[0].lines[2].text, "new line");
+        assert_eq!(hunks[0].lines[3].kind, "equal");
+    }
+
+    /// parse_unified_diff should handle multiple hunks.
+    #[test]
+    fn test_parse_unified_diff_multiple_hunks() {
+        let diff = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n-old line\n+new line\n@@ -10,2 +10,2 @@\n-old2\n+new2\n";
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 2, "should have 2 hunks");
+        assert_eq!(hunks[0].lines.len(), 2);
+        assert_eq!(hunks[0].lines[0].kind, "delete");
+        assert_eq!(hunks[0].lines[1].kind, "insert");
+        assert_eq!(hunks[1].lines.len(), 2);
+        assert_eq!(hunks[1].old_start, 10);
+    }
+
+    /// parse_unified_diff should handle new file diffs.
+    #[test]
+    fn test_parse_unified_diff_new_file() {
+        let diff = "diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..abc\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+line1\n+line2\n";
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 1, "should have 1 hunk for new file");
+        assert_eq!(hunks[0].lines.len(), 2);
+        assert_eq!(hunks[0].lines[0].kind, "insert");
+        assert_eq!(hunks[0].lines[1].kind, "insert");
+    }
+
+    /// parse_unified_diff should handle deleted file diffs.
+    #[test]
+    fn test_parse_unified_diff_deleted_file() {
+        let diff = "diff --git a/del.txt b/del.txt\ndeleted file mode 100644\nindex abc..0000000\n--- a/del.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-line1\n-line2\n";
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 1, "should have 1 hunk for deleted file");
+        assert_eq!(hunks[0].lines.len(), 2);
+        assert_eq!(hunks[0].lines[0].kind, "delete");
+        assert_eq!(hunks[0].lines[1].kind, "delete");
+    }
+
+    /// parse_unified_diff should handle empty diff (no changes).
+    #[test]
+    fn test_parse_unified_diff_empty() {
+        let hunks = parse_unified_diff("");
+        assert!(hunks.is_empty());
+    }
+
+    /// parse_unified_diff should handle hunk header with function context.
+    #[test]
+    fn test_parse_unified_diff_with_function_context() {
+        let diff = "--- a/file.rs\n+++ b/file.rs\n@@ -10,3 +10,4 @@ fn my_function(x: i32) -> i32 {\n     let y = x + 1;\n     y\n+    y * 2\n }\n";
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 10);
+        assert_eq!(hunks[0].new_start, 10);
+        assert_eq!(hunks[0].lines.len(), 4);
+    }
+
+    /// parse_unified_diff should handle "No newline at end of file" marker.
+    #[test]
+    fn test_parse_unified_diff_no_newline_marker() {
+        let diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1,1 +1,2 @@\n line1\n+line2\n\\ No newline at end of file\n";
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 1);
+        // The \ line should be skipped, so only 2 lines.
+        assert_eq!(hunks[0].lines.len(), 2);
+    }
+
+    /// parse_unified_diff should handle hunk header without counts.
+    #[test]
+    fn test_parse_unified_diff_no_counts() {
+        let diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1,2 @@\n-old\n+new1\n+new2\n";
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 1);
+        assert_eq!(hunks[0].new_start, 1);
+        assert_eq!(hunks[0].lines.len(), 3);
+    }
+
+    /// root_pathspec should prepend :/ to make paths relative to repo root.
+    #[test]
+    fn test_root_pathspec_basic() {
+        assert_eq!(root_pathspec("src/main.rs"), ":/src/main.rs");
+        assert_eq!(root_pathspec("crates/editor-ui/src/main.rs"), ":/crates/editor-ui/src/main.rs");
+    }
+
+    /// root_pathspec should not double-prefix paths that already start with :/.
+    #[test]
+    fn test_root_pathspec_already_prefixed() {
+        assert_eq!(root_pathspec(":/src/main.rs"), ":/src/main.rs");
+        assert_eq!(root_pathspec("**/*.rs"), "**/*.rs");
+    }
+
+    /// root_pathspec should handle empty path.
+    #[test]
+    fn test_root_pathspec_empty() {
+        assert_eq!(root_pathspec(""), ":/");
     }
 }

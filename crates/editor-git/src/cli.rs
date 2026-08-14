@@ -186,7 +186,10 @@ impl VersionControl for GitCli {
                 self.exec(&["add", "-A"])?;
             }
             ChangeSelection::File { path } => {
-                self.exec(&["add", "--", path.as_str()])?;
+                // Use :/ prefix so the path is resolved from the repo root,
+                // not the current working directory (which may be a subdirectory).
+                let ps = if path.starts_with(":/") { path.clone() } else { format!(":/{}", path) };
+                self.exec(&["add", "--", ps.as_str()])?;
             }
             ChangeSelection::Hunk { path, hunk_index } => {
                 stage_hunk(self, &path, hunk_index)?;
@@ -204,7 +207,8 @@ impl VersionControl for GitCli {
                 self.exec(&["reset", "-q"])?;
             }
             ChangeSelection::File { path } => {
-                self.exec(&["reset", "-q", "--", path.as_str()])?;
+                let ps = if path.starts_with(":/") { path.clone() } else { format!(":/{}", path) };
+                self.exec(&["reset", "-q", "--", ps.as_str()])?;
             }
             ChangeSelection::Hunk { path, hunk_index } => {
                 unstage_hunk(self, &path, hunk_index)?;
