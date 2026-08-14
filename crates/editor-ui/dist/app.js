@@ -426,6 +426,8 @@ function createBlockElement(index, block) {
     mouseDownX = e.clientX; mouseDownY = e.clientY;
   });
   el.addEventListener("click", (e) => {
+    // If the click is on a link, let it bubble to blockEditor's link handler.
+    if (e.target.closest("a")) return;
     if (editingBlockIndex === index) return;
     // Check if this was a drag-selection (mouse moved between mousedown and click).
     const dx = Math.abs(e.clientX - mouseDownX);
