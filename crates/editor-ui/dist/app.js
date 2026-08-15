@@ -314,6 +314,8 @@ async function refreshSyntax() {
       } else {
         // Block count changed (initial load, new chunk parsed, etc.) —
         // rebuild but preserve existing entries where possible.
+        // Cached line numbers may point to wrong offsets after a rebuild.
+        gutterLineNumbers = {};
         const oldBlocks = syntaxBlocks;
         syntaxBlocks = meta.map((m, i) => {
           if (i < oldBlocks.length && oldBlocks[i].kind === m.kind &&
@@ -905,6 +907,7 @@ async function maybeParseNextChunk() {
     // The append-only `syntaxBlocks.concat(newBlocks.slice(oldLen))` is wrong
     // because it keeps the removed stale block and appends the wrong slice.
     // Rebuild by matching kind+span, preserving any existing loaded data.
+    gutterLineNumbers = {};
     const oldBlocks = syntaxBlocks;
     syntaxBlocks = meta.map((m, i) => {
       if (i < oldBlocks.length &&
