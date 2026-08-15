@@ -37,8 +37,10 @@ let fileTreeClipboard = null; // { path, isDir, operation: "copy" | "cut" }
 // the rendered window.
 const VIRTUALIZATION_THRESHOLD = 200; // blocks above this use virtualized rendering
 const RENDER_WINDOW = 100; // blocks to render at once (visible + buffer)
+const AVG_BLOCK_HEIGHT = 60; // default estimate for unknown block heights
 let blockMeta = [];       // lightweight metadata for all blocks
 let blockCache = new Map(); // index -> full SyntaxBlock (source + AST)
+let blockHeights = [];    // cached real heights per block index (px)
 let virtualizedMode = false;
 let visibleRange = { start: 0, end: 50 }; // currently visible blocks
 let renderedRange = { start: 0, end: 0 }; // currently rendered blocks (>= visibleRange)
@@ -109,7 +111,7 @@ blockEditor.addEventListener("scroll", () => {
     updateVisibleRange();
     // Re-render if visible range moved outside the rendered window,
     // OR if we scrolled far beyond parsed blocks (need to show loading indicator).
-    const parsedHeight = syntaxBlocks.length * 60;
+    const parsedHeight = cumulativeHeight(syntaxBlocks.length);
     const scrolledBeyondParsed = blockEditor.scrollTop > parsedHeight * 0.9;
     if (visibleRange.start < prevStart || visibleRange.end > prevEnd || scrolledBeyondParsed) {
       renderVirtualizedBlocks();
@@ -289,6 +291,7 @@ async function refreshSyntax() {
     if (virtualizedMode) {
       // Clear cache — block data will be loaded for visible blocks.
       blockCache.clear();
+      blockHeights = [];
       // Build a lightweight syntaxBlocks array with just metadata.
       // source/node are loaded on demand for visible blocks.
       syntaxBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
@@ -552,20 +555,53 @@ function renderAllBlocks() {
 
 /// Estimate total document height in pixels, including unparsed region.
 /// Uses parsedOffset/totalLen ratio to extrapolate from parsed block count.
-function estimateTotalHeight() {
-  if (!hasMoreToParse || parsedOffset === 0) {
-    return syntaxBlocks.length * 60;
+/// Get the cached height for a block, or the default estimate.
+function getBlockHeight(i) {
+  return blockHeights[i] || AVG_BLOCK_HEIGHT;
+}
+
+/// Measure and cache the real heights of rendered blocks after they are in the DOM.
+/// This is called after renderVirtualizedBlocks to update blockHeights for
+/// the currently rendered range. On the next render, spacers use these real
+/// heights, making scrolling smooth (no jumps from height estimation errors).
+function measureRenderedBlockHeights() {
+  for (let i = renderedRange.start; i <= renderedRange.end && i < syntaxBlocks.length; i++) {
+    const el = blockEditor.querySelector(`[data-block-index="${i}"]`);
+    if (el) {
+      const h = el.offsetHeight;
+      if (h > 0) blockHeights[i] = h;
+    }
   }
+}
+
+/// Calculate the cumulative height of blocks [0, end) using cached heights
+/// or the default estimate for unknown blocks.
+function cumulativeHeight(end) {
+  let total = 0;
+  for (let i = 0; i < end && i < syntaxBlocks.length; i++) {
+    total += getBlockHeight(i);
+  }
+  return total;
+}
+
+/// Estimate total document height in pixels, including unparsed region.
+function estimateTotalHeight() {
+  const parsedHeight = cumulativeHeight(syntaxBlocks.length);
+  if (!hasMoreToParse || parsedOffset === 0) {
+    return parsedHeight;
+  }
+  // Extrapolate: if parsedOffset bytes produced syntaxBlocks.length blocks,
+  // totalLen bytes would produce proportionally more.
   const ratio = totalLen / parsedOffset;
   const estimatedTotalBlocks = syntaxBlocks.length * ratio;
-  return estimatedTotalBlocks * 60;
+  const avgPerBlock = parsedHeight / syntaxBlocks.length;
+  return parsedHeight + (estimatedTotalBlocks - syntaxBlocks.length) * avgPerBlock;
 }
 
 /// Render only visible blocks with spacers for virtualized scrolling (large documents).
 /// Renders a large window (RENDER_WINDOW blocks) so scrolling doesn't trigger
 /// re-renders on every frame. Re-render only when scroll moves outside the window.
-/// The bottom spacer accounts for the ENTIRE document (including unparsed region)
-/// so the user can scroll anywhere — chunk parsing is triggered on demand.
+/// Uses cached real block heights for spacer calculations to avoid scroll jumps.
 function renderVirtualizedBlocks() {
   // Save scroll position before clearing (innerHTML resets scrollTop to 0).
   const savedScrollTop = blockEditor.scrollTop;
@@ -582,11 +618,11 @@ function renderVirtualizedBlocks() {
     end: Math.min(syntaxBlocks.length - 1, visibleRange.end + extraBelow),
   };
 
-  // Top spacer — occupies the height of skipped blocks above.
+  // Top spacer — uses cumulative cached heights for accuracy.
   const topSpacer = document.createElement("div");
   topSpacer.className = "md-virtual-spacer";
   topSpacer.id = "md-virtual-top-spacer";
-  topSpacer.style.height = renderedRange.start * 60 + "px";
+  topSpacer.style.height = cumulativeHeight(renderedRange.start) + "px";
   blockEditor.appendChild(topSpacer);
 
   // Render blocks in the render window.
@@ -606,22 +642,24 @@ function renderVirtualizedBlocks() {
   }
 
   // Bottom spacer — accounts for BOTH unparsed blocks below the render window
-  // AND the remaining unparsed document region. This ensures the scroll area
-  // is tall enough for the user to scroll anywhere in the document, even before
-  // all chunks have been parsed.
+  // AND the remaining unparsed document region.
   const bottomSpacer = document.createElement("div");
   bottomSpacer.className = "md-virtual-spacer";
   bottomSpacer.id = "md-virtual-bottom-spacer";
   const totalHeight = estimateTotalHeight();
-  const topSpacerHeight = renderedRange.start * 60;
-  // Bottom spacer = total height - top spacer - approximate rendered blocks height
-  let bottomHeight = totalHeight - topSpacerHeight - (renderedRange.end - renderedRange.start + 1) * 60;
+  const topSpacerHeight = cumulativeHeight(renderedRange.start);
+  // Height of rendered blocks (use cached heights, not estimates).
+  let renderedHeight = 0;
+  for (let i = renderedRange.start; i <= renderedRange.end && i < syntaxBlocks.length; i++) {
+    renderedHeight += getBlockHeight(i);
+  }
+  let bottomHeight = totalHeight - topSpacerHeight - renderedHeight;
   if (bottomHeight < 0) bottomHeight = 0;
   bottomSpacer.style.height = bottomHeight + "px";
   blockEditor.appendChild(bottomSpacer);
 
   // If user scrolled into the unparsed region, show a loading indicator.
-  if (hasMoreToParse && !renderedAny && savedScrollTop > syntaxBlocks.length * 60 * 0.9) {
+  if (hasMoreToParse && !renderedAny && savedScrollTop > cumulativeHeight(syntaxBlocks.length) * 0.9) {
     const loading = document.createElement("div");
     loading.className = "md-chunk-loading";
     loading.textContent = "Loading more content...";
@@ -633,6 +671,12 @@ function renderVirtualizedBlocks() {
 
   // Restore scroll position (innerHTML reset it to 0).
   blockEditor.scrollTop = savedScrollTop;
+
+  // Measure real block heights after DOM is updated (next frame) to
+  // improve spacer accuracy for the next render.
+  requestAnimationFrame(() => {
+    measureRenderedBlockHeights();
+  });
 }
 
 /// Update visibleRange based on scroll position.
@@ -644,13 +688,31 @@ function renderVirtualizedBlocks() {
 function updateVisibleRange(scrollTopArg) {
   const scrollTop = scrollTopArg != null ? scrollTopArg : (blockEditor.scrollTop || 0);
   const viewportHeight = blockEditor.clientHeight || 600;
-  const avgHeight = 60;
-  const firstVisible = Math.max(0, Math.floor(scrollTop / avgHeight) - 5);
-  const lastVisible = Math.min(
-    syntaxBlocks.length - 1,
-    Math.ceil((scrollTop + viewportHeight) / avgHeight) + 5
-  );
-  visibleRange = { start: firstVisible, end: lastVisible };
+  // Use cumulative cached heights to find which blocks are visible.
+  // This is more accurate than dividing by a fixed avgHeight, preventing
+  // the visible range from being wrong when blocks have varying heights.
+  let firstVisible = 0;
+  let lastVisible = 0;
+  let cumY = 0;
+  for (let i = 0; i < syntaxBlocks.length; i++) {
+    const h = getBlockHeight(i);
+    if (cumY + h > scrollTop - 100) { // 100px buffer above
+      firstVisible = i;
+      break;
+    }
+    cumY += h;
+  }
+  cumY = 0;
+  for (let i = 0; i < syntaxBlocks.length; i++) {
+    const h = getBlockHeight(i);
+    cumY += h;
+    if (cumY > scrollTop + viewportHeight + 100) { // 100px buffer below
+      lastVisible = i;
+      break;
+    }
+    lastVisible = i;
+  }
+  visibleRange = { start: Math.max(0, firstVisible), end: Math.min(syntaxBlocks.length - 1, lastVisible) };
 }
 
 /// Trigger parsing of the next 10MB chunk if the user is scrolling near the
@@ -663,7 +725,7 @@ async function maybeParseNextChunk() {
   const scrollTop = blockEditor.scrollTop || 0;
   const viewportHeight = blockEditor.clientHeight || 600;
   // Estimate where the parsed content ends in pixels.
-  const parsedContentHeight = syntaxBlocks.length * 60;
+  const parsedContentHeight = cumulativeHeight(syntaxBlocks.length);
   // If user is within 2 viewport heights of the end of parsed content, trigger.
   if (scrollTop + viewportHeight * 2 < parsedContentHeight) return;
   chunkParseInProgress = true;
@@ -2419,7 +2481,7 @@ document.addEventListener("keydown", (e) => {
     setTimeout(() => {
       if (scrollRenderPending) return;
       updateVisibleRange();
-      const parsedHeight = syntaxBlocks.length * 60;
+      const parsedHeight = cumulativeHeight(syntaxBlocks.length);
       const scrolledBeyondParsed = blockEditor.scrollTop > parsedHeight * 0.9;
       if (scrolledBeyondParsed || visibleRange.end >= syntaxBlocks.length - 20) {
         renderVirtualizedBlocks();
