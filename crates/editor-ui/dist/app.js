@@ -694,7 +694,19 @@ function renderVirtualizedBlocks() {
     return;
   }
   // Compute visible range from saved scroll position.
-  updateVisibleRange(savedScrollTop);
+  // If the user was near the bottom of the previous layout, stick to the
+  // last parsed block. This is essential after a chunk parse: the height
+  // estimates for newly parsed blocks are often off, and updateVisibleRange
+  // with an absolute savedScrollTop can map to a much earlier block, which
+  // makes the view jump/teleport. The near-bottom check uses the actual
+  // previous scrollHeight, which is more reliable than cumulativeHeight().
+  const viewportHeight = blockEditor.clientHeight || 600;
+  if (savedScrollTop + viewportHeight + 100 >= savedScrollHeight) {
+    const last = syntaxBlocks.length - 1;
+    visibleRange = { start: Math.max(0, last), end: last };
+  } else {
+    updateVisibleRange(savedScrollTop);
+  }
 
   // Expand to render window: center the visible range in a larger window.
   const visibleCount = Math.max(1, visibleRange.end - visibleRange.start + 1);
