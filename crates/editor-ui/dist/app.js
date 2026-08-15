@@ -1018,6 +1018,9 @@ function exitEditMode() {
 
 /// Restore a single block element from textarea back to rendered HTML.
 /// Avoids full renderBlocks() which would destroy all elements and reset scroll.
+/// At the end, resets suppressRender to false if this is a standalone exit
+/// (editingBlockIndex < 0). If editingBlockIndex >= 0 (transition to another
+/// block), leaves suppressRender true so the new edit mode is not disrupted.
 async function restoreBlockElement(idx, blockEl, newSource) {
   const oldSource = syntaxBlocks[idx].source;
   if (newSource === oldSource) {
@@ -1035,6 +1038,8 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     }
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
+    // Reset suppressRender if standalone exit (not transitioning to another block).
+    if (editingBlockIndex < 0) suppressRender = false;
     return;
   }
   // Source changed — send to backend, then update in-place.
@@ -1073,6 +1078,8 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
   }
+  // Reset suppressRender if standalone exit (not transitioning to another block).
+  if (editingBlockIndex < 0) suppressRender = false;
 }
 
 async function commitEdit(newSource) {
