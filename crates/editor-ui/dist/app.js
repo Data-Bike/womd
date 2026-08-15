@@ -472,6 +472,7 @@ function scheduleAutosave() {
 
 function renderBlocks() {
   if (editingBlockIndex >= 0) return; // don't re-render while editing
+  if (suppressRender) return;
   blockEditor.innerHTML = "";
 
   // Source view mode — show raw Markdown.
@@ -699,6 +700,11 @@ function attachBlockListeners(el, index) {
   let mouseDownX = 0, mouseDownY = 0;
   el.addEventListener("mousedown", (e) => {
     mouseDownX = e.clientX; mouseDownY = e.clientY;
+    // Set suppressBlur BEFORE blur fires — see createBlockElement for details.
+    if (editingBlockIndex >= 0 && editingBlockIndex !== index) {
+      suppressBlur = true;
+      suppressRender = true;
+    }
   });
   el.addEventListener("click", (e) => {
     if (e.target.closest("a")) return;
@@ -737,6 +743,15 @@ function createBlockElement(index, block) {
   let mouseDownX = 0, mouseDownY = 0;
   el.addEventListener("mousedown", (e) => {
     mouseDownX = e.clientX; mouseDownY = e.clientY;
+    // If we're editing another block, set suppressBlur BEFORE the blur fires.
+    // mousedown causes the textarea to lose focus → blur fires synchronously
+    // after mousedown. Without this, blur → exitEditMode → renderBlocks →
+    // innerHTML='' destroys all elements and resets scroll before the click
+    // handler can call enterEditMode.
+    if (editingBlockIndex >= 0 && editingBlockIndex !== index) {
+      suppressBlur = true;
+      suppressRender = true;
+    }
   });
   el.addEventListener("click", (e) => {
     // If the click is on a link, let it bubble to blockEditor's link handler.
@@ -890,8 +905,9 @@ function joinPath(dir, name) {
 
 async function enterEditMode(blockIndex) {
   // If already editing another block, exit it first.
-  // Set suppressBlur so the deferred blur handler (from the previous
-  // textarea) skips exitEditMode — we're handling the transition here.
+  // suppressBlur/suppressRender are already set by the mousedown handler
+  // on the clicked block, but set them here as fallback for keyboard-initiated
+  // transitions (e.g. Escape then click).
   if (editingBlockIndex >= 0) {
     suppressBlur = true;
     suppressRender = true;
@@ -945,17 +961,7 @@ async function enterEditMode(blockIndex) {
   ta.addEventListener("input", () => autoSizeTextarea(ta));
   ta.addEventListener("blur", () => {
     if (suppressBlur) { suppressBlur = false; return; }
-    // Defer exitEditMode — if a click on another block follows the blur,
-    // that click's enterEditMode will set suppressBlur=true before this
-    // deferred handler runs, so we skip exitEditMode (the click handler
-    // manages the transition). Without this defer, blur fires before
-    // click, causing exitEditMode → renderBlocks → innerHTML='' →
-    // scroll reset and destroying the click target element.
-    setTimeout(() => {
-      if (suppressBlur) { suppressBlur = false; return; }
-      if (editingBlockIndex !== blockIndex) return; // already exited
-      exitEditMode();
-    }, 0);
+    exitEditMode();
   });
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); exitEditMode(); return; }
