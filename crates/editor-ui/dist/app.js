@@ -16,6 +16,7 @@ let isDirty = false;
 let syntaxBlocks = [];
 let debounceTimer = null;
 let autosaveTimer = null;
+let autosaveInnerTimer = null;
 let activeTabId = 0;
 let openTabs = [];
 let gitPanelVisible = false;
@@ -351,13 +352,14 @@ function flushEdits() {
 
 function scheduleAutosave() {
   clearTimeout(autosaveTimer);
+  clearTimeout(autosaveInnerTimer);
   if (!isDirty) return;
   autosaveTimer = setTimeout(async () => {
     const tab = openTabs.find(t => t.id === activeTabId);
     if (tab && tab.file_name !== "untitled.md" && tab.file_name !== "untitled" && isDirty) {
       try {
         flushEdits();
-        setTimeout(async () => {
+        autosaveInnerTimer = setTimeout(async () => {
           if (isDirty) { try { await saveDocument(); } catch (e) { console.error("autosave:", e); } }
         }, 400);
       } catch (e) { console.error("autosave:", e); }
@@ -564,6 +566,22 @@ function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 function escapeAttr(s) { return s.replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
+
+/// Get the parent directory of a path (handles both / and \ separators).
+function parentDir(p) {
+  const idx = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return idx >= 0 ? p.substring(0, idx) : p;
+}
+/// Get the base name (last segment) of a path.
+function baseName(p) {
+  const idx = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return idx >= 0 ? p.substring(idx + 1) : p;
+}
+/// Join path segments with the correct separator for the path.
+function joinPath(dir, name) {
+  const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  return dir + sep + name;
+}
 
 // ── Click-to-edit ───────────────────────────────────────────────────────────
 
@@ -962,7 +980,7 @@ function findPlainTextInSource(source, plainText) {
     // Check for link/image syntax — skip the URL part.
     if (source[i] === "[" || source[i] === "]" || source[i] === "(" || source[i] === ")") {
       // For [text](url): skip ](url) but keep text
-      if (source[i] === "]" && source[i+1] === "(") {
+      if (source[i] === "]" && i + 1 < source.length && source[i+1] === "(") {
         // Skip ](url)
         i++; // skip ]
         if (source[i] === "(") {
@@ -1443,8 +1461,10 @@ window.gitPullFromRemote = async function() {
 };
 
 window.gitShowDiff = async function() {
-  const mode = document.getElementById("diff-mode-select").value;
+  const modeSelect = document.getElementById("diff-mode-select");
+  const mode = modeSelect ? modeSelect.value : "working";
   const resultDiv = document.getElementById("diff-viewer-result");
+  if (!resultDiv) return;
   // Read filter state from UI.
   const cb = document.getElementById("diff-current-file-only");
   const filterInput = document.getElementById("diff-file-filter");
@@ -1931,7 +1951,7 @@ function toggleFileTree() {
       const activeTab = openTabs.find(t => t.id === activeTabId);
       if (activeTab && activeTab.file_path) {
         const path = activeTab.file_path;
-        const dir = path.substring(0, path.lastIndexOf(/[/\\]/.test(path) ? (path.includes("\\") ? "\\" : "/") : "/"));
+        const dir = parentDir(path);
         if (dir) setFileTreeRoot(dir);
       }
     }
@@ -2172,8 +2192,8 @@ async function deleteFileEntry(entry) {
 async function renameFileEntry(entry) {
   const newName = prompt(t("msg.rename.prompt", { name: entry.name }), entry.name);
   if (!newName || newName === entry.name) return;
-  const parent = entry.path.substring(0, entry.path.lastIndexOf(/[/\\]/.test(entry.path) ? (entry.path.includes("\\") ? "\\" : "/") : "/"));
-  const dest = parent + (entry.path.includes("\\") ? "\\" : "/") + newName;
+  const parent = parentDir(entry.path);
+  const dest = joinPath(parent, newName);
   try {
     await tauriInvoke("move_file", { srcPath: entry.path, destPath: dest });
     refreshFileTree();
@@ -2185,9 +2205,9 @@ async function renameFileEntry(entry) {
 /// Paste (copy or cut) from clipboard into a folder.
 async function pasteFileEntry(targetEntry) {
   if (!fileTreeClipboard) return;
-  const targetDir = targetEntry.isDir ? targetEntry.path : targetEntry.path.substring(0, targetEntry.path.lastIndexOf(/[/\\]/.test(targetEntry.path) ? (targetEntry.path.includes("\\") ? "\\" : "/") : "/"));
-  const srcName = fileTreeClipboard.path.split(/[\\/]/).filter(Boolean).pop();
-  const destPath = targetDir + (targetDir.includes("\\") ? "\\" : "/") + srcName;
+  const targetDir = targetEntry.isDir ? targetEntry.path : parentDir(targetEntry.path);
+  const srcName = baseName(fileTreeClipboard.path);
+  const destPath = joinPath(targetDir, srcName);
   if (fileTreeClipboard.path === destPath) {
     alert(t("msg.paste.same"));
     return;
@@ -2382,11 +2402,11 @@ window.selectLanguage = function(code) {
 function renderThemeGrid() {
   const grid = document.getElementById("theme-grid");
   let html = "";
-  for (const t of THEMES) {
-    const selected = settings.theme === t.id ? " selected" : "";
-    const swatches = t.swatches.map(c => `<div class="theme-swatch" style="background:${c}"></div>`).join("");
-    html += `<div class="theme-card${selected}" data-theme-id="${escapeAttr(t.id)}" onclick="selectTheme('${escapeAttr(t.id)}')">
-      <div class="theme-card-name">${escapeHtml(t.name)}</div>
+  for (const theme of THEMES) {
+    const selected = settings.theme === theme.id ? " selected" : "";
+    const swatches = theme.swatches.map(c => `<div class="theme-swatch" style="background:${c}"></div>`).join("");
+    html += `<div class="theme-card${selected}" data-theme-id="${escapeAttr(theme.id)}" onclick="selectTheme('${escapeAttr(theme.id)}')">
+      <div class="theme-card-name">${escapeHtml(theme.name)}</div>
       <div class="theme-card-swatches">${swatches}</div>
     </div>`;
   }
@@ -2397,11 +2417,11 @@ function renderThemeGrid() {
 function renderSyntaxGrid() {
   const grid = document.getElementById("syntax-grid");
   let html = "";
-  for (const t of SYNTAX_PALETTES) {
-    const selected = settings.syntaxTheme === t.id ? " selected" : "";
-    const swatches = t.swatches.map(c => `<div class="theme-swatch" style="background:${c}"></div>`).join("");
-    html += `<div class="theme-card${selected}" data-syntax-id="${escapeAttr(t.id)}" onclick="selectSyntaxTheme('${escapeAttr(t.id)}')">
-      <div class="theme-card-name">${escapeHtml(t.name)}</div>
+  for (const palette of SYNTAX_PALETTES) {
+    const selected = settings.syntaxTheme === palette.id ? " selected" : "";
+    const swatches = palette.swatches.map(c => `<div class="theme-swatch" style="background:${c}"></div>`).join("");
+    html += `<div class="theme-card${selected}" data-syntax-id="${escapeAttr(palette.id)}" onclick="selectSyntaxTheme('${escapeAttr(palette.id)}')">
+      <div class="theme-card-name">${escapeHtml(palette.name)}</div>
       <div class="theme-card-swatches">${swatches}</div>
     </div>`;
   }

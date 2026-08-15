@@ -13,7 +13,7 @@ const I18N_LANGUAGES = [
   { code: "ko", name: "한국어", flag: "🇰🇷" },
   { code: "ar", name: "العربية", flag: "🇸🇦" },
   { code: "pt", name: "Português", flag: "🇵🇹" },
-  { code: "hi", name: "हिन्दी", flag: "🇮🇳" },
+  { code: "hi", name: "हिंदी", flag: "🇮🇳" },
 ];
 
 const I18N_STRINGS = {
@@ -21,7 +21,7 @@ const I18N_STRINGS = {
     // Toolbar
     "tb.new": "New", "tb.open": "Open", "tb.save": "Save",
     "tb.undo": "Undo", "tb.redo": "Redo",
-    "tb.heading": "Heading level", "tb.heading.normal": "Normal text",
+    "tb.heading": "Heading level", "tb.heading.normal": "Normal text", "tb.heading.1": "Heading 1", "tb.heading.2": "Heading 2", "tb.heading.3": "Heading 3", "tb.heading.4": "Heading 4", "tb.heading.5": "Heading 5", "tb.heading.6": "Heading 6",
     "tb.bold": "Bold", "tb.italic": "Italic", "tb.strike": "Strikethrough",
     "tb.code": "Inline code", "tb.link": "Link",
     "tb.ul": "Bullet list", "tb.ol": "Numbered list",
@@ -87,7 +87,7 @@ const I18N_STRINGS = {
   ru: {
     "tb.new": "Создать", "tb.open": "Открыть", "tb.save": "Сохранить",
     "tb.undo": "Отменить", "tb.redo": "Повторить",
-    "tb.heading": "Уровень заголовка", "tb.heading.normal": "Обычный текст",
+    "tb.heading": "Уровень заголовка", "tb.heading.normal": "Обычный текст", "tb.heading.1": "Заголовок 1", "tb.heading.2": "Заголовок 2", "tb.heading.3": "Заголовок 3", "tb.heading.4": "Заголовок 4", "tb.heading.5": "Заголовок 5", "tb.heading.6": "Заголовок 6",
     "tb.bold": "Жирный", "tb.italic": "Курсив", "tb.strike": "Зачёркнутый",
     "tb.code": "Код", "tb.link": "Ссылка",
     "tb.ul": "Маркированный список", "tb.ol": "Нумерованный список",
@@ -147,7 +147,7 @@ const I18N_STRINGS = {
   uk: {
     "tb.new": "Створити", "tb.open": "Відкрити", "tb.save": "Зберегти",
     "tb.undo": "Скасувати", "tb.redo": "Повторити",
-    "tb.heading": "Рівень заголовка", "tb.heading.normal": "Звичайний текст",
+    "tb.heading": "Рівень заголовка", "tb.heading.normal": "Звичайний текст", "tb.heading.1": "Заголовок 1", "tb.heading.2": "Заголовок 2", "tb.heading.3": "Заголовок 3", "tb.heading.4": "Заголовок 4", "tb.heading.5": "Заголовок 5", "tb.heading.6": "Заголовок 6",
     "tb.bold": "Жирний", "tb.italic": "Курсив", "tb.strike": "Закреслений",
     "tb.code": "Код", "tb.link": "Посилання",
     "tb.ul": "Маркований список", "tb.ol": "Нумерований список",
@@ -207,7 +207,7 @@ const I18N_STRINGS = {
   es: {
     "tb.new": "Nuevo", "tb.open": "Abrir", "tb.save": "Guardar",
     "tb.undo": "Deshacer", "tb.redo": "Rehacer",
-    "tb.heading": "Nivel de encabezado", "tb.heading.normal": "Texto normal",
+    "tb.heading": "Nivel de encabezado", "tb.heading.normal": "Texto normal", "tb.heading.1": "Título 1", "tb.heading.2": "Título 2", "tb.heading.3": "Título 3", "tb.heading.4": "Título 4", "tb.heading.5": "Título 5", "tb.heading.6": "Título 6", "tb.heading.1": "Encabezado 1", "tb.heading.2": "Encabezado 2", "tb.heading.3": "Encabezado 3", "tb.heading.4": "Encabezado 4", "tb.heading.5": "Encabezado 5", "tb.heading.6": "Encabezado 6",
     "tb.bold": "Negrita", "tb.italic": "Cursiva", "tb.strike": "Tachado",
     "tb.code": "Código", "tb.link": "Enlace",
     "tb.ul": "Lista con viñetas", "tb.ol": "Lista numerada",
@@ -267,7 +267,7 @@ const I18N_STRINGS = {
   fr: {
     "tb.new": "Nouveau", "tb.open": "Ouvrir", "tb.save": "Enregistrer",
     "tb.undo": "Annuler", "tb.redo": "Rétablir",
-    "tb.heading": "Niveau de titre", "tb.heading.normal": "Texte normal",
+    "tb.heading": "Niveau de titre", "tb.heading.normal": "Texte normal", "tb.heading.1": "Titre 1", "tb.heading.2": "Titre 2", "tb.heading.3": "Titre 3", "tb.heading.4": "Titre 4", "tb.heading.5": "Titre 5", "tb.heading.6": "Titre 6",
     "tb.bold": "Gras", "tb.italic": "Italique", "tb.strike": "Barré",
     "tb.code": "Code", "tb.link": "Lien",
     "tb.ul": "Liste à puces", "tb.ol": "Liste numérotée",
@@ -327,7 +327,7 @@ const I18N_STRINGS = {
   de: {
     "tb.new": "Neu", "tb.open": "Öffnen", "tb.save": "Speichern",
     "tb.undo": "Rückgängig", "tb.redo": "Wiederholen",
-    "tb.heading": "Überschriftsebene", "tb.heading.normal": "Normaler Text",
+    "tb.heading": "Überschriftsebene", "tb.heading.normal": "Normaler Text", "tb.heading.1": "Überschrift 1", "tb.heading.2": "Überschrift 2", "tb.heading.3": "Überschrift 3", "tb.heading.4": "Überschrift 4", "tb.heading.5": "Überschrift 5", "tb.heading.6": "Überschrift 6",
     "tb.bold": "Fett", "tb.italic": "Kursiv", "tb.strike": "Durchgestrichen",
     "tb.code": "Code", "tb.link": "Link",
     "tb.ul": "Aufzählung", "tb.ol": "Nummerierte Liste",
@@ -387,7 +387,7 @@ const I18N_STRINGS = {
   zh: {
     "tb.new": "新建", "tb.open": "打开", "tb.save": "保存",
     "tb.undo": "撤销", "tb.redo": "重做",
-    "tb.heading": "标题级别", "tb.heading.normal": "正文",
+    "tb.heading": "标题级别", "tb.heading.normal": "正文", "tb.heading.1": "标题 1", "tb.heading.2": "标题 2", "tb.heading.3": "标题 3", "tb.heading.4": "标题 4", "tb.heading.5": "标题 5", "tb.heading.6": "标题 6",
     "tb.bold": "粗体", "tb.italic": "斜体", "tb.strike": "删除线",
     "tb.code": "代码", "tb.link": "链接",
     "tb.ul": "无序列表", "tb.ol": "有序列表",
@@ -447,7 +447,7 @@ const I18N_STRINGS = {
   ja: {
     "tb.new": "新規", "tb.open": "開く", "tb.save": "保存",
     "tb.undo": "元に戻す", "tb.redo": "やり直し",
-    "tb.heading": "見出しレベル", "tb.heading.normal": "通常テキスト",
+    "tb.heading": "見出しレベル", "tb.heading.normal": "通常テキスト", "tb.heading.1": "見出し 1", "tb.heading.2": "見出し 2", "tb.heading.3": "見出し 3", "tb.heading.4": "見出し 4", "tb.heading.5": "見出し 5", "tb.heading.6": "見出し 6",
     "tb.bold": "太字", "tb.italic": "斜体", "tb.strike": "取り消し線",
     "tb.code": "コード", "tb.link": "リンク",
     "tb.ul": "箇条書き", "tb.ol": "番号付きリスト",
@@ -507,7 +507,7 @@ const I18N_STRINGS = {
   ko: {
     "tb.new": "새로 만들기", "tb.open": "열기", "tb.save": "저장",
     "tb.undo": "실행 취소", "tb.redo": "다시 실행",
-    "tb.heading": "제목 수준", "tb.heading.normal": "일반 텍스트",
+    "tb.heading": "제목 수준", "tb.heading.normal": "일반 텍스트", "tb.heading.1": "제목 1", "tb.heading.2": "제목 2", "tb.heading.3": "제목 3", "tb.heading.4": "제목 4", "tb.heading.5": "제목 5", "tb.heading.6": "제목 6",
     "tb.bold": "굵게", "tb.italic": "기울임", "tb.strike": "취소선",
     "tb.code": "코드", "tb.link": "링크",
     "tb.ul": "글머리 기호 목록", "tb.ol": "번호 목록",
@@ -567,7 +567,7 @@ const I18N_STRINGS = {
   ar: {
     "tb.new": "جديد", "tb.open": "فتح", "tb.save": "حفظ",
     "tb.undo": "تراجع", "tb.redo": "إعادة",
-    "tb.heading": "مستوى العنوان", "tb.heading.normal": "نص عادي",
+    "tb.heading": "مستوى العنوان", "tb.heading.normal": "نص عادي", "tb.heading.1": "عنوان 1", "tb.heading.2": "عنوان 2", "tb.heading.3": "عنوان 3", "tb.heading.4": "عنوان 4", "tb.heading.5": "عنوان 5", "tb.heading.6": "عنوان 6",
     "tb.bold": "عريض", "tb.italic": "مائل", "tb.strike": "مشطوب",
     "tb.code": "كود", "tb.link": "رابط",
     "tb.ul": "قائمة نقطية", "tb.ol": "قائمة مرقمة",
@@ -687,7 +687,7 @@ const I18N_STRINGS = {
   hi: {
     "tb.new": "नया", "tb.open": "खोलें", "tb.save": "सहेजें",
     "tb.undo": "पूर्ववत", "tb.redo": "पुनः करें",
-    "tb.heading": "शीर्षक स्तर", "tb.heading.normal": "सामान्य पाठ",
+    "tb.heading": "शीर्षक स्तर", "tb.heading.normal": "सामान्य पाठ", "tb.heading.1": "शीर्षक 1", "tb.heading.2": "शीर्षक 2", "tb.heading.3": "शीर्षक 3", "tb.heading.4": "शीर्षक 4", "tb.heading.5": "शीर्षक 5", "tb.heading.6": "शीर्षक 6",
     "tb.bold": "बोल्ड", "tb.italic": "इटैलिक", "tb.strike": "स्ट्राइकथ्रू",
     "tb.code": "कोड", "tb.link": "लिंक",
     "tb.ul": "बुलेट सूची", "tb.ol": "क्रमांकित सूची",

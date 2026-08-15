@@ -336,7 +336,13 @@ fn parse_fenced_code(
         }
         j += 1;
     }
-    let end_line = if j < lines.len() { lines[j].end } else { lines[lines.len() - 1].end };
+    let end_line = if j < lines.len() {
+        lines[j].end
+    } else if !lines.is_empty() {
+        lines[lines.len() - 1].end
+    } else {
+        start
+    };
     let span = SourceSpan::new(ByteOffset(start), ByteOffset(end_line));
     let next = if j < lines.len() { j + 1 } else { lines.len() };
     (
@@ -765,7 +771,7 @@ fn try_parse_table(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> Opt
         rows.push(TableRow { meta: NodeMeta { span: rspan, dirty: false }, header: false, cells: rcells });
         j += 1;
     }
-    let end = lines[j - 1].end;
+    let end = if j > idx + 1 { lines[j - 1].end } else { lines[idx + 1].end };
     let span = SourceSpan::new(ByteOffset(lines[idx].start), ByteOffset(end));
     Some((Table { meta: NodeMeta { span, dirty: false }, alignments: aligns, rows }, j))
 }
@@ -1102,7 +1108,7 @@ fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
     let mut depth = 1i32;
     let mut j = i + 1;
     while j < region.len() && depth > 0 {
-        if region[j] == b'\\' {
+        if region[j] == b'\\' && j + 1 < region.len() {
             j += 2;
             continue;
         }

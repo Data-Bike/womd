@@ -304,14 +304,21 @@ fn switch_tab(state: tauri::State<'_, Mutex<AppState>>, tab_id: u64) -> Result<D
 fn close_tab(state: tauri::State<'_, Mutex<AppState>>, tab_id: u64) -> Result<Option<DocumentInfo>, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let idx = s.tabs.iter().position(|t| t.id == tab_id).ok_or("tab not found")?;
+    let was_active = idx == s.active;
     s.tabs.remove(idx);
     // Adjust active index.
     if s.tabs.is_empty() {
         s.active = 0;
         return Ok(None);
     }
-    if s.active >= s.tabs.len() {
-        s.active = s.tabs.len() - 1;
+    if was_active {
+        // Closed the active tab — pick the one now at the same position (or last).
+        if s.active >= s.tabs.len() {
+            s.active = s.tabs.len() - 1;
+        }
+    } else if idx < s.active {
+        // Closed a tab before the active one — shift active index down.
+        s.active -= 1;
     }
     let tab = &s.tabs[s.active];
     Ok(Some(DocumentInfo {
@@ -347,14 +354,10 @@ fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Resu
     let buffer = DocumentBuffer::open(bytes, meta, MarkdownProfile::Gfm)
         .map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&buffer.serialize()).to_string();
-    let id = {
-        let mut s = state.lock().map_err(|e| e.to_string())?;
-        let id = s.next_id;
-        s.next_id += 1;
-        s.push_tab(DocumentTab { id, buffer, file_path: Some(PathBuf::from(path)) });
-        id
-    };
-    let s = state.lock().map_err(|e| e.to_string())?;
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let id = s.next_id;
+    s.next_id += 1;
+    s.push_tab(DocumentTab { id, buffer, file_path: Some(PathBuf::from(path)) });
     let tab = s.active_tab()?;
     Ok(DocumentInfo {
         text,
@@ -378,13 +381,10 @@ fn new_document(state: tauri::State<'_, Mutex<AppState>>) -> Result<DocumentInfo
     };
     let buffer = DocumentBuffer::open(b"\n".to_vec(), meta, MarkdownProfile::Gfm)
         .map_err(|e| e.to_string())?;
-    let id = {
-        let mut s = state.lock().map_err(|e| e.to_string())?;
-        let id = s.next_id;
-        s.next_id += 1;
-        s.push_tab(DocumentTab { id, buffer, file_path: None });
-        id
-    };
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let id = s.next_id;
+    s.next_id += 1;
+    s.push_tab(DocumentTab { id, buffer, file_path: None });
     Ok(DocumentInfo {
         text: String::new(),
         file_name: "untitled.md".to_string(),
@@ -456,10 +456,15 @@ fn get_blocks(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<BlockInfo>
             let m = b.meta();
             let start = m.span.start.0 as usize;
             let end = m.span.end.0 as usize;
+            let source = if start <= end && end <= full_text.len() {
+                full_text[start..end].to_string()
+            } else {
+                String::new()
+            };
             BlockInfo {
                 index: i,
                 kind: block_kind_name(b),
-                source: full_text[start..end].to_string(),
+                source,
                 start: m.span.start.0,
                 end: m.span.end.0,
             }
@@ -1541,7 +1546,29 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io:
         let file_type = entry.file_type()?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
-        if file_type.is_dir() {
+        if file_type.is_symlink() {
+            // Copy the symlink target path itself (don't follow — avoids infinite recursion on cycles).
+            if let Ok(target) = std::fs::read_link(&src_path) {
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink(&target, &dest_path)?;
+                }
+                #[cfg(windows)]
+                {
+                    // On Windows, fall back to copying the resolved target.
+                    let resolved = src_path.canonicalize().unwrap_or_else(|_| src_path.clone());
+                    if resolved.is_dir() {
+                        copy_dir_recursive(&resolved, &dest_path)?;
+                    } else {
+                        std::fs::copy(&resolved, &dest_path)?;
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    std::fs::copy(&src_path, &dest_path)?;
+                }
+            }
+        } else if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dest_path)?;
         } else {
             std::fs::copy(&src_path, &dest_path)?;

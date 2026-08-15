@@ -626,3 +626,24 @@ body {
 .github-branches { margin-top: 8px; }
 .github-branch-entry { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .github-branch-entry .br-name { color: var(--accent); font-family: monospace; }
+
+/* ═══ RTL support for Arabic ═══ */
+[dir="rtl"] #toolbar { direction: rtl; }
+[dir="rtl"] #tab-bar { direction: rtl; }
+[dir="rtl"] #tab-list { direction: rtl; }
+[dir="rtl"] .tab { border-right: none; border-left: 1px solid var(--border); }
+[dir="rtl"] .tab.active { border-top: 2px solid var(--accent); border-right: 2px solid var(--accent); }
+[dir="rtl"] #file-tree-panel { border-right: none; border-left: 1px solid var(--border); order: 2; }
+[dir="rtl"] #file-tree-divider { order: 1; }
+[dir="rtl"] #git-panel { border-left: none; border-right: 1px solid var(--border); order: 0; }
+[dir="rtl"] #git-divider { order: 1; }
+[dir="rtl"] #status-bar { direction: rtl; }
+[dir="rtl"] .md-block { direction: rtl; text-align: right; }
+[dir="rtl"] .md-block h1, [dir="rtl"] .md-block h2, [dir="rtl"] .md-block h3,
+[dir="rtl"] .md-block h4, [dir="rtl"] .md-block h5, [dir="rtl"] .md-block h6 { text-align: right; }
+[dir="rtl"] blockquote { border-left: none; border-right: 3px solid var(--accent); padding-left: 0; padding-right: 12px; }
+[dir="rtl"] .git-file-entry { direction: rtl; }
+[dir="rtl"] .modal-dialog { direction: rtl; }
+[dir="rtl"] .settings-tabs { direction: rtl; }
+[dir="rtl"] #file-tree-content { direction: rtl; }
+[dir="rtl"] .file-tree-item { padding-left: 8px; padding-right: calc(8px + var(--ft-depth, 0) * 16px); }
