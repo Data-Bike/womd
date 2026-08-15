@@ -984,10 +984,12 @@ async function enterEditMode(blockIndex) {
   // never receives a scroll event, so the user can't scroll while editing.
   ta.addEventListener("wheel", (e) => {
     e.preventDefault();
+    suppressBlur = false;
     exitEditMode();
     blockEditor.scrollTop += e.deltaY;
     setTimeout(() => {
-      if (editingBlockIndex < 0 && !suppressRender) {
+      if (editingBlockIndex < 0) {
+        suppressRender = false;
         renderVirtualizedBlocks();
         maybeParseNextChunk();
       }
@@ -1006,13 +1008,16 @@ async function enterEditMode(blockIndex) {
                         : e.key === "PageDown" ? viewportHeight
                         : e.key === "Home" ? -blockEditor.scrollTop
                         : blockEditor.scrollHeight;
+      // Force standalone exit — clear suppressBlur so exitEditMode resets
+      // suppressRender synchronously, allowing render in the setTimeout.
+      suppressBlur = false;
       exitEditMode();
       blockEditor.scrollTop += scrollDelta;
       // Explicitly render and check chunk loading — the scroll handler
       // returns early after exitEditMode, so we must trigger rendering here.
-      // Use setTimeout to let restoreBlockElement's sync portion complete.
       setTimeout(() => {
-        if (editingBlockIndex < 0 && !suppressRender) {
+        if (editingBlockIndex < 0) {
+          suppressRender = false;
           renderVirtualizedBlocks();
           maybeParseNextChunk();
         }
