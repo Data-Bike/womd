@@ -94,12 +94,17 @@ blockEditor.addEventListener("scroll", () => {
   scrollRenderPending = true;
   requestAnimationFrame(() => {
     scrollRenderPending = false;
+    const prevStart = renderedRange.start;
+    const prevEnd = renderedRange.end;
     updateVisibleRange();
-    // Only re-render if visible range moved outside the rendered window.
-    if (visibleRange.start < renderedRange.start || visibleRange.end > renderedRange.end) {
+    // Re-render if visible range moved outside the rendered window,
+    // OR if we scrolled far beyond parsed blocks (need to show loading indicator).
+    const parsedHeight = syntaxBlocks.length * 60;
+    const scrolledBeyondParsed = blockEditor.scrollTop > parsedHeight * 0.9;
+    if (visibleRange.start < prevStart || visibleRange.end > prevEnd || scrolledBeyondParsed) {
       renderVirtualizedBlocks();
     }
-    // Trigger chunk parsing if user is scrolling near the end of parsed region.
+    // Always check for chunk parsing — PgDown can jump far beyond parsed region.
     maybeParseNextChunk();
   });
 });
@@ -528,9 +533,22 @@ function renderAllBlocks() {
   addTrailingBlock();
 }
 
+/// Estimate total document height in pixels, including unparsed region.
+/// Uses parsedOffset/totalLen ratio to extrapolate from parsed block count.
+function estimateTotalHeight() {
+  if (!hasMoreToParse || parsedOffset === 0) {
+    return syntaxBlocks.length * 60;
+  }
+  const ratio = totalLen / parsedOffset;
+  const estimatedTotalBlocks = syntaxBlocks.length * ratio;
+  return estimatedTotalBlocks * 60;
+}
+
 /// Render only visible blocks with spacers for virtualized scrolling (large documents).
 /// Renders a large window (RENDER_WINDOW blocks) so scrolling doesn't trigger
 /// re-renders on every frame. Re-render only when scroll moves outside the window.
+/// The bottom spacer accounts for the ENTIRE document (including unparsed region)
+/// so the user can scroll anywhere — chunk parsing is triggered on demand.
 function renderVirtualizedBlocks() {
   // Save scroll position before clearing (innerHTML resets scrollTop to 0).
   const savedScrollTop = blockEditor.scrollTop;
@@ -555,7 +573,9 @@ function renderVirtualizedBlocks() {
   blockEditor.appendChild(topSpacer);
 
   // Render blocks in the render window.
+  let renderedAny = false;
   for (let i = renderedRange.start; i <= renderedRange.end && i < syntaxBlocks.length; i++) {
+    renderedAny = true;
     const block = syntaxBlocks[i];
     if (block.kind === "blank-line") continue;
     if (block.kind === "link-ref-def") continue;
@@ -568,13 +588,29 @@ function renderVirtualizedBlocks() {
     blockEditor.appendChild(el);
   }
 
-  // Bottom spacer — occupies the height of skipped blocks below.
+  // Bottom spacer — accounts for BOTH unparsed blocks below the render window
+  // AND the remaining unparsed document region. This ensures the scroll area
+  // is tall enough for the user to scroll anywhere in the document, even before
+  // all chunks have been parsed.
   const bottomSpacer = document.createElement("div");
   bottomSpacer.className = "md-virtual-spacer";
   bottomSpacer.id = "md-virtual-bottom-spacer";
-  const remaining = syntaxBlocks.length - renderedRange.end - 1;
-  bottomSpacer.style.height = remaining * 60 + "px";
+  const totalHeight = estimateTotalHeight();
+  const topSpacerHeight = renderedRange.start * 60;
+  // Bottom spacer = total height - top spacer - approximate rendered blocks height
+  let bottomHeight = totalHeight - topSpacerHeight - (renderedRange.end - renderedRange.start + 1) * 60;
+  if (bottomHeight < 0) bottomHeight = 0;
+  bottomSpacer.style.height = bottomHeight + "px";
   blockEditor.appendChild(bottomSpacer);
+
+  // If user scrolled into the unparsed region, show a loading indicator.
+  if (hasMoreToParse && !renderedAny && savedScrollTop > syntaxBlocks.length * 60 * 0.9) {
+    const loading = document.createElement("div");
+    loading.className = "md-chunk-loading";
+    loading.textContent = "Loading more content...";
+    loading.style.cssText = "padding:24px;text-align:center;color:var(--fg-muted);font-size:14px";
+    blockEditor.appendChild(loading);
+  }
 
   addTrailingBlock();
 
@@ -585,6 +621,9 @@ function renderVirtualizedBlocks() {
 /// Update visibleRange based on scroll position.
 /// Accepts optional scrollTop param (used when called after innerHTML reset,
 /// since blockEditor.scrollTop will be 0 at that point).
+/// Note: visibleRange is clamped to syntaxBlocks.length (parsed blocks only).
+/// The bottom spacer accounts for the unparsed region so the user can scroll
+/// beyond parsed blocks — maybeParseNextChunk triggers on scroll into that region.
 function updateVisibleRange(scrollTopArg) {
   const scrollTop = scrollTopArg != null ? scrollTopArg : (blockEditor.scrollTop || 0);
   const viewportHeight = blockEditor.clientHeight || 600;
@@ -600,16 +639,16 @@ function updateVisibleRange(scrollTopArg) {
 /// Trigger parsing of the next 10MB chunk if the user is scrolling near the
 /// end of the currently-parsed region. This enables lazy loading of very
 /// large files (>20MB) without parsing the entire file upfront.
+/// Checks by pixel position: if the user is within 2 screens of the end of
+/// parsed content, trigger the next chunk.
 async function maybeParseNextChunk() {
   if (!hasMoreToParse || chunkParseInProgress) return;
-  // Check if the last visible block is near the end of the parsed region.
-  // Use a threshold of 20 blocks — trigger parsing before user reaches the end.
-  const lastVisibleBlock = visibleRange.end;
-  if (lastVisibleBlock < syntaxBlocks.length - 20) return;
-  // Also check by byte offset — if the last visible block's end is within
-  // 1MB of the parsed offset, trigger parsing.
-  const lastBlock = syntaxBlocks[syntaxBlocks.length - 1];
-  if (!lastBlock || lastBlock.end + 1_048_576 > parsedOffset) return;
+  const scrollTop = blockEditor.scrollTop || 0;
+  const viewportHeight = blockEditor.clientHeight || 600;
+  // Estimate where the parsed content ends in pixels.
+  const parsedContentHeight = syntaxBlocks.length * 60;
+  // If user is within 2 viewport heights of the end of parsed content, trigger.
+  if (scrollTop + viewportHeight * 2 < parsedContentHeight) return;
   chunkParseInProgress = true;
   try {
     const [newOffset, total, blockCount] = await tauriInvoke("parse_next_chunk");
@@ -622,6 +661,10 @@ async function maybeParseNextChunk() {
     blockCount.textContent = `${meta.length} ${t("status.blocks")}`;
     // Re-render to show the newly parsed blocks.
     renderVirtualizedBlocks();
+    // Recursively check if we need more chunks (user might have scrolled very far).
+    if (hasMoreToParse) {
+      setTimeout(() => maybeParseNextChunk(), 50);
+    }
   } catch (e) {
     console.error("Failed to parse next chunk:", e);
   } finally {
@@ -2190,6 +2233,20 @@ document.addEventListener("keydown", (e) => {
         switchTab(openTabs[next].id);
         break;
     }
+  }
+  // PgUp/PgDown — ensure chunk loading triggers after fast scroll.
+  if (virtualizedMode && (e.key === "PageUp" || e.key === "PageDown")) {
+    // Let the browser handle the scroll, then check for chunk loading.
+    setTimeout(() => {
+      if (scrollRenderPending) return;
+      updateVisibleRange();
+      const parsedHeight = syntaxBlocks.length * 60;
+      const scrolledBeyondParsed = blockEditor.scrollTop > parsedHeight * 0.9;
+      if (scrolledBeyondParsed || visibleRange.end >= syntaxBlocks.length - 20) {
+        renderVirtualizedBlocks();
+        maybeParseNextChunk();
+      }
+    }, 50);
   }
 });
 
