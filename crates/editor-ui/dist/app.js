@@ -2349,6 +2349,14 @@ async function init() {
     } else {
       await newDocument();
     }
+
+    // Warn before closing the window if there are unsaved changes.
+    window.addEventListener("beforeunload", (e) => {
+      if (isDirty) {
+        e.preventDefault();
+        e.returnValue = "";
+      }
+    });
   } catch (e) {
     console.error("init failed:", e);
     blockEditor.innerHTML = `<div style="padding:24px;color:#f38ba8;font-family:monospace"><h2>${t("msg.init.fail")}</h2><p>${escapeHtml(e.message)}</p></div>`;
@@ -2434,6 +2442,12 @@ window.selectLanguage = function(code) {
   renderSyntaxGrid();
   renderGitChanges();
   refreshFileTree();
+  // Re-render git panel sections that contain translatable labels.
+  refreshGitAll();
+  // Re-render the diff viewer if visible.
+  syncDiffTabIfVisible();
+  // Update status bar (block count label is language-dependent).
+  if (syntaxBlocks) blockCount.textContent = `${syntaxBlocks.length} ${t("status.blocks")}`;
 };
 
 /// Render the interface theme grid.

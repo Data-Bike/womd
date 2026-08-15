@@ -67,6 +67,7 @@ pub fn line_column_to_byte(table: &PieceTable, lc: LineColumn) -> ByteOffset {
     for (i, b) in line_bytes.iter().enumerate() {
         if b & 0xC0 != 0x80 {
             if scalars_seen == lc.column.0 {
+                bytes_into_line = i as u64;
                 break;
             }
             scalars_seen += 1;

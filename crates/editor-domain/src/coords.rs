@@ -53,7 +53,7 @@ impl ByteRange {
         Self { start: at, end: at }
     }
     pub fn len(&self) -> u64 {
-        self.end.0 - self.start.0
+        self.end.0.saturating_sub(self.start.0)
     }
     pub fn is_empty(&self) -> bool {
         self.start == self.end

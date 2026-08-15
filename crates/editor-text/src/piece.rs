@@ -226,7 +226,7 @@ impl PieceTable {
             .iter()
             .copied()
             .filter(|&ls| ls > old_end)
-            .map(|ls| ((ls as i64) + delta) as u64)
+            .map(|ls| (((ls as i64) + delta).max(0)) as u64)
             .collect();
 
         // New line starts from the inserted text, at absolute offset old_start + pos + 1
