@@ -889,7 +889,13 @@ function joinPath(dir, name) {
 // ── Click-to-edit ───────────────────────────────────────────────────────────
 
 async function enterEditMode(blockIndex) {
-  if (editingBlockIndex >= 0) exitEditMode();
+  // If already editing another block, exit it first.
+  // Set suppressBlur to prevent the textarea's blur handler from also
+  // calling exitEditMode (which would double-exit and cause re-render).
+  if (editingBlockIndex >= 0) {
+    suppressBlur = true;
+    exitEditMode();
+  }
   if (blockIndex < 0 || blockIndex >= syntaxBlocks.length) return;
 
   // In virtualized mode, ensure block data is loaded before editing.
@@ -958,24 +964,59 @@ async function enterEditMode(blockIndex) {
 function exitEditMode() {
   if (editingBlockIndex < 0) return;
   const idx = editingBlockIndex;
+  editingBlockIndex = -1;
+  suppressRender = false;
   const blockEl = blockEditor.querySelector(`[data-block-index="${idx}"]`);
   if (blockEl) {
     const ta = blockEl.querySelector(".md-block-textarea");
     if (ta) {
       const newSource = ta.value;
-      commitEdit(newSource);
+      // Restore the block element in-place instead of full re-render.
+      // This avoids destroying other block elements (which would lose click
+      // events and reset scroll position).
+      restoreBlockElement(idx, blockEl, newSource);
     }
-    // Restore focus to the block editor so keyboard shortcuts keep working.
     blockEditor.focus();
   }
 }
 
+/// Restore a single block element from textarea back to rendered HTML.
+/// Avoids full renderBlocks() which would destroy all elements and reset scroll.
+function restoreBlockElement(idx, blockEl, newSource) {
+  const oldSource = syntaxBlocks[idx].source;
+  if (newSource === oldSource) {
+    // Source unchanged — just restore rendered HTML in-place.
+    blockEl.classList.remove("editing");
+    blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
+    attachBlockListeners(blockEl, idx);
+    return;
+  }
+  // Source changed — send to backend, then update in-place.
+  blockEl.classList.remove("editing");
+  blockEl.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
+  sendReplaceBlock(idx, newSource).then(() => {
+    // sendReplaceBlock triggers refreshSyntax which re-renders.
+    // But if we're about to enter another edit mode, suppressRender is true
+    // and renderBlocks will be skipped. So update this block manually.
+    if (suppressRender) {
+      const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
+      if (el) {
+        el.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
+        attachBlockListeners(el, idx);
+      }
+    }
+  });
+}
+
 async function commitEdit(newSource) {
+  // Legacy path — called from flushEdits before save/undo/redo.
+  // exitEditMode now handles the in-place restoration directly.
   const idx = editingBlockIndex;
+  if (idx < 0) return;
   editingBlockIndex = -1;
   suppressRender = false;
 
-  if (idx < 0 || idx >= syntaxBlocks.length) return;
+  if (idx >= syntaxBlocks.length) return;
   const oldSource = syntaxBlocks[idx].source;
   if (newSource === oldSource) {
     renderBlocks();
