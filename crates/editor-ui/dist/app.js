@@ -491,7 +491,8 @@ function renderAstNode(node) {
     case "Table":
       return renderAstTable(node);
     case "HtmlBlock":
-      return node.content; // Render raw HTML
+      // Escape raw HTML to prevent XSS in Tauri webview (which has IPC access).
+      return `<pre class="md-html-block">${escapeHtml(node.content)}</pre>`;
     case "LinkRefDef":
       // Hidden in WYSIWYG — link reference definitions are not visible content.
       return `<div style="display:none"></div>`;
@@ -517,7 +518,8 @@ function renderAstNode(node) {
     case "HardBreak":
       return "<br/>";
     case "RawHtml":
-      return node.content; // Render raw HTML inline
+      // Escape raw inline HTML to prevent XSS.
+      return escapeHtml(node.content);
     default:
       return "";
   }
