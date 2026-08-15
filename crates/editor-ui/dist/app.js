@@ -892,8 +892,12 @@ async function enterEditMode(blockIndex) {
   // If already editing another block, exit it first.
   // Set suppressBlur to prevent the textarea's blur handler from also
   // calling exitEditMode (which would double-exit and cause re-render).
+  // Set suppressRender BEFORE exitEditMode so that restoreBlockElement's
+  // sendReplaceBlock -> refreshSyntax -> renderBlocks is suppressed
+  // (otherwise it would destroy all elements and reset scroll).
   if (editingBlockIndex >= 0) {
     suppressBlur = true;
+    suppressRender = true;
     exitEditMode();
   }
   if (blockIndex < 0 || blockIndex >= syntaxBlocks.length) return;
@@ -928,7 +932,8 @@ async function enterEditMode(blockIndex) {
   // Auto-size.
   autoSizeTextarea(ta);
 
-  ta.focus();
+  // focus with preventScroll to avoid the browser scrolling to the element.
+  ta.focus({ preventScroll: true });
   // Place cursor at end.
   ta.selectionStart = ta.value.length;
   ta.selectionEnd = ta.value.length;
@@ -965,19 +970,24 @@ function exitEditMode() {
   if (editingBlockIndex < 0) return;
   const idx = editingBlockIndex;
   editingBlockIndex = -1;
-  suppressRender = false;
+  // Don't reset suppressRender here — restoreBlockElement may trigger
+  // sendReplaceBlock -> refreshSyntax -> renderBlocks which would destroy
+  // all elements and reset scroll. The caller (enterEditMode or commitEdit)
+  // is responsible for resetting suppressRender when appropriate.
   const blockEl = blockEditor.querySelector(`[data-block-index="${idx}"]`);
   if (blockEl) {
     const ta = blockEl.querySelector(".md-block-textarea");
     if (ta) {
       const newSource = ta.value;
       // Restore the block element in-place instead of full re-render.
-      // This avoids destroying other block elements (which would lose click
-      // events and reset scroll position).
       restoreBlockElement(idx, blockEl, newSource);
     }
-    blockEditor.focus();
+    blockEditor.focus({ preventScroll: true });
   }
+  // Now safe to re-render — but only if we're not entering another edit mode.
+  if (suppressRender) return;
+  suppressRender = false;
+  // No re-render needed — restoreBlockElement already updated the DOM.
 }
 
 /// Restore a single block element from textarea back to rendered HTML.
