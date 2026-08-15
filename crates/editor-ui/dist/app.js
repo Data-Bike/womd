@@ -1054,13 +1054,21 @@ async function enterEditMode(blockIndex) {
     e.preventDefault();
     // Save scrollTop BEFORE exitEditMode — replacing textarea with rendered
     // HTML changes the block's height, causing the browser to adjust scrollTop.
-    // We restore the saved position and add deltaY on top to avoid jumps.
+    // We compute the target scroll position and set it AFTER restoreBlockElement
+    // completes, because restoreBlockElement changes the DOM multiple times
+    // (textarea → placeholder → rendered HTML), each time shifting scrollTop.
     const savedScrollTop = blockEditor.scrollTop;
+    const targetScrollTop = savedScrollTop + e.deltaY;
     suppressBlur = false;
     const restorePromise = exitEditMode();
-    blockEditor.scrollTop = savedScrollTop + e.deltaY;
+    // Set scrollTop immediately so the user sees the scroll response.
+    blockEditor.scrollTop = targetScrollTop;
+    // After restoreBlockElement finishes (DOM changes complete), re-set
+    // scrollTop to the target — the browser may have shifted it during
+    // async DOM updates. Then render.
     restorePromise.then(() => {
       if (editingBlockIndex < 0) {
+        blockEditor.scrollTop = targetScrollTop;
         suppressRender = false;
         renderVirtualizedBlocks();
         maybeParseNextChunk();
@@ -1080,14 +1088,14 @@ async function enterEditMode(blockIndex) {
                         : e.key === "PageDown" ? viewportHeight
                         : e.key === "Home" ? -blockEditor.scrollTop
                         : blockEditor.scrollHeight;
-      // Save scrollTop BEFORE exitEditMode — replacing textarea with rendered
-      // HTML changes the block's height, causing the browser to adjust scrollTop.
       const savedScrollTop = blockEditor.scrollTop;
+      const targetScrollTop = savedScrollTop + scrollDelta;
       suppressBlur = false;
       const restorePromise = exitEditMode();
-      blockEditor.scrollTop = savedScrollTop + scrollDelta;
+      blockEditor.scrollTop = targetScrollTop;
       restorePromise.then(() => {
         if (editingBlockIndex < 0) {
+          blockEditor.scrollTop = targetScrollTop;
           suppressRender = false;
           renderVirtualizedBlocks();
           maybeParseNextChunk();
@@ -1169,8 +1177,12 @@ async function restoreBlockElement(idx, blockEl, newSource) {
         }
       } catch (e) { /* fallback to empty */ }
     }
+    // Save scrollTop before DOM change — replacing content changes block
+    // height, causing the browser to adjust scrollTop.
+    const savedScroll = blockEditor.scrollTop;
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
+    blockEditor.scrollTop = savedScroll;
     // Cache the block's new height so renderVirtualizedBlocks uses it.
     requestAnimationFrame(() => {
       const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
@@ -1183,7 +1195,9 @@ async function restoreBlockElement(idx, blockEl, newSource) {
   // prevent refreshSyntax from calling renderBlocks() (which would do
   // innerHTML='' and reset scroll). We'll update the block element manually.
   blockEl.classList.remove("editing");
+  const savedScroll1 = blockEditor.scrollTop;
   blockEl.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
+  blockEditor.scrollTop = savedScroll1;
   const wasSuppressRender = suppressRender;
   suppressRender = true;
   try {
@@ -1200,8 +1214,10 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     } catch (e) { /* fallback to empty */ }
     const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
     if (el) {
+      const savedScroll2 = blockEditor.scrollTop;
       el.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
       attachBlockListeners(el, idx);
+      blockEditor.scrollTop = savedScroll2;
     }
   } catch (e) {
     // Restore original on error — reload block data first.
@@ -1212,8 +1228,10 @@ async function restoreBlockElement(idx, blockEl, newSource) {
         syntaxBlocks[idx] = block;
       }
     } catch (e2) { /* give up */ }
+    const savedScroll3 = blockEditor.scrollTop;
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
+    blockEditor.scrollTop = savedScroll3;
   }
   // Restore suppressRender to its previous value — if it was false before
   // (standalone exit), keep it false so the caller can render. If it was
