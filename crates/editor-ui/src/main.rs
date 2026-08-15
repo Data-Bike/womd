@@ -107,6 +107,15 @@ struct SyntaxBlock {
     node: Option<AstNode>,
 }
 
+/// Lightweight block metadata for virtualized rendering — no source text or AST.
+/// The frontend requests full block data (source + AST) only for visible blocks.
+#[derive(Serialize, Deserialize)]
+struct SyntaxBlockMeta {
+    kind: String,
+    start: u64,
+    end: u64,
+}
+
 /// A serializable AST node — block or inline — for the frontend renderer.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -554,7 +563,8 @@ fn save_document(
     Ok(true)
 }
 
-/// Get the syntax tree for the active document.
+/// Get the syntax tree for the active document (full — includes source text and AST).
+/// Used for small documents. For large documents, use get_syntax_tree_meta + get_block_data.
 #[tauri::command]
 fn get_syntax_tree(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<SyntaxBlock>, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
@@ -585,6 +595,63 @@ fn get_syntax_tree(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<Synta
         })
         .collect();
     Ok(blocks)
+}
+
+/// Get lightweight block metadata (kind + byte span) without source text or AST.
+/// Used for virtualized rendering of large documents — the frontend requests
+/// full block data only for visible blocks via get_block_data.
+#[tauri::command]
+fn get_syntax_tree_meta(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<SyntaxBlockMeta>, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab()?;
+    let blocks: Vec<SyntaxBlockMeta> = tab
+        .buffer
+        .syntax()
+        .blocks
+        .iter()
+        .map(|b| {
+            let m = b.meta();
+            SyntaxBlockMeta {
+                kind: block_kind_name(b),
+                start: m.span.start.0,
+                end: m.span.end.0,
+            }
+        })
+        .collect();
+    Ok(blocks)
+}
+
+/// Get full block data (source + AST) for a specific block by index.
+/// Used for on-demand loading of visible blocks in virtualized rendering.
+#[tauri::command]
+fn get_block_data(
+    state: tauri::State<'_, Mutex<AppState>>,
+    block_index: usize,
+) -> Result<Option<SyntaxBlock>, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab()?;
+    let blocks = &tab.buffer.syntax().blocks;
+    let b = match blocks.get(block_index) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let full_text = tab.buffer.serialize();
+    let text_str = String::from_utf8_lossy(&full_text).to_string();
+    let m = b.meta();
+    let start = m.span.start.0 as usize;
+    let end = m.span.end.0 as usize;
+    let source = if start <= end && end <= text_str.len() {
+        text_str[start..end].to_string()
+    } else {
+        String::new()
+    };
+    Ok(Some(SyntaxBlock {
+        kind: block_kind_name(b),
+        source,
+        start: m.span.start.0,
+        end: m.span.end.0,
+        node: block_to_ast(b, &text_str),
+    }))
 }
 
 /// Get git status for the active document's repository.
@@ -1880,6 +1947,8 @@ pub fn run() {
             redo,
             save_document,
             get_syntax_tree,
+            get_syntax_tree_meta,
+            get_block_data,
             get_git_status,
             git_branches,
             git_diff,

@@ -30,6 +30,18 @@ let fileTreeRoot = null; // current root directory path for the file tree
 let fileTreeExpanded = new Set(); // expanded folder paths
 let fileTreeClipboard = null; // { path, isDir, operation: "copy" | "cut" }
 
+// ── Virtualization state ────────────────────────────────────────────────────
+// For large documents, only visible blocks are rendered with full data.
+// blockMeta: lightweight metadata (kind, start, end) for all blocks.
+// blockCache: full block data (source + AST) for loaded blocks, keyed by index.
+// VISIBLE_BUFFER: extra blocks rendered above/below viewport for smooth scrolling.
+const VIRTUALIZATION_THRESHOLD = 200; // blocks above this use virtualized rendering
+const VISIBLE_BUFFER = 10; // extra blocks above/below viewport
+let blockMeta = [];       // lightweight metadata for all blocks
+let blockCache = new Map(); // index -> full SyntaxBlock (source + AST)
+let virtualizedMode = false;
+let visibleRange = { start: 0, end: 50 }; // currently rendered block range
+
 // ── Settings state ─────────────────────────────────────────────────────────
 const SETTINGS_KEY = "womd_settings";
 const settings = loadSettings();
@@ -67,6 +79,24 @@ function applyTheme() {
 
 // ── DOM ─────────────────────────────────────────────────────────────────────
 const blockEditor = document.getElementById("block-editor");
+
+// Virtualized scroll handler — re-renders visible blocks on scroll for large documents.
+let scrollRenderPending = false;
+blockEditor.addEventListener("scroll", () => {
+  if (!virtualizedMode || editingBlockIndex >= 0) return;
+  if (scrollRenderPending) return;
+  scrollRenderPending = true;
+  requestAnimationFrame(() => {
+    scrollRenderPending = false;
+    // Check if visible range changed significantly.
+    const prevStart = visibleRange.start;
+    const prevEnd = visibleRange.end;
+    updateVisibleRange();
+    if (visibleRange.start !== prevStart || visibleRange.end !== prevEnd) {
+      renderBlocks();
+    }
+  });
+});
 const fileNameEl = document.getElementById("file-name");
 const dirtyIndicator = document.getElementById("dirty-indicator");
 const gitBranchInfo = document.getElementById("git-branch-info");
@@ -225,8 +255,28 @@ async function doRedo() {
 }
 
 async function refreshSyntax() {
-  try { syntaxBlocks = await tauriInvoke("get_syntax_tree"); }
-  catch (e) { syntaxBlocks = []; }
+  try {
+    // For large documents, fetch only metadata; full block data loaded on demand.
+    const meta = await tauriInvoke("get_syntax_tree_meta");
+    blockMeta = meta;
+    virtualizedMode = meta.length > VIRTUALIZATION_THRESHOLD;
+    if (virtualizedMode) {
+      // Clear cache — block data will be loaded for visible blocks.
+      blockCache.clear();
+      // Build a lightweight syntaxBlocks array with just metadata.
+      // source/node are loaded on demand for visible blocks.
+      syntaxBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
+    } else {
+      // Small document — fetch full syntax tree in one go.
+      syntaxBlocks = await tauriInvoke("get_syntax_tree");
+      blockCache.clear();
+    }
+  }
+  catch (e) {
+    syntaxBlocks = [];
+    blockMeta = [];
+    virtualizedMode = false;
+  }
   if (!suppressRender) renderBlocks();
 }
 
@@ -425,17 +475,131 @@ function renderBlocks() {
     return;
   }
 
+  if (virtualizedMode) {
+    renderVirtualizedBlocks();
+  } else {
+    renderAllBlocks();
+  }
+}
+
+/// Render all blocks (small documents).
+function renderAllBlocks() {
   for (let i = 0; i < syntaxBlocks.length; i++) {
     const block = syntaxBlocks[i];
-    // Skip blank-line blocks — they're spacing, not content.
     if (block.kind === "blank-line") continue;
-    // Skip link-ref-def blocks — hidden in WYSIWYG.
     if (block.kind === "link-ref-def") continue;
     const el = createBlockElement(i, block);
     blockEditor.appendChild(el);
   }
+  addTrailingBlock();
+}
 
-  // Add a trailing empty block for appending content.
+/// Render only visible blocks with spacers for virtualized scrolling (large documents).
+/// A scroll listener updates visibleRange and calls this on scroll.
+function renderVirtualizedBlocks() {
+  // Compute visible range from scroll position.
+  updateVisibleRange();
+
+  // Top spacer — occupies the height of skipped blocks above.
+  const topSpacer = document.createElement("div");
+  topSpacer.className = "md-virtual-spacer";
+  topSpacer.style.height = estimateBlockHeight(visibleRange.start) + "px";
+  blockEditor.appendChild(topSpacer);
+
+  // Render visible blocks (with buffer).
+  for (let i = visibleRange.start; i <= visibleRange.end && i < syntaxBlocks.length; i++) {
+    const block = syntaxBlocks[i];
+    if (block.kind === "blank-line") continue;
+    if (block.kind === "link-ref-def") continue;
+    const el = createBlockElement(i, block);
+    // If block data not loaded yet, show placeholder and load async.
+    if (!block.source && virtualizedMode) {
+      el.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
+      loadBlockData(i, el);
+    }
+    blockEditor.appendChild(el);
+  }
+
+  // Bottom spacer — occupies the height of skipped blocks below.
+  const bottomSpacer = document.createElement("div");
+  bottomSpacer.className = "md-virtual-spacer";
+  const remaining = syntaxBlocks.length - visibleRange.end - 1;
+  bottomSpacer.style.height = estimateBlockHeightFrom(visibleRange.end + 1, remaining) + "px";
+  blockEditor.appendChild(bottomSpacer);
+
+  addTrailingBlock();
+}
+
+/// Estimate cumulative height of blocks [0, count) for spacer sizing.
+/// Uses a fixed estimate per block since we don't have exact heights without rendering.
+function estimateBlockHeight(count) {
+  // Average block height ~60px (paragraph with some content).
+  return count * 60;
+}
+
+/// Estimate height of `count` blocks starting from index `start`.
+function estimateBlockHeightFrom(start, count) {
+  return count * 60;
+}
+
+/// Update visibleRange based on blockEditor scroll position.
+function updateVisibleRange() {
+  const container = blockEditor.parentElement || blockEditor;
+  const scrollTop = container.scrollTop || 0;
+  const viewportHeight = container.clientHeight || window.innerHeight || 600;
+  // Estimate which blocks are visible based on average height.
+  const avgHeight = 60;
+  const firstVisible = Math.max(0, Math.floor(scrollTop / avgHeight) - VISIBLE_BUFFER);
+  const lastVisible = Math.min(
+    syntaxBlocks.length - 1,
+    Math.ceil((scrollTop + viewportHeight) / avgHeight) + VISIBLE_BUFFER
+  );
+  visibleRange = { start: firstVisible, end: lastVisible };
+}
+
+/// Load full block data on demand and update the placeholder element.
+async function loadBlockData(blockIndex, el) {
+  if (blockCache.has(blockIndex)) {
+    const block = blockCache.get(blockIndex);
+    syntaxBlocks[blockIndex] = block;
+    el.innerHTML = renderBlockHtml(block);
+    attachBlockListeners(el, blockIndex);
+    return;
+  }
+  try {
+    const block = await tauriInvoke("get_block_data", { blockIndex });
+    if (block) {
+      blockCache.set(blockIndex, block);
+      syntaxBlocks[blockIndex] = block;
+      el.innerHTML = renderBlockHtml(block);
+      attachBlockListeners(el, blockIndex);
+    }
+  } catch (e) {
+    el.innerHTML = `<div style="padding:8px;color:var(--diff-del)">Error: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+/// Attach event listeners to a block element (extracted from createBlockElement for virtualization).
+function attachBlockListeners(el, index) {
+  let mouseDownX = 0, mouseDownY = 0;
+  el.addEventListener("mousedown", (e) => {
+    mouseDownX = e.clientX; mouseDownY = e.clientY;
+  });
+  el.addEventListener("click", (e) => {
+    if (e.target.closest("a")) return;
+    if (editingBlockIndex === index) return;
+    const dx = Math.abs(e.clientX - mouseDownX);
+    const dy = Math.abs(e.clientY - mouseDownY);
+    if (dx > 3 || dy > 3) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return;
+    e.stopPropagation();
+    enterEditMode(index);
+  });
+}
+
+/// Add trailing empty block for appending content.
+function addTrailingBlock() {
   const trailing = document.createElement("div");
   trailing.className = "md-block empty-block";
   trailing.style.minHeight = "2em";
@@ -609,9 +773,20 @@ function joinPath(dir, name) {
 
 // ── Click-to-edit ───────────────────────────────────────────────────────────
 
-function enterEditMode(blockIndex) {
+async function enterEditMode(blockIndex) {
   if (editingBlockIndex >= 0) exitEditMode();
   if (blockIndex < 0 || blockIndex >= syntaxBlocks.length) return;
+
+  // In virtualized mode, ensure block data is loaded before editing.
+  if (virtualizedMode && !syntaxBlocks[blockIndex].source) {
+    try {
+      const block = await tauriInvoke("get_block_data", { blockIndex });
+      if (block) {
+        blockCache.set(blockIndex, block);
+        syntaxBlocks[blockIndex] = block;
+      }
+    } catch (e) { /* fallback to empty source */ }
+  }
 
   editingBlockIndex = blockIndex;
   suppressRender = true;
@@ -619,7 +794,7 @@ function enterEditMode(blockIndex) {
   const blockEl = blockEditor.querySelector(`[data-block-index="${blockIndex}"]`);
   if (!blockEl) { suppressRender = false; return; }
 
-  const source = syntaxBlocks[blockIndex].source;
+  const source = syntaxBlocks[blockIndex].source || "";
   blockEl.classList.add("editing");
   blockEl.innerHTML = "";
 

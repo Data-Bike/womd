@@ -348,6 +348,9 @@ body {
   cursor: text; transition: background 0.1s; position: relative;
   min-height: 1.7em; user-select: text;
 }
+
+.md-virtual-spacer { width: 100%; }
+.md-block-placeholder { color: var(--fg-muted); padding: 8px; }
 .md-block:hover { background: rgba(137, 180, 250, 0.04); }
 .md-block.editing { background: rgba(137, 180, 250, 0.08); border: 1px solid var(--accent); padding: 2px 7px; }
 
