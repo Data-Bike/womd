@@ -109,6 +109,10 @@ blockEditor.addEventListener("scroll", async () => {
   scrollRenderPending = true;
   requestAnimationFrame(() => {
     scrollRenderPending = false;
+    // suppressRender may have been set after the scroll event queued this frame
+    // (e.g. during exitEditMode). Skip rendering to avoid destroying the DOM
+    // while restoreBlockElement is still running.
+    if (suppressRender) return;
     const prevStart = renderedRange.start;
     const prevEnd = renderedRange.end;
     updateVisibleRange();
@@ -883,6 +887,16 @@ function updateVisibleRange(scrollTopArg) {
   // Use cumulative cached heights to find which blocks are visible.
   // This is more accurate than dividing by a fixed avgHeight, preventing
   // the visible range from being wrong when blocks have varying heights.
+  const totalParsedHeight = cumulativeHeight(syntaxBlocks.length);
+  // If the user scrolled past the end of parsed content (e.g. dragging the
+  // scrollbar below the bottom spacer), stick to the last parsed block.
+  // Otherwise the firstVisible loop falls through to 0 and the user gets
+  // teleported to the first line.
+  if (scrollTop >= totalParsedHeight - 100) {
+    const last = syntaxBlocks.length - 1;
+    visibleRange = { start: Math.max(0, last), end: last };
+    return;
+  }
   let firstVisible = 0;
   let lastVisible = syntaxBlocks.length - 1;
   let cumY = 0;
@@ -1295,7 +1309,9 @@ async function enterEditMode(blockIndex) {
     // (textarea → placeholder → rendered HTML), each time shifting scrollTop.
     const savedScrollTop = blockEditor.scrollTop;
     const targetScrollTop = savedScrollTop + e.deltaY;
-    suppressBlur = false;
+    // Prevent the blur/scroll handlers from running while we restore and re-render.
+    suppressBlur = true;
+    suppressRender = true;
     const restorePromise = exitEditMode();
     // Set scrollTop immediately so the user sees the scroll response.
     blockEditor.scrollTop = targetScrollTop;
@@ -1305,6 +1321,8 @@ async function enterEditMode(blockIndex) {
     restorePromise.then(() => {
       if (editingBlockIndex < 0) {
         blockEditor.scrollTop = targetScrollTop;
+        // Release the guards and re-render.
+        suppressBlur = false;
         suppressRender = false;
         // Check if we need to parse more chunks. maybeParseNextChunk will
         // call renderVirtualizedBlocks after parsing. If no parsing needed,
@@ -1339,12 +1357,16 @@ async function enterEditMode(blockIndex) {
                         : blockEditor.scrollHeight;
       const savedScrollTop = blockEditor.scrollTop;
       const targetScrollTop = savedScrollTop + scrollDelta;
-      suppressBlur = false;
+      // Prevent the blur/scroll handlers from running while we restore and re-render.
+      suppressBlur = true;
+      suppressRender = true;
       const restorePromise = exitEditMode();
       blockEditor.scrollTop = targetScrollTop;
       restorePromise.then(() => {
         if (editingBlockIndex < 0) {
           blockEditor.scrollTop = targetScrollTop;
+          // Release the guards and re-render.
+          suppressBlur = false;
           suppressRender = false;
           // Check if we need to parse more chunks. maybeParseNextChunk will
           // call renderVirtualizedBlocks after parsing. If no parsing needed,
@@ -1380,6 +1402,10 @@ async function enterEditMode(blockIndex) {
       if (e.key === "k") { e.preventDefault(); e.stopPropagation(); insertLinkInTextarea(ta); }
     }
   });
+  // The new textarea is in place and focused; any transition-suppression is over.
+  suppressBlur = false;
+  // suppressRender stays true while editing (scroll/render handlers check
+  // editingBlockIndex >= 0 and call exitEditMode).
 }
 
 // Guard: track which block is being restored to prevent double-exit races.
