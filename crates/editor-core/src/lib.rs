@@ -203,7 +203,6 @@ impl DocumentBuffer {
         net_delta: i64,
     ) -> Result<(), editor_domain::DocumentError> {
         // Find the first and last top-level blocks that overlap the affected range.
-        // Expand by one block on each side for safety (block boundaries may shift).
         let blocks = &self.syntax.blocks;
         let mut first_idx = None;
         let mut last_idx = None;

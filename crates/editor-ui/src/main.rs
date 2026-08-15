@@ -5,6 +5,7 @@
 //! HTML/CSS/JS editor (no JS framework) that calls these commands through
 //! `window.__TAURI__.core.invoke`.
 
+#![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "custom-protocol"), allow(dead_code))]
 
 use std::sync::Mutex;
