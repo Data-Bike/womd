@@ -890,17 +890,17 @@ function joinPath(dir, name) {
 
 async function enterEditMode(blockIndex) {
   // If already editing another block, exit it first.
-  // Set suppressBlur to prevent the textarea's blur handler from also
-  // calling exitEditMode (which would double-exit and cause re-render).
-  // Set suppressRender BEFORE exitEditMode so that restoreBlockElement's
-  // sendReplaceBlock -> refreshSyntax -> renderBlocks is suppressed
-  // (otherwise it would destroy all elements and reset scroll).
+  // Set suppressBlur so the deferred blur handler (from the previous
+  // textarea) skips exitEditMode — we're handling the transition here.
   if (editingBlockIndex >= 0) {
     suppressBlur = true;
     suppressRender = true;
     exitEditMode();
   }
-  if (blockIndex < 0 || blockIndex >= syntaxBlocks.length) return;
+  if (blockIndex < 0 || blockIndex >= syntaxBlocks.length) {
+    suppressRender = false;
+    return;
+  }
 
   // In virtualized mode, ensure block data is loaded before editing.
   if (virtualizedMode && !syntaxBlocks[blockIndex].source) {
@@ -941,7 +941,17 @@ async function enterEditMode(blockIndex) {
   ta.addEventListener("input", () => autoSizeTextarea(ta));
   ta.addEventListener("blur", () => {
     if (suppressBlur) { suppressBlur = false; return; }
-    exitEditMode();
+    // Defer exitEditMode — if a click on another block follows the blur,
+    // that click's enterEditMode will set suppressBlur=true before this
+    // deferred handler runs, so we skip exitEditMode (the click handler
+    // manages the transition). Without this defer, blur fires before
+    // click, causing exitEditMode → renderBlocks → innerHTML='' →
+    // scroll reset and destroying the click target element.
+    setTimeout(() => {
+      if (suppressBlur) { suppressBlur = false; return; }
+      if (editingBlockIndex !== blockIndex) return; // already exited
+      exitEditMode();
+    }, 0);
   });
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); exitEditMode(); return; }
@@ -992,11 +1002,21 @@ function exitEditMode() {
 
 /// Restore a single block element from textarea back to rendered HTML.
 /// Avoids full renderBlocks() which would destroy all elements and reset scroll.
-function restoreBlockElement(idx, blockEl, newSource) {
+async function restoreBlockElement(idx, blockEl, newSource) {
   const oldSource = syntaxBlocks[idx].source;
   if (newSource === oldSource) {
     // Source unchanged — just restore rendered HTML in-place.
     blockEl.classList.remove("editing");
+    // In virtualized mode, ensure block data (node + source) is loaded.
+    if (virtualizedMode && !syntaxBlocks[idx].node && !syntaxBlocks[idx].source) {
+      try {
+        const block = await tauriInvoke("get_block_data", { blockIndex: idx });
+        if (block) {
+          blockCache.set(idx, block);
+          syntaxBlocks[idx] = block;
+        }
+      } catch (e) { /* fallback to empty */ }
+    }
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
     return;
@@ -1004,10 +1024,11 @@ function restoreBlockElement(idx, blockEl, newSource) {
   // Source changed — send to backend, then update in-place.
   blockEl.classList.remove("editing");
   blockEl.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
-  sendReplaceBlock(idx, newSource).then(() => {
-    // sendReplaceBlock triggers refreshSyntax which re-renders.
-    // But if we're about to enter another edit mode, suppressRender is true
-    // and renderBlocks will be skipped. So update this block manually.
+  try {
+    await sendReplaceBlock(idx, newSource);
+    // sendReplaceBlock triggers refreshSyntax which updates syntaxBlocks.
+    // If suppressRender is true (entering another edit mode), renderBlocks
+    // was skipped — update this block element manually.
     if (suppressRender) {
       const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
       if (el) {
@@ -1015,7 +1036,11 @@ function restoreBlockElement(idx, blockEl, newSource) {
         attachBlockListeners(el, idx);
       }
     }
-  });
+  } catch (e) {
+    // Restore original on error.
+    blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
+    attachBlockListeners(blockEl, idx);
+  }
 }
 
 async function commitEdit(newSource) {
