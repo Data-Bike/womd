@@ -234,6 +234,7 @@ async function newDocument() {
   activeTabId = info.tab_id;
   updateUI(info);
   await refreshTabs();
+  blockHeights = [];
   await refreshSyntax();
   editorFocusFirst();
 }
@@ -247,6 +248,8 @@ async function openDocument(path) {
     activeTabId = info.tab_id;
     updateUI(info);
     await refreshTabs();
+    // Clear cached block heights — new document, old heights are invalid.
+    blockHeights = [];
     await refreshSyntax();
     refreshGitAll();
     syncDiffTabIfVisible();
@@ -289,9 +292,11 @@ async function refreshSyntax() {
     blockMeta = meta;
     virtualizedMode = meta.length > VIRTUALIZATION_THRESHOLD;
     if (virtualizedMode) {
-      // Clear cache — block data will be loaded for visible blocks.
+      // Clear block cache — block data will be loaded for visible blocks.
+      // Don't clear blockHeights — preserving cached heights prevents scroll
+      // jumps when refreshSyntax is called after an edit (sendReplaceBlock).
+      // New/changed blocks will use the default estimate until measured.
       blockCache.clear();
-      blockHeights = [];
       // Build a lightweight syntaxBlocks array with just metadata.
       // source/node are loaded on demand for visible blocks.
       syntaxBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
@@ -344,6 +349,7 @@ async function switchTab(tabId) {
     currentText = info.text || "";
     activeTabId = info.tab_id;
     updateUI(info);
+    blockHeights = [];
     await refreshSyntax();
     await refreshTabs();
     refreshGitAll();
@@ -1165,6 +1171,11 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     }
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
+    // Cache the block's new height so renderVirtualizedBlocks uses it.
+    requestAnimationFrame(() => {
+      const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
+      if (el && el.offsetHeight > 0) blockHeights[idx] = el.offsetHeight;
+    });
     return;
   }
   // Source changed — send to backend, then update in-place.
@@ -1208,6 +1219,11 @@ async function restoreBlockElement(idx, blockEl, newSource) {
   // (standalone exit), keep it false so the caller can render. If it was
   // true (transition), keep it true.
   suppressRender = wasSuppressRender;
+  // Cache the block's new height so renderVirtualizedBlocks uses it.
+  requestAnimationFrame(() => {
+    const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
+    if (el && el.offsetHeight > 0) blockHeights[idx] = el.offsetHeight;
+  });
 }
 
 async function commitEdit(newSource) {
