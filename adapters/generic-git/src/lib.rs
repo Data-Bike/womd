@@ -64,11 +64,7 @@ impl RepositoryHostAdapter for GenericGitAdapter {
             .git_text(&["rev-parse", "--abbrev-ref", "HEAD"])
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let name = remote_url
-            .rsplit('/')
-            .next()
-            .map(|s| s.trim_end_matches(".git").to_string())
-            .unwrap_or_default();
+        let name = extract_repo_name(&remote_url);
         Ok(RepositoryMetadata {
             full_name: name,
             default_branch: head,
@@ -93,6 +89,24 @@ impl RepositoryHostAdapter for GenericGitAdapter {
         Ok(branches)
     }
     fn open_remote_url(&self, _target: RemoteUrlTarget) {}
+}
+
+/// Extract a repository name from a remote URL.
+/// Handles HTTPS (`https://host/owner/repo.git`),
+/// SSH (`git@host:owner/repo.git`), and bare names.
+fn extract_repo_name(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    // SSH style: git@github.com:owner/repo.git (no "://" in the URL)
+    if !url.contains("://") {
+        if let Some(idx) = url.rfind(':') {
+            return url[idx + 1..].trim_end_matches(".git").to_string();
+        }
+    }
+    // HTTPS style: https://host/owner/repo.git
+    url.rsplit('/')
+        .next()
+        .map(|s| s.trim_end_matches(".git").to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

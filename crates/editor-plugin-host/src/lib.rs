@@ -95,7 +95,14 @@ impl PluginHost {
                 got: format!("{}.{}", manifest.api_version.major, manifest.api_version.minor),
             });
         }
+        // Reject duplicate plugin IDs to prevent capability confusion.
         let id = manifest.id.clone();
+        if self.plugins.iter().any(|p| p.manifest.id == id) {
+            return Err(PluginError::IncompatibleApi {
+                expected: "unique plugin id".to_string(),
+                got: format!("duplicate: {}", id.0),
+            });
+        }
         self.plugins.push(LoadedPlugin { manifest, state: PluginState::Active });
         Ok(id)
     }

@@ -470,6 +470,9 @@ fn apply_patch_to_index_reverse(repo: &GitCli, patch: &str) -> GitResult<()> {
 
 /// File history for a single document (§45).
 pub fn file_history(repo: &GitCli, path: &str) -> GitResult<Vec<FileHistoryEntry>> {
+    if path.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
+        return Err(GitError::Other("invalid characters in path".into()));
+    }
     let text = repo.exec_text(&["log", "--follow", "--pretty=format:%H%x09%an%x09%ad%x09%s", "--date=short", "--", path])?;
     let mut out = Vec::new();
     for line in text.lines() {
@@ -753,6 +756,9 @@ impl GitExtended for GitCli {
     }
 
     fn log_for_file(&self, path: &str, max_count: usize) -> GitResult<Vec<CommitEntry>> {
+        if path.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
+            return Err(GitError::Other("invalid characters in path".into()));
+        }
         let limit = format!("-{}", max_count);
         let fmt = "%H%x09%h%x09%an%x09%ae%x09%ad%x09%s%x09%b%x09%p";
         let pretty = format!("format:{}", fmt);

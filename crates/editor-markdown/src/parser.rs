@@ -1131,9 +1131,18 @@ fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
     }
     let text_end = j; // position of `]`
     let after = &region[text_end + 1..];
-    // Inline `( ... )`.
+    // Inline `( ... )` — track parenthesis depth to handle URLs with nested parens.
     if after.first() == Some(&b'(') {
-        let close = after.iter().position(|&b| b == b')')?;
+        let mut depth = 1usize;
+        let mut close = 0usize;
+        for (k, &b) in after.iter().enumerate().skip(1) {
+            if b == b'(' { depth += 1; }
+            else if b == b')' {
+                depth -= 1;
+                if depth == 0 { close = k; break; }
+            }
+        }
+        if close == 0 { return None; }
         let inner = &after[1..close];
         let (dest, title) = split_link_dest(inner);
         let span_end = text_end + 1 + close + 1;
