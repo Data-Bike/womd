@@ -402,8 +402,10 @@ function renderBlocks() {
     empty.textContent = t("msg.empty.doc");
     empty.addEventListener("click", () => {
       // Insert a new paragraph block.
-      currentText += (currentText.length > 0 ? "\n\n" : "") + "";
-      sendReplace(0, currentText.length, currentText).then(() => {
+      const insertText = (currentText.length > 0 ? "\n\n" : "") + "";
+      const insertPos = currentText.length;
+      currentText += insertText;
+      sendReplace(insertPos, insertPos, insertText).then(() => {
         // Enter edit mode on the new block.
         setTimeout(() => enterEditMode(syntaxBlocks.length - 1), 50);
       });
@@ -427,8 +429,10 @@ function renderBlocks() {
   trailing.className = "md-block empty-block";
   trailing.style.minHeight = "2em";
   trailing.addEventListener("click", () => {
-    currentText += (currentText.length > 0 ? "\n\n" : "") + "New paragraph";
-    sendReplace(0, currentText.length, currentText).then(() => {
+    const insertText = (currentText.length > 0 ? "\n\n" : "") + "New paragraph";
+    const insertPos = currentText.length;
+    currentText += insertText;
+    sendReplace(insertPos, insertPos, insertText).then(() => {
       const idx = syntaxBlocks.length - 1;
       setTimeout(() => enterEditMode(idx), 50);
     });
@@ -682,16 +686,17 @@ async function commitEdit(newSource) {
   // Find oldSource in currentText by string matching, not byte offsets.
   // Byte offsets from Rust don't match JS string indices for non-ASCII text.
   const pos = currentText.indexOf(oldSource);
-  let newText;
   if (pos >= 0) {
-    newText = currentText.substring(0, pos) + newSource + currentText.substring(pos + oldSource.length);
+    // Granular replace: only send the changed range (Invariant 2: minimal diff).
+    const start = pos;
+    const end = pos + oldSource.length;
+    await sendReplace(start, end, newSource);
   } else {
     // Fallback: use byte offsets (works for pure ASCII).
     const start = syntaxBlocks[idx].start;
     const end = syntaxBlocks[idx].end;
-    newText = currentText.substring(0, start) + newSource + currentText.substring(end);
+    await sendReplace(start, end, newSource);
   }
-  await sendReplace(0, currentText.length, newText);
 }
 
 function autoSizeTextarea(ta) {
@@ -850,22 +855,13 @@ async function applyInlineFormat(prefix, suffix) {
 
   // Replace block source in full text using string matching (not byte offsets).
   const pos = currentText.indexOf(block.source);
-  let newText;
   if (pos >= 0) {
-    newText = currentText.substring(0, pos) + newSource + currentText.substring(pos + block.source.length);
+    // Granular replace: only send the changed block range (Invariant 2: minimal diff).
+    await sendReplace(pos, pos + block.source.length, newSource);
   } else {
-    newText = newSource; // fallback: replace everything
+    // Fallback: replace entire text if block source not found.
+    await sendReplace(0, currentText.length, newSource);
   }
-  await sendReplace(0, currentText.length, newText);
-}
-
-// Helper: replace a block's source in currentText using string matching.
-function replaceBlockSource(block, newSource) {
-  const pos = currentText.indexOf(block.source);
-  if (pos >= 0) {
-    return currentText.substring(0, pos) + newSource + currentText.substring(pos + block.source.length);
-  }
-  return newSource; // fallback
 }
 
 // Apply line-prefix formatting (list, quote, heading) to current selection.
@@ -897,8 +893,13 @@ async function applyLineFormat(prefix) {
   } else {
     newSource = prefix + source;
   }
-  const newText = replaceBlockSource(block, newSource);
-  await sendReplace(0, currentText.length, newText);
+  // Granular replace: find block position and send only the changed range.
+  const pos = currentText.indexOf(block.source);
+  if (pos >= 0) {
+    await sendReplace(pos, pos + block.source.length, newSource);
+  } else {
+    await sendReplace(0, currentText.length, newSource);
+  }
 }
 
 // Apply heading level to current block.
@@ -927,8 +928,12 @@ async function applyHeading(level) {
   const stripped = source.replace(/^#{1,6}\s+/, "").replace(/^={2,}\s*$\n?/m, "").replace(/^-{2,}\s*$\n?/m, "");
   const prefix = level > 0 ? "#".repeat(level) + " " : "";
   const newSource = prefix + stripped;
-  const newText = replaceBlockSource(block, newSource);
-  await sendReplace(0, currentText.length, newText);
+  const pos = currentText.indexOf(block.source);
+  if (pos >= 0) {
+    await sendReplace(pos, pos + block.source.length, newSource);
+  } else {
+    await sendReplace(0, currentText.length, newSource);
+  }
 }
 
 // Insert a link around the current selection.
@@ -966,8 +971,12 @@ async function applyLink() {
   const newSource = source.substring(0, result.start) +
     `[${source.substring(result.start, result.end)}](${url})` +
     source.substring(result.end);
-  const newText = replaceBlockSource(block, newSource);
-  await sendReplace(0, currentText.length, newText);
+  const pos = currentText.indexOf(block.source);
+  if (pos >= 0) {
+    await sendReplace(pos, pos + block.source.length, newSource);
+  } else {
+    await sendReplace(0, currentText.length, newSource);
+  }
 }
 
 // Find a plain-text string in Markdown source, returning {start, end} byte offsets.
@@ -1719,8 +1728,8 @@ btnHr.addEventListener("click", async () => {
     // Insert after this block's source in currentText.
     const pos = currentText.indexOf(block.source);
     const insertPos = pos >= 0 ? pos + block.source.length : currentText.length;
-    const newText = currentText.substring(0, insertPos) + "\n---\n" + currentText.substring(insertPos);
-    await sendReplace(0, currentText.length, newText);
+    // Granular insert: zero-length range at insertPos (Invariant 2: minimal diff).
+    await sendReplace(insertPos, insertPos, "\n---\n");
   }
 });
 
@@ -1752,8 +1761,8 @@ btnCodeblock.addEventListener("click", async () => {
     const lang = prompt("Language (optional):", "");
     const pos = currentText.indexOf(block.source);
     const insertPos = pos >= 0 ? pos + block.source.length : currentText.length;
-    const newText = currentText.substring(0, insertPos) + "\n```" + lang + "\n// code here\n```\n" + currentText.substring(insertPos);
-    await sendReplace(0, currentText.length, newText);
+    // Granular insert: zero-length range at insertPos.
+    await sendReplace(insertPos, insertPos, "\n```" + lang + "\n// code here\n```\n");
   }
 });
 

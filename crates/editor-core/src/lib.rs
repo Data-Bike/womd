@@ -133,6 +133,12 @@ impl DocumentBuffer {
     /// Open a document from raw bytes (the storage layer supplies these).
     pub fn open(bytes: Vec<u8>, meta: DocumentMeta, profile: MarkdownProfile) -> Result<Self, editor_domain::DocumentError> {
         let original: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+        Self::open_from_buffer(original, meta, profile)
+    }
+
+    /// Open a document from a shared immutable buffer (zero-copy for mmap-backed files).
+    /// The buffer is shared with the PieceTable as its immutable original (Invariant 1, 6).
+    pub fn open_from_buffer(original: Arc<[u8]>, meta: DocumentMeta, profile: MarkdownProfile) -> Result<Self, editor_domain::DocumentError> {
         let table = PieceTable::from_original(Arc::clone(&original));
         let syntax = editor_markdown::parse_with(&original, profile.clone())?;
         Ok(Self {

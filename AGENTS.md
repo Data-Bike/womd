@@ -95,10 +95,10 @@
   byte-level path (already minimal-diff).
 - `editor-platform` system clipboard/watcher/secret implementations are CLI-based; a
   native `notify`/`keyring`/`arboard`-backed impl can replace them behind the traits.
-- `editor-ui` sends full-text replace on each edit (debounced 300ms). Granular
-  range-based edits via `replace_text` command are available but not yet wired to
-  fine-grained DOM diffing in the frontend.
-- `editor-ui` uses `std::fs::read` for file reads instead of the `editor-storage`
-  `DocumentStorage` port. Integrating `MmapStorage` would enable mmap-backed large
-  file support (>RAM files) as designed in §51-57. File saves already use
-  `editor_storage::atomic_save` (temp + rename, §55).
+- `editor-ui` uses granular `replace_text` for block-level edits (commitEdit,
+  applyInlineFormat, applyLineFormat, applyHeading, applyLink, thematic break
+  and code block insertion). Full-text replace is only used for initial load,
+  file dialog import, and fallbacks when block source can't be found.
+- `editor-ui` uses `editor_storage::MmapStorage` for file reads (zero-copy,
+  >RAM file support via mmap, Invariant 6) and `editor_storage::atomic_save`
+  for file saves (temp + rename, §55).

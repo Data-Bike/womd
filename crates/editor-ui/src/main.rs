@@ -339,20 +339,24 @@ fn close_tab(state: tauri::State<'_, Mutex<AppState>>, tab_id: u64) -> Result<Op
 /// Open a file from disk in a new tab.
 #[tauri::command]
 fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Result<DocumentInfo, String> {
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    // Use mmap-backed storage for zero-copy reads (Invariant 6: >RAM file support).
+    let doc_id = DocumentId::new(&path);
+    let storage = editor_storage::MmapStorage::open(&path, doc_id)
+        .map_err(|e| e.to_string())?;
+    let buffer_bytes = storage.buffer();
     let file_name = PathBuf::from(&path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
-    let trailing_newline = bytes.last() == Some(&b'\n');
+    let trailing_newline = buffer_bytes.last() == Some(&b'\n');
     let meta = editor_domain::DocumentMeta {
         id: DocumentId::new(&file_name),
-        has_bom: bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
-        line_ending: detect_line_ending(&bytes),
+        has_bom: buffer_bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        line_ending: detect_line_ending(&buffer_bytes),
         trailing_newline,
         encoding: editor_domain::Encoding::Utf8,
     };
-    let buffer = DocumentBuffer::open(bytes, meta, MarkdownProfile::Gfm)
+    let buffer = DocumentBuffer::open_from_buffer(buffer_bytes, meta, MarkdownProfile::Gfm)
         .map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&buffer.serialize()).to_string();
     let mut s = state.lock().map_err(|e| e.to_string())?;
@@ -1369,19 +1373,22 @@ fn open_relative_file(
     if !path.starts_with(&canonical_base) {
         return Err("path traversal denied: resolved path is outside the base directory".to_string());
     }
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let doc_id = DocumentId::new(path.to_string_lossy().as_ref());
+    let storage = editor_storage::MmapStorage::open(&path, doc_id)
+        .map_err(|e| e.to_string())?;
+    let buffer_bytes = storage.buffer();
     let file_name = path.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
-    let trailing_newline = bytes.last() == Some(&b'\n');
+    let trailing_newline = buffer_bytes.last() == Some(&b'\n');
     let meta = editor_domain::DocumentMeta {
         id: DocumentId::new(&file_name),
-        has_bom: bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
-        line_ending: detect_line_ending(&bytes),
+        has_bom: buffer_bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        line_ending: detect_line_ending(&buffer_bytes),
         trailing_newline,
         encoding: editor_domain::Encoding::Utf8,
     };
-    let buffer = DocumentBuffer::open(bytes, meta, MarkdownProfile::Gfm)
+    let buffer = DocumentBuffer::open_from_buffer(buffer_bytes, meta, MarkdownProfile::Gfm)
         .map_err(|e| e.to_string())?;
 
     let mut s = state.lock().map_err(|e| e.to_string())?;
