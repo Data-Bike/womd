@@ -89,7 +89,7 @@ const blockEditor = document.getElementById("block-editor");
 // Uses a larger render window to avoid frequent re-renders during scrolling.
 let scrollRenderPending = false;
 blockEditor.addEventListener("scroll", () => {
-  if (!virtualizedMode || editingBlockIndex >= 0) return;
+  if (!virtualizedMode || editingBlockIndex >= 0 || suppressRender) return;
   if (scrollRenderPending) return;
   scrollRenderPending = true;
   requestAnimationFrame(() => {
@@ -902,6 +902,13 @@ async function enterEditMode(blockIndex) {
     return;
   }
 
+  // Set editingBlockIndex BEFORE any await — during the async get_block_data
+  // call, scroll events or other handlers might fire. If editingBlockIndex
+  // is still -1, the scroll handler would call renderVirtualizedBlocks()
+  // which does innerHTML='' and resets scroll.
+  editingBlockIndex = blockIndex;
+  suppressRender = true;
+
   // In virtualized mode, ensure block data is loaded before editing.
   if (virtualizedMode && !syntaxBlocks[blockIndex].source) {
     try {
@@ -913,11 +920,8 @@ async function enterEditMode(blockIndex) {
     } catch (e) { /* fallback to empty source */ }
   }
 
-  editingBlockIndex = blockIndex;
-  suppressRender = true;
-
   const blockEl = blockEditor.querySelector(`[data-block-index="${blockIndex}"]`);
-  if (!blockEl) { suppressRender = false; return; }
+  if (!blockEl) { editingBlockIndex = -1; suppressRender = false; return; }
 
   const source = syntaxBlocks[blockIndex].source || "";
   blockEl.classList.add("editing");
