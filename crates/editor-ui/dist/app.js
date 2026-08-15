@@ -92,8 +92,12 @@ blockEditor.addEventListener("scroll", () => {
   if (!virtualizedMode) return;
   // If editing a block, exit edit mode first — scrolling away from the edited
   // block should commit the edit and allow normal scroll handling.
+  // Then return — restoreBlockElement is async and needs to finish before
+  // we destroy and recreate all elements via renderVirtualizedBlocks.
+  // The next scroll event (or explicit scrollTop change) will handle rendering.
   if (editingBlockIndex >= 0) {
     exitEditMode();
+    return;
   }
   if (suppressRender) return;
   if (scrollRenderPending) return;
@@ -978,6 +982,29 @@ async function enterEditMode(blockIndex) {
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); exitEditMode(); return; }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); exitEditMode(); return; }
+    // PgUp/PgDown/Home/End — exit edit mode and scroll the container.
+    // Without this, these keys move the cursor inside the textarea instead
+    // of scrolling the document, so the user can't navigate while editing.
+    if (e.key === "PageUp" || e.key === "PageDown" || e.key === "Home" || e.key === "End") {
+      e.preventDefault();
+      const viewportHeight = blockEditor.clientHeight || 600;
+      const scrollDelta = e.key === "PageUp" ? -viewportHeight
+                        : e.key === "PageDown" ? viewportHeight
+                        : e.key === "Home" ? -blockEditor.scrollTop
+                        : blockEditor.scrollHeight;
+      exitEditMode();
+      blockEditor.scrollTop += scrollDelta;
+      // Explicitly render and check chunk loading — the scroll handler
+      // returns early after exitEditMode, so we must trigger rendering here.
+      // Use setTimeout to let restoreBlockElement's sync portion complete.
+      setTimeout(() => {
+        if (editingBlockIndex < 0 && !suppressRender) {
+          renderVirtualizedBlocks();
+          maybeParseNextChunk();
+        }
+      }, 0);
+      return;
+    }
     // Shift+Enter = newline in block. Plain Enter for single-line blocks = save.
     if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey) {
       const kind = syntaxBlocks[blockIndex].kind;
