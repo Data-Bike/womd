@@ -293,7 +293,7 @@ body {
   scrollbar-width: none;
 }
 #line-gutter::-webkit-scrollbar { display: none; }
-#line-gutter .gutter-line { height: 1.7em; padding-right: 4px; }
+#line-gutter .gutter-line { min-height: 1.7em; padding-right: 4px; box-sizing: border-box; }
 
 /* File tree sidebar */
 #file-tree-panel { width: 260px; min-width: 180px; max-width: 500px; background: var(--bg-tab); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }

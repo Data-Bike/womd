@@ -583,6 +583,14 @@ function renderAllBlocks() {
     blockEditor.appendChild(el);
   }
   addTrailingBlock();
+  // Measure block heights for small docs too, so the line gutter aligns.
+  requestAnimationFrame(() => {
+    for (let i = 0; i < syntaxBlocks.length; i++) {
+      const el = blockEditor.querySelector(`[data-block-index="${i}"]`);
+      if (el && el.offsetHeight > 0) blockHeights[i] = el.offsetHeight;
+    }
+    updateLineGutter();
+  });
 }
 
 /// Estimate total document height in pixels, including unparsed region.
@@ -638,16 +646,28 @@ function renderVirtualizedBlocks() {
   // Save scroll position before clearing (innerHTML resets scrollTop to 0).
   const savedScrollTop = blockEditor.scrollTop;
   blockEditor.innerHTML = "";
+  if (syntaxBlocks.length === 0) {
+    // Nothing parsed yet. If there is more to parse, show a loading indicator.
+    if (hasMoreToParse) {
+      const loading = document.createElement("div");
+      loading.className = "md-chunk-loading";
+      loading.textContent = "Loading more content...";
+      loading.style.cssText = "padding:24px;text-align:center;color:var(--fg-muted);font-size:14px";
+      blockEditor.appendChild(loading);
+    }
+    blockEditor.scrollTop = savedScrollTop;
+    return;
+  }
   // Compute visible range from saved scroll position.
   updateVisibleRange(savedScrollTop);
 
   // Expand to render window: center the visible range in a larger window.
-  const visibleCount = visibleRange.end - visibleRange.start + 1;
+  const visibleCount = Math.max(1, visibleRange.end - visibleRange.start + 1);
   const extraAbove = Math.floor((RENDER_WINDOW - visibleCount) / 2);
   const extraBelow = RENDER_WINDOW - visibleCount - extraAbove;
   renderedRange = {
     start: Math.max(0, visibleRange.start - extraAbove),
-    end: Math.min(syntaxBlocks.length - 1, visibleRange.end + extraBelow),
+    end: Math.min(syntaxBlocks.length - 1, Math.max(0, visibleRange.end + extraBelow)),
   };
 
   // Top spacer — uses cumulative cached heights for accuracy.
@@ -760,11 +780,12 @@ function renderLineGutterFromCache(start, end) {
   let html = `<div style="height:${topHeight}px"></div>`;
   for (let i = start; i <= end && i < syntaxBlocks.length; i++) {
     const block = syntaxBlocks[i];
+    const h = getBlockHeight(i);
     if (block.kind === "blank-line" || block.kind === "link-ref-def") {
-      html += `<div class="gutter-line"></div>`;
+      html += `<div class="gutter-line" style="height:${h}px"></div>`;
     } else {
       const ln = gutterLineNumbers[i] || (i + 1);
-      html += `<div class="gutter-line">${ln}</div>`;
+      html += `<div class="gutter-line" style="height:${h}px">${ln}</div>`;
     }
   }
   lineGutter.innerHTML = html;
@@ -783,12 +804,13 @@ function renderLineGutterSimple() {
   let html = "";
   for (let i = 0; i < syntaxBlocks.length; i++) {
     const block = syntaxBlocks[i];
+    const h = getBlockHeight(i);
     if (block.kind === "blank-line" || block.kind === "link-ref-def") {
-      html += `<div class="gutter-line"></div>`;
+      html += `<div class="gutter-line" style="height:${h}px"></div>`;
       if (block.source) lineNum += block.source.split("\n").length - 1;
       continue;
     }
-    html += `<div class="gutter-line">${lineNum}</div>`;
+    html += `<div class="gutter-line" style="height:${h}px">${lineNum}</div>`;
     if (block.source) lineNum += block.source.split("\n").length;
   }
   lineGutter.innerHTML = html;
@@ -801,10 +823,11 @@ function renderLineGutterFallback(start, end) {
   let html = `<div style="height:${topHeight}px"></div>`;
   for (let i = start; i <= end && i < syntaxBlocks.length; i++) {
     const block = syntaxBlocks[i];
+    const h = getBlockHeight(i);
     if (block.kind === "blank-line" || block.kind === "link-ref-def") {
-      html += `<div class="gutter-line"></div>`;
+      html += `<div class="gutter-line" style="height:${h}px"></div>`;
     } else {
-      html += `<div class="gutter-line">${i + 1}</div>`;
+      html += `<div class="gutter-line" style="height:${h}px">${i + 1}</div>`;
     }
   }
   lineGutter.innerHTML = html;
@@ -820,11 +843,15 @@ function renderLineGutterFallback(start, end) {
 function updateVisibleRange(scrollTopArg) {
   const scrollTop = scrollTopArg != null ? scrollTopArg : (blockEditor.scrollTop || 0);
   const viewportHeight = blockEditor.clientHeight || 600;
+  if (syntaxBlocks.length === 0) {
+    visibleRange = { start: 0, end: -1 };
+    return;
+  }
   // Use cumulative cached heights to find which blocks are visible.
   // This is more accurate than dividing by a fixed avgHeight, preventing
   // the visible range from being wrong when blocks have varying heights.
   let firstVisible = 0;
-  let lastVisible = 0;
+  let lastVisible = syntaxBlocks.length - 1;
   let cumY = 0;
   for (let i = 0; i < syntaxBlocks.length; i++) {
     const h = getBlockHeight(i);
@@ -872,27 +899,23 @@ async function maybeParseNextChunk() {
     // Re-fetch metadata and re-render with the new blocks.
     const meta = await tauriInvoke("get_syntax_tree_meta");
     blockMeta = meta;
-    // Preserve existing block data — only add new blocks from the parsed chunk.
-    // Rebuilding the entire array with empty source/node would destroy all
-    // loaded block data, causing every visible block to show a placeholder
-    // and reload asynchronously → height changes → scroll jumps.
-    const oldLen = syntaxBlocks.length;
-    const newBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
-    if (meta.length > oldLen) {
-      // New blocks were added — append only the new ones.
-      syntaxBlocks = syntaxBlocks.concat(newBlocks.slice(oldLen));
-    } else if (meta.length === oldLen) {
-      // No new blocks (edge case) — keep existing data, just update metadata.
-      for (let i = 0; i < oldLen; i++) {
-        syntaxBlocks[i].kind = meta[i].kind;
-        syntaxBlocks[i].start = meta[i].start;
-        syntaxBlocks[i].end = meta[i].end;
+    // CRITICAL: use the same merge logic as refreshSyntax. The backend
+    // `merge_blocks` may remove the overlapping tail of the previous chunk
+    // and replace it with new blocks, so block indices at the end shift.
+    // The append-only `syntaxBlocks.concat(newBlocks.slice(oldLen))` is wrong
+    // because it keeps the removed stale block and appends the wrong slice.
+    // Rebuild by matching kind+span, preserving any existing loaded data.
+    const oldBlocks = syntaxBlocks;
+    syntaxBlocks = meta.map((m, i) => {
+      if (i < oldBlocks.length &&
+          oldBlocks[i].kind === m.kind &&
+          oldBlocks[i].start === m.start &&
+          oldBlocks[i].end === m.end) {
+        // Same block (same span and kind) — keep loaded source/node.
+        return oldBlocks[i];
       }
-    } else {
-      // Block count decreased (shouldn't happen with append-only parsing,
-      // but handle it defensively).
-      syntaxBlocks = newBlocks;
-    }
+      return { kind: m.kind, source: "", start: m.start, end: m.end, node: null };
+    });
     blockCount.textContent = `${meta.length} ${t("status.blocks")}`;
     // Re-render to show the newly parsed blocks. Restore scroll position
     // after re-render — renderVirtualizedBlocks saves/restores scrollTop

@@ -163,13 +163,16 @@ impl DocumentBuffer {
         chunk_size: usize,
     ) -> Result<Self, editor_domain::DocumentError> {
         let table = PieceTable::from_original(Arc::clone(&original));
-        let total_len = original.len();
-        let first_chunk_end = chunk_size.min(total_len);
+        let total_len = original.len() as u64;
+        let target_end = (chunk_size as u64).min(total_len);
+        // Round the first chunk up to the next line boundary so we never
+        // split a line between chunks (prevents corrupted block boundaries).
+        let first_chunk_end = round_to_next_line_end(&table, target_end, total_len);
         // Parse only the first chunk. Blocks beyond this are loaded on demand.
         let syntax = editor_markdown::parse_range(
             original.as_bytes(),
             0,
-            first_chunk_end as u64,
+            first_chunk_end,
             profile.clone(),
         )?;
         let syntax = editor_markdown::Document::from_blocks(syntax);
@@ -192,7 +195,12 @@ impl DocumentBuffer {
         if offset >= total_len {
             return Ok(total_len);
         }
-        let chunk_end = (offset + chunk_size as u64).min(total_len);
+        let target_end = (offset + chunk_size as u64).min(total_len);
+        // Round up to the next line boundary so we never split a line across
+        // chunks. Splitting a line produces partial blocks and breaks the
+        // assumption in merge_blocks that new_blocks[0] starts at a logical
+        // block boundary.
+        let chunk_end = round_to_next_line_end(&self.table, target_end, total_len);
         let new_blocks = editor_markdown::parse_range(
             self.table.original().as_bytes(),
             offset,
@@ -433,11 +441,30 @@ fn compute_edit_impact(edits: &[TextEdit]) -> (u64, u64, i64) {
     (min_start, max_end, net_delta)
 }
 
+/// Round a target byte offset up to the next line ending (the byte after a
+/// `\n`, or `total_len` if there is no later line start). This keeps chunk
+/// boundaries on line boundaries so the parser never starts in the middle of
+/// a line, which would produce split blocks and corrupt the block tree.
+fn round_to_next_line_end(table: &PieceTable, target: u64, total_len: u64) -> u64 {
+    if target >= total_len {
+        return total_len;
+    }
+    let line_starts = table.line_starts();
+    match line_starts.binary_search(&target) {
+        // target is exactly a line start -> use it as the chunk end (the
+        // previous line ends here, next chunk starts at a fresh line).
+        Ok(i) => line_starts.get(i).copied().unwrap_or(total_len),
+        // target is inside a line -> advance to the next line start.
+        Err(i) => line_starts.get(i).copied().unwrap_or(total_len),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use editor_domain::ids::DocumentId;
+    use editor_domain::{ids::DocumentId, ArcByteSource, ByteSource};
     use editor_markdown::Block;
+    use std::sync::Arc;
 
     fn open(src: &[u8]) -> DocumentBuffer {
         let meta = DocumentMeta {
@@ -591,5 +618,40 @@ mod tests {
         assert_eq!(out, b"# Title\n\nSome text.\n\nNew paragraph.\n");
         // Should have more blocks than before (heading + blank + para + blank + para).
         assert!(buf.syntax().blocks.len() >= 4, "block count should grow: got {}", buf.syntax().blocks.len());
+    }
+
+    #[test]
+    fn lazy_open_parses_first_chunk_and_continues() {
+        // Build a source with a block quote that spans past a small chunk boundary,
+        // forcing the chunk boundary to fall inside the quote. With line-boundary
+        // alignment, parsing should still be byte-identical.
+        let src = b"# Title\n\nParagraph one.\n\n> quote line one\n> quote line two\n\nParagraph two.\n";
+        let original: Arc<dyn ByteSource> = Arc::new(ArcByteSource::new(src.to_vec()));
+        let meta = DocumentMeta {
+            id: DocumentId::new("test"),
+            has_bom: false,
+            line_ending: editor_domain::LineEnding::Lf,
+            trailing_newline: src.last() == Some(&b'\n'),
+            encoding: editor_domain::Encoding::Utf8,
+        };
+        // Use a tiny chunk size that falls inside the block quote to exercise
+        // the boundary alignment and merge_blocks logic.
+        let mut buf = DocumentBuffer::open_lazy(original, meta, MarkdownProfile::Gfm, 24).unwrap();
+
+        // First chunk should be parsed (and aligned to a line boundary).
+        assert!(!buf.syntax().blocks.is_empty(), "first chunk should produce blocks");
+
+        // Parse the next chunk(s) until the document is fully parsed.
+        let mut parsed = buf.parsed_offset();
+        let total = buf.total_len();
+        let mut iterations = 0;
+        while parsed < total && iterations < 10 {
+            parsed = buf.parse_next_chunk(parsed, 24).unwrap();
+            iterations += 1;
+        }
+
+        // Should be fully parsed and byte-identical.
+        assert_eq!(parsed, total, "parser should reach total length: parsed={parsed}, total={total}");
+        assert_eq!(buf.serialize(), src, "lazy chunked parse must be byte-identical");
     }
 }

@@ -552,4 +552,37 @@ mod tests {
         // Unordered followed by ordered (separate lists).
         assert_roundtrip(b"- Item A\n\n1. First\n2. Second\n");
     }
+
+    #[test]
+    fn chunked_parse_preserves_full_coverage() {
+        // Simulates large-file chunking: parse the first half, then parse
+        // a second chunk and merge. The merged block spans must still
+        // contiguously cover [0, total_len) so serialization is byte-identical.
+        let src = b"# Section 1\n\nParagraph one.\nStill paragraph one.\n\n> block quote\n> continues\n\nParagraph two.\n";
+        let total_len = src.len() as u64;
+        // Pick a chunk boundary that falls inside the block quote to exercise
+        // the overlap/replace path in Document::merge_blocks.
+        let split = src.iter().position(|&b| b == b'>').unwrap() as u64 + 4;
+        let first = parse_range(src, 0, split, MarkdownProfile::Gfm).expect("first chunk");
+        let mut doc = Document::from_blocks(first);
+
+        let second = parse_range(src, split, total_len - split, MarkdownProfile::Gfm)
+            .expect("second chunk");
+        doc.merge_blocks(second);
+
+        // Spans must be contiguous and cover the full document.
+        assert!(!doc.blocks.is_empty(), "expected blocks after merge");
+        assert_eq!(doc.blocks[0].meta().span.start.0, 0, "first block must start at 0");
+        let last_end = doc.blocks.last().unwrap().meta().span.end.0;
+        assert_eq!(last_end, total_len, "last block must end at total_len");
+        for i in 1..doc.blocks.len() {
+            let prev_end = doc.blocks[i - 1].meta().span.end.0;
+            let next_start = doc.blocks[i].meta().span.start.0;
+            assert_eq!(prev_end, next_start, "blocks must be contiguous at index {i}");
+        }
+
+        // Round-trip must still be byte-identical (no lost/duplicated bytes).
+        let out = serialize(&doc, src);
+        assert_eq!(out, src, "round-trip mismatch after chunked merge");
+    }
 }
