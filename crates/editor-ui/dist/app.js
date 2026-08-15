@@ -735,8 +735,12 @@ async function maybeParseNextChunk() {
   // If user is within 2 viewport heights of the end of parsed content, trigger.
   if (scrollTop + viewportHeight * 2 < parsedContentHeight) return;
   chunkParseInProgress = true;
+  // Save scroll position before async operations — the await calls below
+  // may take time, and the user may scroll further during parsing.
+  // We restore it after re-rendering to avoid scroll jumps.
+  const savedScrollTop = blockEditor.scrollTop;
   try {
-    const [newOffset, total, blockCount] = await tauriInvoke("parse_next_chunk");
+    const [newOffset, total, newBlockCount] = await tauriInvoke("parse_next_chunk");
     parsedOffset = newOffset;
     hasMoreToParse = newOffset < total;
     // Re-fetch metadata and re-render with the new blocks.
@@ -744,8 +748,11 @@ async function maybeParseNextChunk() {
     blockMeta = meta;
     syntaxBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
     blockCount.textContent = `${meta.length} ${t("status.blocks")}`;
-    // Re-render to show the newly parsed blocks.
+    // Re-render to show the newly parsed blocks. Restore scroll position
+    // after re-render — renderVirtualizedBlocks saves/restores scrollTop
+    // internally, but the new blocks may have changed the total height.
     renderVirtualizedBlocks();
+    blockEditor.scrollTop = savedScrollTop;
     // Recursively check if we need more chunks (user might have scrolled very far).
     if (hasMoreToParse) {
       setTimeout(() => maybeParseNextChunk(), 50);
@@ -1070,8 +1077,21 @@ async function enterEditMode(blockIndex) {
       if (editingBlockIndex < 0) {
         blockEditor.scrollTop = targetScrollTop;
         suppressRender = false;
-        renderVirtualizedBlocks();
-        maybeParseNextChunk();
+        // Check if we need to parse more chunks. maybeParseNextChunk will
+        // call renderVirtualizedBlocks after parsing. If no parsing needed,
+        // render here.
+        const scrollTopNow = blockEditor.scrollTop || 0;
+        const viewportHeight = blockEditor.clientHeight || 600;
+        const parsedContentHeight = cumulativeHeight(syntaxBlocks.length);
+        const needsChunk = hasMoreToParse && !chunkParseInProgress &&
+                           scrollTopNow + viewportHeight * 2 >= parsedContentHeight;
+        if (needsChunk) {
+          // maybeParseNextChunk will render after parsing.
+          maybeParseNextChunk();
+        } else {
+          // No chunk parsing needed — render directly.
+          renderVirtualizedBlocks();
+        }
       }
     });
   }, { passive: false });
@@ -1097,8 +1117,18 @@ async function enterEditMode(blockIndex) {
         if (editingBlockIndex < 0) {
           blockEditor.scrollTop = targetScrollTop;
           suppressRender = false;
-          renderVirtualizedBlocks();
-          maybeParseNextChunk();
+          // Check if we need to parse more chunks. maybeParseNextChunk will
+          // call renderVirtualizedBlocks after parsing. If no parsing needed,
+          // render here.
+          const scrollTopNow = blockEditor.scrollTop || 0;
+          const parsedContentHeight = cumulativeHeight(syntaxBlocks.length);
+          const needsChunk = hasMoreToParse && !chunkParseInProgress &&
+                             scrollTopNow + viewportHeight * 2 >= parsedContentHeight;
+          if (needsChunk) {
+            maybeParseNextChunk();
+          } else {
+            renderVirtualizedBlocks();
+          }
         }
       });
       return;
