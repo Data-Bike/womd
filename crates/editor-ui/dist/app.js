@@ -979,6 +979,20 @@ async function enterEditMode(blockIndex) {
     if (suppressBlur) { suppressBlur = false; return; }
     exitEditMode();
   });
+  // Mouse wheel over textarea — exit edit mode and scroll the container.
+  // Without this, wheel events are captured by the textarea and blockEditor
+  // never receives a scroll event, so the user can't scroll while editing.
+  ta.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    exitEditMode();
+    blockEditor.scrollTop += e.deltaY;
+    setTimeout(() => {
+      if (editingBlockIndex < 0 && !suppressRender) {
+        renderVirtualizedBlocks();
+        maybeParseNextChunk();
+      }
+    }, 0);
+  }, { passive: false });
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); exitEditMode(); return; }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); exitEditMode(); return; }
