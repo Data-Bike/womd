@@ -517,9 +517,11 @@ function renderAllBlocks() {
 /// Renders a large window (RENDER_WINDOW blocks) so scrolling doesn't trigger
 /// re-renders on every frame. Re-render only when scroll moves outside the window.
 function renderVirtualizedBlocks() {
+  // Save scroll position before clearing (innerHTML resets scrollTop to 0).
+  const savedScrollTop = blockEditor.scrollTop;
   blockEditor.innerHTML = "";
-  // Compute visible range from scroll position.
-  updateVisibleRange();
+  // Compute visible range from saved scroll position.
+  updateVisibleRange(savedScrollTop);
 
   // Expand to render window: center the visible range in a larger window.
   const visibleCount = visibleRange.end - visibleRange.start + 1;
@@ -560,12 +562,16 @@ function renderVirtualizedBlocks() {
   blockEditor.appendChild(bottomSpacer);
 
   addTrailingBlock();
+
+  // Restore scroll position (innerHTML reset it to 0).
+  blockEditor.scrollTop = savedScrollTop;
 }
 
-/// Update visibleRange based on blockEditor scroll position.
-/// blockEditor is the scroll container (overflow-y: auto in CSS).
-function updateVisibleRange() {
-  const scrollTop = blockEditor.scrollTop || 0;
+/// Update visibleRange based on scroll position.
+/// Accepts optional scrollTop param (used when called after innerHTML reset,
+/// since blockEditor.scrollTop will be 0 at that point).
+function updateVisibleRange(scrollTopArg) {
+  const scrollTop = scrollTopArg != null ? scrollTopArg : (blockEditor.scrollTop || 0);
   const viewportHeight = blockEditor.clientHeight || 600;
   const avgHeight = 60;
   const firstVisible = Math.max(0, Math.floor(scrollTop / avgHeight) - 5);
