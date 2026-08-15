@@ -132,15 +132,15 @@ pub struct DocumentBuffer {
 impl DocumentBuffer {
     /// Open a document from raw bytes (the storage layer supplies these).
     pub fn open(bytes: Vec<u8>, meta: DocumentMeta, profile: MarkdownProfile) -> Result<Self, editor_domain::DocumentError> {
-        let original: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+        let original: Arc<dyn editor_domain::ByteSource> = Arc::new(editor_domain::ArcByteSource::new(bytes));
         Self::open_from_buffer(original, meta, profile)
     }
 
     /// Open a document from a shared immutable buffer (zero-copy for mmap-backed files).
     /// The buffer is shared with the PieceTable as its immutable original (Invariant 1, 6).
-    pub fn open_from_buffer(original: Arc<[u8]>, meta: DocumentMeta, profile: MarkdownProfile) -> Result<Self, editor_domain::DocumentError> {
+    pub fn open_from_buffer(original: Arc<dyn editor_domain::ByteSource>, meta: DocumentMeta, profile: MarkdownProfile) -> Result<Self, editor_domain::DocumentError> {
         let table = PieceTable::from_original(Arc::clone(&original));
-        let syntax = editor_markdown::parse_with(&original, profile.clone())?;
+        let syntax = editor_markdown::parse_with(original.as_bytes(), profile.clone())?;
         Ok(Self {
             meta,
             profile,
@@ -150,6 +150,68 @@ impl DocumentBuffer {
             undo: UndoManager::new(),
             dirty: false,
         })
+    }
+
+    /// Open a large document lazily — creates a PieceTable with the full mmap
+    /// (zero-copy, OS pages on demand) but parses only the first `chunk_size` bytes.
+    /// Additional chunks are parsed on demand via `parse_next_chunk()`.
+    /// This avoids parsing 100+ MB at once (Invariant 6: >RAM files).
+    pub fn open_lazy(
+        original: Arc<dyn editor_domain::ByteSource>,
+        meta: DocumentMeta,
+        profile: MarkdownProfile,
+        chunk_size: usize,
+    ) -> Result<Self, editor_domain::DocumentError> {
+        let table = PieceTable::from_original(Arc::clone(&original));
+        let total_len = original.len();
+        let first_chunk_end = chunk_size.min(total_len);
+        // Parse only the first chunk. Blocks beyond this are loaded on demand.
+        let syntax = editor_markdown::parse_range(
+            original.as_bytes(),
+            0,
+            first_chunk_end as u64,
+            profile.clone(),
+        )?;
+        let syntax = editor_markdown::Document::from_blocks(syntax);
+        Ok(Self {
+            meta,
+            profile,
+            table,
+            syntax,
+            selection: SelectionModel::new(),
+            undo: UndoManager::new(),
+            dirty: false,
+        })
+    }
+
+    /// Parse the next chunk of the document starting at `offset`.
+    /// Returns the byte offset where parsing stopped (end of chunk or end of file).
+    /// The parsed blocks are merged into the syntax tree.
+    pub fn parse_next_chunk(&mut self, offset: u64, chunk_size: usize) -> Result<u64, editor_domain::DocumentError> {
+        let total_len = self.table.len();
+        if offset >= total_len {
+            return Ok(total_len);
+        }
+        let chunk_end = (offset + chunk_size as u64).min(total_len);
+        let new_blocks = editor_markdown::parse_range(
+            self.table.original().as_bytes(),
+            offset,
+            chunk_end - offset,
+            self.profile.clone(),
+        )?;
+        // Merge new blocks into the syntax tree.
+        self.syntax.merge_blocks(new_blocks);
+        Ok(chunk_end)
+    }
+
+    /// How many bytes of the document have been parsed so far.
+    pub fn parsed_offset(&self) -> u64 {
+        self.syntax.parsed_offset
+    }
+
+    /// Total document length in bytes (may be larger than parsed_offset for lazy docs).
+    pub fn total_len(&self) -> u64 {
+        self.table.len()
     }
 
     pub fn len(&self) -> u64 {

@@ -78,5 +78,6 @@ pub fn line_column_to_byte(table: &PieceTable, lc: LineColumn) -> ByteOffset {
     ByteOffset(line_start + bytes_into_line)
 }
 
-/// Re-export the original buffer for storage/mmap integration.
-pub type OriginalBuffer = Arc<[u8]>;
+/// Re-export the original buffer type for storage/mmap integration.
+/// Uses `ByteSource` trait to support both in-memory and mmap-backed buffers.
+pub type OriginalBuffer = Arc<dyn editor_domain::ByteSource>;

@@ -22,7 +22,7 @@ pub type StorageResult<T> = Result<T, StorageError>;
 mod mmap;
 mod chunk;
 
-pub use mmap::MmapStorage;
+pub use mmap::{MmapSource, MmapStorage};
 pub use chunk::{analyze_context, ChunkContext};
 
 /// A chunk of bytes read from a document, with its absolute start offset and partial-edge

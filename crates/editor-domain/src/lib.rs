@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 pub mod ids;
 pub mod coords;
 pub mod errors;
@@ -76,4 +78,58 @@ pub enum LineEnding {
 pub enum Encoding {
     Utf8,
     Utf8WithBom,
+}
+
+/// A source of immutable bytes that can be accessed without copying the entire
+/// buffer into memory. Used by PieceTable to support mmap-backed files (Invariant 6:
+/// >RAM files are mmap'd and lazily paged by the OS, never fully loaded).
+///
+/// Implementations: `Arc<[u8]>` (in-memory), `MmapSource` (mmap-backed, zero-copy).
+pub trait ByteSource: Send + Sync {
+    /// The full byte slice. For mmap-backed sources, this is a direct view into
+    /// the memory-mapped file — the OS pages regions on demand.
+    fn as_bytes(&self) -> &[u8];
+    /// Total length in bytes.
+    fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+    /// Extract a byte range without copying the entire buffer.
+    /// Default implementation slices from `as_bytes()`; mmap implementations
+    /// can override to use `read_range` for partial reads.
+    fn read_range(&self, start: usize, end: usize) -> Vec<u8> {
+        let bytes = self.as_bytes();
+        let s = start.min(bytes.len());
+        let e = end.min(bytes.len()).max(s);
+        bytes[s..e].to_vec()
+    }
+}
+
+/// In-memory byte source wrapping `Arc<[u8]>`.
+/// Used for small documents that fit in RAM.
+#[derive(Debug, Clone)]
+pub struct ArcByteSource {
+    bytes: Arc<[u8]>,
+}
+
+impl ArcByteSource {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes: Arc::from(bytes.into_boxed_slice()) }
+    }
+    pub fn from_arc(bytes: Arc<[u8]>) -> Self {
+        Self { bytes }
+    }
+}
+
+impl ByteSource for ArcByteSource {
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    fn read_range(&self, start: usize, end: usize) -> Vec<u8> {
+        let s = start.min(self.bytes.len());
+        let e = end.min(self.bytes.len()).max(s);
+        self.bytes[s..e].to_vec()
+    }
 }

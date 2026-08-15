@@ -15,9 +15,54 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use editor_domain::{errors::StorageError, ByteOffset, DocumentId};
+use editor_domain::{errors::StorageError, ByteOffset, ByteSource, DocumentId};
 
 use crate::{ByteChunk, DocumentStorage, StorageResult};
+
+/// Zero-copy `ByteSource` backed by an mmap'd file.
+///
+/// The `Mmap` handle is kept alive in an `Arc`, and `as_bytes()` returns a
+/// direct slice into the memory-mapped region. The OS lazily pages regions
+/// on access, so a >RAM file never needs to fit entirely in physical memory
+/// (Invariant 6).
+///
+/// This replaces the old `MmapStorage::buffer()` which copied the entire file
+/// into an `Arc<[u8]>`.
+pub struct MmapSource {
+    map: Arc<memmap2::Mmap>,
+}
+
+impl MmapSource {
+    /// Open a file read-only and create a zero-copy byte source.
+    pub fn open(path: impl AsRef<std::path::Path>) -> StorageResult<Self> {
+        let file = File::open(path.as_ref()).map_err(|e| StorageError::Io(e.to_string()))?;
+        let map = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        Ok(Self { map: Arc::new(map) })
+    }
+
+    /// Create from an existing `Arc<Mmap>` (used by `MmapStorage`).
+    pub fn from_mmap(map: Arc<memmap2::Mmap>) -> Self {
+        Self { map }
+    }
+}
+
+impl ByteSource for MmapSource {
+    fn as_bytes(&self) -> &[u8] {
+        &self.map
+    }
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+    /// For mmap, `read_range` slices from the mapped region — the OS pages
+    /// only the requested range from disk (zero-copy for already-paged regions).
+    fn read_range(&self, start: usize, end: usize) -> Vec<u8> {
+        let bytes = self.as_bytes();
+        let s = start.min(bytes.len());
+        let e = end.min(bytes.len()).max(s);
+        bytes[s..e].to_vec()
+    }
+}
 
 /// mmap-backed storage. The map is kept alive for the lifetime of this struct.
 pub struct MmapStorage {
@@ -36,12 +81,12 @@ impl MmapStorage {
         Ok(Self { id, path, map: Arc::new(map) })
     }
 
-    /// The immutable mapped buffer, shareable with the Piece Table.
-    pub fn buffer(&self) -> Arc<[u8]> {
-        // Cheap: `Arc<[u8]>` from `Arc<Mmap>` via a pointer-length construction would avoid
-        // the copy, but `Arc<[u8]>` cannot wrap an external allocation without unsafe
-        // custom allocators. For MVP we expose the slice via a method instead.
-        Arc::from(&self.map[..])
+    /// The immutable mapped buffer as a zero-copy `ByteSource`.
+    /// This replaces the old `buffer()` method that copied the entire file.
+    /// The returned `Arc<dyn ByteSource>` can be shared with the PieceTable
+    /// without copying any file content.
+    pub fn byte_source(&self) -> Arc<dyn ByteSource> {
+        Arc::new(MmapSource::from_mmap(Arc::clone(&self.map)))
     }
 
     /// The mapped bytes as a slice (zero-copy).

@@ -42,6 +42,10 @@ let blockCache = new Map(); // index -> full SyntaxBlock (source + AST)
 let virtualizedMode = false;
 let visibleRange = { start: 0, end: 50 }; // currently visible blocks
 let renderedRange = { start: 0, end: 0 }; // currently rendered blocks (>= visibleRange)
+let parsedOffset = 0;     // how far parsing has progressed (lazy loading)
+let totalLen = 0;         // total document length in bytes
+let hasMoreToParse = false; // true if there are unparsed chunks
+let chunkParseInProgress = false; // prevent concurrent chunk parsing
 
 // ── Settings state ─────────────────────────────────────────────────────────
 const SETTINGS_KEY = "womd_settings";
@@ -95,6 +99,8 @@ blockEditor.addEventListener("scroll", () => {
     if (visibleRange.start < renderedRange.start || visibleRange.end > renderedRange.end) {
       renderVirtualizedBlocks();
     }
+    // Trigger chunk parsing if user is scrolling near the end of parsed region.
+    maybeParseNextChunk();
   });
 });
 const fileNameEl = document.getElementById("file-name");
@@ -271,16 +277,25 @@ async function refreshSyntax() {
       // Build a lightweight syntaxBlocks array with just metadata.
       // source/node are loaded on demand for visible blocks.
       syntaxBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
+      // Check if there are more chunks to parse (lazy loading).
+      const [parsed, total] = await tauriInvoke("get_parsed_offset");
+      parsedOffset = parsed;
+      totalLen = total;
+      hasMoreToParse = parsed < total;
     } else {
       // Small document — fetch full syntax tree in one go.
       syntaxBlocks = await tauriInvoke("get_syntax_tree");
       blockCache.clear();
+      parsedOffset = 0;
+      totalLen = 0;
+      hasMoreToParse = false;
     }
   }
   catch (e) {
     syntaxBlocks = [];
     blockMeta = [];
     virtualizedMode = false;
+    hasMoreToParse = false;
   }
   if (!suppressRender) renderBlocks();
 }
@@ -580,6 +595,38 @@ function updateVisibleRange(scrollTopArg) {
     Math.ceil((scrollTop + viewportHeight) / avgHeight) + 5
   );
   visibleRange = { start: firstVisible, end: lastVisible };
+}
+
+/// Trigger parsing of the next 10MB chunk if the user is scrolling near the
+/// end of the currently-parsed region. This enables lazy loading of very
+/// large files (>20MB) without parsing the entire file upfront.
+async function maybeParseNextChunk() {
+  if (!hasMoreToParse || chunkParseInProgress) return;
+  // Check if the last visible block is near the end of the parsed region.
+  // Use a threshold of 20 blocks — trigger parsing before user reaches the end.
+  const lastVisibleBlock = visibleRange.end;
+  if (lastVisibleBlock < syntaxBlocks.length - 20) return;
+  // Also check by byte offset — if the last visible block's end is within
+  // 1MB of the parsed offset, trigger parsing.
+  const lastBlock = syntaxBlocks[syntaxBlocks.length - 1];
+  if (!lastBlock || lastBlock.end + 1_048_576 > parsedOffset) return;
+  chunkParseInProgress = true;
+  try {
+    const [newOffset, total, blockCount] = await tauriInvoke("parse_next_chunk");
+    parsedOffset = newOffset;
+    hasMoreToParse = newOffset < total;
+    // Re-fetch metadata and re-render with the new blocks.
+    const meta = await tauriInvoke("get_syntax_tree_meta");
+    blockMeta = meta;
+    syntaxBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
+    blockCount.textContent = `${meta.length} ${t("status.blocks")}`;
+    // Re-render to show the newly parsed blocks.
+    renderVirtualizedBlocks();
+  } catch (e) {
+    console.error("Failed to parse next chunk:", e);
+  } finally {
+    chunkParseInProgress = false;
+  }
 }
 
 /// Load full block data on demand and update the placeholder element.

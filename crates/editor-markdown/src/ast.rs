@@ -32,6 +32,50 @@ impl SourceSpan {
 pub struct Document {
     pub span: SourceSpan,
     pub blocks: Vec<Block>,
+    /// How far parsing has progressed (for lazy/chunked parsing of large files).
+    /// Blocks with `span.end <= parsed_offset` are fully parsed; bytes beyond
+    /// `parsed_offset` have not yet been parsed. For fully-parsed documents,
+    /// `parsed_offset == span.end.0`.
+    pub parsed_offset: u64,
+}
+
+impl Document {
+    /// Create a document from a pre-parsed list of blocks.
+    /// The document span covers `[0, last_block_end)`.
+    /// `parsed_offset` is set to the end of the last block.
+    pub fn from_blocks(blocks: Vec<Block>) -> Self {
+        let end = blocks.last().map(|b| b.meta().span.end.0).unwrap_or(0);
+        Self {
+            span: SourceSpan::new(ByteOffset(0), ByteOffset(end)),
+            blocks,
+            parsed_offset: end,
+        }
+    }
+
+    /// Merge newly-parsed blocks from a subsequent chunk into this document.
+    /// New blocks are appended; `parsed_offset` advances to the end of the
+    /// last new block. Blocks that overlap with existing blocks (due to
+    /// chunk boundary re-alignment) replace the overlapping tail.
+    pub fn merge_blocks(&mut self, new_blocks: Vec<Block>) {
+        if new_blocks.is_empty() {
+            return;
+        }
+        let new_start = new_blocks[0].meta().span.start.0;
+        // Remove existing blocks that overlap with the new chunk.
+        // Keep blocks whose span ends at or before new_start.
+        let split_point = self
+            .blocks
+            .iter()
+            .position(|b| b.meta().span.end.0 > new_start)
+            .unwrap_or(self.blocks.len());
+        self.blocks.truncate(split_point);
+        // Append new blocks.
+        let new_end = new_blocks.last().map(|b| b.meta().span.end.0).unwrap_or(0);
+        self.blocks.extend(new_blocks);
+        self.parsed_offset = new_end;
+        // Update document span.
+        self.span.end = ByteOffset(new_end);
+    }
 }
 
 /// Common fields for every node: source span + dirty flag.

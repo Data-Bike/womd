@@ -382,22 +382,33 @@ fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Resu
     let doc_id = DocumentId::new(&path);
     let storage = editor_storage::MmapStorage::open(&path, doc_id)
         .map_err(|e| e.to_string())?;
-    let buffer_bytes = storage.buffer();
+    let byte_source = storage.byte_source();
     let file_name = PathBuf::from(&path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
-    let trailing_newline = buffer_bytes.last() == Some(&b'\n');
+    let bytes = byte_source.as_bytes();
+    let trailing_newline = bytes.last() == Some(&b'\n');
     let meta = editor_domain::DocumentMeta {
         id: DocumentId::new(&file_name),
-        has_bom: buffer_bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
-        line_ending: detect_line_ending(&buffer_bytes),
+        has_bom: bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        line_ending: detect_line_ending(bytes),
         trailing_newline,
         encoding: editor_domain::Encoding::Utf8,
     };
-    let buffer = DocumentBuffer::open_from_buffer(buffer_bytes, meta, MarkdownProfile::Gfm)
-        .map_err(|e| e.to_string())?;
-    let byte_len = buffer.len() as usize;
+    let byte_len = byte_source.len();
+    // For large files (>20MB), use lazy/chunked parsing: only parse the first
+    // 10MB chunk. Additional chunks are parsed on demand via parse_next_chunk.
+    // This avoids parsing 100+ MB at once (Invariant 6: >RAM files).
+    const LAZY_THRESHOLD: usize = 20 * 1024 * 1024; // 20 MB
+    const CHUNK_SIZE: usize = 10 * 1024 * 1024;     // 10 MB
+    let buffer = if byte_len > LAZY_THRESHOLD {
+        DocumentBuffer::open_lazy(byte_source, meta, MarkdownProfile::Gfm, CHUNK_SIZE)
+            .map_err(|e| e.to_string())?
+    } else {
+        DocumentBuffer::open_from_buffer(byte_source, meta, MarkdownProfile::Gfm)
+            .map_err(|e| e.to_string())?
+    };
     let block_count = buffer.syntax().blocks.len();
     // For large documents, don't serialize the full text — frontend will
     // use get_syntax_tree_meta + get_block_data for virtualized rendering.
@@ -642,6 +653,36 @@ fn get_syntax_tree_meta(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<
         })
         .collect();
     Ok(blocks)
+}
+
+/// How many bytes of the document have been parsed so far.
+/// For fully-parsed documents, this equals the document length.
+/// For lazy/chunked documents, bytes beyond this offset have not been parsed yet.
+#[tauri::command]
+fn get_parsed_offset(state: tauri::State<'_, Mutex<AppState>>) -> Result<(u64, u64), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab()?;
+    Ok((tab.buffer.parsed_offset(), tab.buffer.total_len()))
+}
+
+/// Parse the next chunk of a large document (10 MB).
+/// Returns (parsed_offset, total_len, block_count) after parsing.
+/// The frontend calls this when the user scrolls near the end of the currently
+/// parsed region to trigger on-demand parsing of the next chunk.
+#[tauri::command]
+fn parse_next_chunk(state: tauri::State<'_, Mutex<AppState>>) -> Result<(u64, u64, usize), String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab_mut()?;
+    let offset = tab.buffer.parsed_offset();
+    let total = tab.buffer.total_len();
+    if offset >= total {
+        return Ok((offset, total, tab.buffer.syntax().blocks.len()));
+    }
+    const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+    let new_offset = tab.buffer.parse_next_chunk(offset, CHUNK_SIZE)
+        .map_err(|e| e.to_string())?;
+    let block_count = tab.buffer.syntax().blocks.len();
+    Ok((new_offset, total, block_count))
 }
 
 /// Get full block data (source + AST) for a specific block by index.
@@ -1466,20 +1507,29 @@ fn open_relative_file(
     let doc_id = DocumentId::new(path.to_string_lossy().as_ref());
     let storage = editor_storage::MmapStorage::open(&path, doc_id)
         .map_err(|e| e.to_string())?;
-    let buffer_bytes = storage.buffer();
+    let byte_source = storage.byte_source();
     let file_name = path.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
-    let trailing_newline = buffer_bytes.last() == Some(&b'\n');
+    let bytes = byte_source.as_bytes();
+    let trailing_newline = bytes.last() == Some(&b'\n');
     let meta = editor_domain::DocumentMeta {
         id: DocumentId::new(&file_name),
-        has_bom: buffer_bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
-        line_ending: detect_line_ending(&buffer_bytes),
+        has_bom: bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        line_ending: detect_line_ending(bytes),
         trailing_newline,
         encoding: editor_domain::Encoding::Utf8,
     };
-    let buffer = DocumentBuffer::open_from_buffer(buffer_bytes, meta, MarkdownProfile::Gfm)
-        .map_err(|e| e.to_string())?;
+    let byte_len = byte_source.len();
+    const LAZY_THRESHOLD: usize = 20 * 1024 * 1024;
+    const CHUNK_SIZE: usize = 10 * 1024 * 1024;
+    let buffer = if byte_len > LAZY_THRESHOLD {
+        DocumentBuffer::open_lazy(byte_source, meta, MarkdownProfile::Gfm, CHUNK_SIZE)
+            .map_err(|e| e.to_string())?
+    } else {
+        DocumentBuffer::open_from_buffer(byte_source, meta, MarkdownProfile::Gfm)
+            .map_err(|e| e.to_string())?
+    };
 
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let id = s.next_id;
@@ -1965,6 +2015,8 @@ pub fn run() {
             get_syntax_tree,
             get_syntax_tree_meta,
             get_block_data,
+            get_parsed_offset,
+            parse_next_chunk,
             get_git_status,
             git_branches,
             git_diff,

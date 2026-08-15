@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use editor_domain::{ByteOffset, ByteRange};
+use editor_domain::{ByteOffset, ByteRange, ByteSource};
 
 /// Where a piece's bytes live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +26,9 @@ pub struct Piece {
 /// The source-preserving text buffer.
 pub struct PieceTable {
     /// Immutable original document bytes. Never mutated (Invariant 1, 2, 6).
-    original: Arc<[u8]>,
+    /// Uses `ByteSource` trait to support mmap-backed files without copying
+    /// the entire file into memory (Invariant 6: >RAM files).
+    original: Arc<dyn ByteSource>,
     /// Append-only edit log.
     edit_log: Vec<u8>,
     /// Ordered list of pieces describing the current document.
@@ -39,8 +41,8 @@ pub struct PieceTable {
 
 impl PieceTable {
     /// Create a table from the original document bytes. No edits yet.
-    pub fn from_original(original: Arc<[u8]>) -> Self {
-        let line_starts = compute_line_starts(&original);
+    pub fn from_original(original: Arc<dyn ByteSource>) -> Self {
+        let line_starts = compute_line_starts(original.as_bytes());
         let total_len = original.len() as u64;
         let pieces = if total_len > 0 {
             vec![Piece { source: PieceSource::Original, start: 0, len: total_len }]
@@ -52,7 +54,8 @@ impl PieceTable {
 
     /// Create from a owned byte vector (convenience for tests / small docs).
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self::from_original(Arc::from(bytes.into_boxed_slice()))
+        let original: Arc<dyn ByteSource> = Arc::new(editor_domain::ArcByteSource::new(bytes));
+        Self::from_original(original)
     }
 
     /// Total byte length of the current document.
@@ -66,7 +69,7 @@ impl PieceTable {
     }
 
     /// The immutable original buffer (for storage/mmap integration).
-    pub fn original(&self) -> &Arc<[u8]> {
+    pub fn original(&self) -> &Arc<dyn ByteSource> {
         &self.original
     }
 
@@ -166,7 +169,10 @@ impl PieceTable {
 
     fn piece_bytes(&self, piece: &Piece) -> &[u8] {
         match piece.source {
-            PieceSource::Original => &self.original[piece.start as usize..(piece.start + piece.len) as usize],
+            PieceSource::Original => {
+                let orig = self.original.as_bytes();
+                &orig[piece.start as usize..(piece.start + piece.len) as usize]
+            }
             PieceSource::EditLog => &self.edit_log[piece.start as usize..(piece.start + piece.len) as usize],
         }
     }

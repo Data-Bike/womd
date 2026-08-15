@@ -17,7 +17,7 @@ pub fn parse(source: &[u8], profile: MarkdownProfile) -> Result<Document, Docume
     let preliminary = parse_block_sequence(source, 0, len, 0, &profile, &Refs::default())?;
     let refs = collect_references(&preliminary);
     let blocks = parse_block_sequence(source, 0, len, 0, &profile, &refs)?;
-    Ok(Document { span: SourceSpan::new(ByteOffset(0), ByteOffset(len)), blocks })
+    Ok(Document { span: SourceSpan::new(ByteOffset(0), ByteOffset(len)), blocks, parsed_offset: len })
 }
 
 // ---------------------------------------------------------------------------
