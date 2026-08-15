@@ -310,6 +310,13 @@ impl DocumentBuffer {
         serialize(&self.syntax, &current)
     }
 
+    /// Extract a byte range [start, end) from the current document without
+    /// serializing the entire buffer. Used for virtualized rendering of large
+    /// documents — only the requested block's bytes are copied.
+    pub fn serialize_range(&self, start: u64, end: u64) -> Vec<u8> {
+        self.table.to_range(start, end)
+    }
+
     /// Replace a text run within a paragraph and return the resulting bytes (minimal diff).
     /// Convenience for the WYSIWYG "replace word" flow (§2 example).
     pub fn replace_text_run(

@@ -207,7 +207,7 @@ async function saveFileDialog() {
 
 async function newDocument() {
   const info = await tauriInvoke("new_document");
-  currentText = info.text;
+  currentText = info.text || "";
   activeTabId = info.tab_id;
   updateUI(info);
   await refreshTabs();
@@ -217,7 +217,7 @@ async function newDocument() {
 
 async function openDocument(path) {
   const info = await tauriInvoke("open_document", { path });
-  currentText = info.text;
+  currentText = info.text || "";
   activeTabId = info.tab_id;
   updateUI(info);
   await refreshTabs();
@@ -239,7 +239,7 @@ async function saveDocument(path) {
 async function doUndo() {
   flushEdits();
   const r = await tauriInvoke("undo");
-  currentText = r.text;
+  if (r.text != null) currentText = r.text;
   updateUI(r);
   await refreshSyntax();
   scheduleAutosave();
@@ -248,7 +248,7 @@ async function doUndo() {
 async function doRedo() {
   flushEdits();
   const r = await tauriInvoke("redo");
-  currentText = r.text;
+  if (r.text != null) currentText = r.text;
   updateUI(r);
   await refreshSyntax();
   scheduleAutosave();
@@ -303,7 +303,7 @@ async function switchTab(tabId) {
     const info = await tauriInvoke("switch_tab", { tabId });
     // Verify the tab is still the one we want (user may have switched again).
     if (info.tab_id !== tabId) return;
-    currentText = info.text;
+    currentText = info.text || "";
     activeTabId = info.tab_id;
     updateUI(info);
     await refreshSyntax();
@@ -325,7 +325,7 @@ async function closeTab(tabId) {
   flushEdits();
   const result = await tauriInvoke("close_tab", { tabId });
   if (result) {
-    currentText = result.text;
+    currentText = result.text || "";
     activeTabId = result.tab_id;
     updateUI(result);
     await refreshSyntax();
@@ -388,7 +388,8 @@ async function tearOffTab(tabId) {
 
 async function sendReplace(start, end, newText) {
   const r = await tauriInvoke("replace_text", { args: { start, end, new_text: newText } });
-  currentText = r.text;
+  // For large documents, r.text is null — don't update currentText.
+  if (r.text != null) currentText = r.text;
   isDirty = r.is_dirty;
   updateDirtyState();
   blockCount.textContent = `${r.block_count} ${t("status.blocks")}`;
@@ -401,7 +402,7 @@ async function sendReplace(start, end, newText) {
 // Replace a single block by index — backend uses exact byte spans (no JS/byte offset mismatch).
 async function sendReplaceBlock(blockIndex, newSource) {
   const r = await tauriInvoke("replace_block", { blockIndex, newSource });
-  currentText = r.text;
+  if (r.text != null) currentText = r.text;
   isDirty = r.is_dirty;
   updateDirtyState();
   blockCount.textContent = `${r.block_count} ${t("status.blocks")}`;
@@ -2068,7 +2069,7 @@ async function openRelativeFile(relativePath) {
       await switchTab(existing.id);
       return;
     }
-    currentText = info.text;
+    currentText = info.text || "";
     activeTabId = info.tab_id;
     updateUI(info);
     await refreshSyntax();
@@ -2302,7 +2303,7 @@ async function openFileFromTree(filePath) {
       return;
     }
     const info = await tauriInvoke("open_document", { path: filePath });
-    currentText = info.text;
+    currentText = info.text || "";
     activeTabId = info.tab_id;
     updateUI(info);
     await refreshSyntax();
@@ -2529,7 +2530,7 @@ async function init() {
 async function openDocument(path) {
   try {
     const info = await tauriInvoke("open_document", { path });
-    currentText = info.text;
+    currentText = info.text || "";
     activeTabId = info.tab_id;
     updateUI(info);
     await refreshSyntax();

@@ -108,6 +108,15 @@ impl PieceTable {
         self.extract_bytes(ByteRange::new(ByteOffset(0), ByteOffset(self.total_len)))
     }
 
+    /// Extract a byte range [start, end) without serializing the entire document.
+    /// Used for virtualized rendering of large documents — only the requested
+    /// block's bytes are copied, not the full 100+ MB buffer.
+    pub fn to_range(&self, start: u64, end: u64) -> Vec<u8> {
+        let s = start.min(self.total_len);
+        let e = end.min(self.total_len).max(s);
+        self.extract_bytes(ByteRange::new(ByteOffset(s), ByteOffset(e)))
+    }
+
     /// Apply an edit: replace `range` with `replacement`. Returns the byte length of the
     /// inserted text.
     pub fn apply_edit(&mut self, range: ByteRange, replacement: &[u8]) -> u64 {

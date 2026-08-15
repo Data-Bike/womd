@@ -75,7 +75,10 @@ impl AppState {
 
 #[derive(Serialize, Deserialize)]
 struct DocumentInfo {
-    text: String,
+    /// Full document text — None for large documents (>1MB) to avoid
+    /// sending 100+ MB strings over IPC. Frontend uses get_text_range
+    /// for lazy loading in that case.
+    text: Option<String>,
     file_name: String,
     is_dirty: bool,
     block_count: usize,
@@ -92,7 +95,10 @@ struct ReplaceTextArgs {
 
 #[derive(Serialize, Deserialize)]
 struct EditResult {
-    text: String,
+    /// Full text after edit — None for large documents (>1MB) to avoid
+    /// serializing 100+ MB on every keystroke. Frontend uses block data
+    /// for rendering instead.
+    text: Option<String>,
     is_dirty: bool,
     block_count: usize,
 }
@@ -114,6 +120,44 @@ struct SyntaxBlockMeta {
     kind: String,
     start: u64,
     end: u64,
+}
+
+/// Threshold for "large document" — above this, full text is not serialized
+/// on every operation. 1 MB ≈ 20K lines of typical Markdown.
+const LARGE_DOC_THRESHOLD: usize = 1_048_576;
+
+/// Build a DocumentInfo from a tab, conditionally serializing text only for small docs.
+fn doc_info_from_tab(tab: &DocumentTab) -> DocumentInfo {
+    let byte_len = tab.buffer.len() as usize;
+    let block_count = tab.buffer.syntax().blocks.len();
+    let text = if byte_len > LARGE_DOC_THRESHOLD {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&tab.buffer.serialize()).to_string())
+    };
+    DocumentInfo {
+        text,
+        file_name: tab.file_name(),
+        is_dirty: tab.buffer.is_dirty(),
+        block_count,
+        byte_len,
+        tab_id: tab.id,
+    }
+}
+
+/// Build an EditResult from a tab, conditionally serializing text only for small docs.
+fn edit_result_from_tab(tab: &DocumentTab) -> EditResult {
+    let byte_len = tab.buffer.len() as usize;
+    let text = if byte_len > LARGE_DOC_THRESHOLD {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&tab.buffer.serialize()).to_string())
+    };
+    EditResult {
+        text,
+        is_dirty: tab.buffer.is_dirty(),
+        block_count: tab.buffer.syntax().blocks.len(),
+    }
 }
 
 /// A serializable AST node — block or inline — for the frontend renderer.
@@ -299,14 +343,7 @@ fn switch_tab(state: tauri::State<'_, Mutex<AppState>>, tab_id: u64) -> Result<D
     let idx = s.tabs.iter().position(|t| t.id == tab_id).ok_or("tab not found")?;
     s.active = idx;
     let tab = &s.tabs[idx];
-    Ok(DocumentInfo {
-        text: String::from_utf8_lossy(&tab.buffer.serialize()).to_string(),
-        file_name: tab.file_name(),
-        is_dirty: tab.buffer.is_dirty(),
-        block_count: tab.buffer.syntax().blocks.len(),
-        byte_len: tab.buffer.serialize().len(),
-        tab_id: tab.id,
-    })
+    Ok(doc_info_from_tab(tab))
 }
 
 /// Close a tab by id. Returns the new active tab's info (or None if no tabs remain).
@@ -331,14 +368,7 @@ fn close_tab(state: tauri::State<'_, Mutex<AppState>>, tab_id: u64) -> Result<Op
         s.active -= 1;
     }
     let tab = &s.tabs[s.active];
-    Ok(Some(DocumentInfo {
-        text: String::from_utf8_lossy(&tab.buffer.serialize()).to_string(),
-        file_name: tab.file_name(),
-        is_dirty: tab.buffer.is_dirty(),
-        block_count: tab.buffer.syntax().blocks.len(),
-        byte_len: tab.buffer.serialize().len(),
-        tab_id: tab.id,
-    }))
+    Ok(Some(doc_info_from_tab(tab)))
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +397,16 @@ fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Resu
     };
     let buffer = DocumentBuffer::open_from_buffer(buffer_bytes, meta, MarkdownProfile::Gfm)
         .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&buffer.serialize()).to_string();
+    let byte_len = buffer.len() as usize;
+    let block_count = buffer.syntax().blocks.len();
+    // For large documents, don't serialize the full text — frontend will
+    // use get_syntax_tree_meta + get_block_data for virtualized rendering.
+    // Threshold: 1 MB (avoid sending 100+ MB strings over IPC).
+    let text = if byte_len > 1_048_576 {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&buffer.serialize()).to_string())
+    };
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let id = s.next_id;
     s.next_id += 1;
@@ -377,8 +416,8 @@ fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Resu
         text,
         file_name,
         is_dirty: tab.buffer.is_dirty(),
-        block_count: tab.buffer.syntax().blocks.len(),
-        byte_len: tab.buffer.serialize().len(),
+        block_count,
+        byte_len,
         tab_id: id,
     })
 }
@@ -400,7 +439,7 @@ fn new_document(state: tauri::State<'_, Mutex<AppState>>) -> Result<DocumentInfo
     s.next_id += 1;
     s.push_tab(DocumentTab { id, buffer, file_path: None });
     Ok(DocumentInfo {
-        text: String::new(),
+        text: Some(String::new()),
         file_name: "untitled.md".to_string(),
         is_dirty: false,
         block_count: 0,
@@ -435,11 +474,7 @@ fn replace_text(
         editor_domain::Selection::caret(ByteOffset(args.start + args.new_text.len() as u64)),
     );
     tab.buffer.apply(tx).map_err(|e| e.to_string())?;
-    Ok(EditResult {
-        text: String::from_utf8_lossy(&tab.buffer.serialize()).to_string(),
-        is_dirty: tab.buffer.is_dirty(),
-        block_count: tab.buffer.syntax().blocks.len(),
-    })
+    Ok(edit_result_from_tab(tab))
 }
 
 /// Insert text at a position in the active document.
@@ -513,11 +548,7 @@ fn replace_block(
         editor_domain::Selection::caret(ByteOffset(span.start.0 + new_source.len() as u64)),
     );
     tab.buffer.apply(tx).map_err(|e| e.to_string())?;
-    Ok(EditResult {
-        text: String::from_utf8_lossy(&tab.buffer.serialize()).to_string(),
-        is_dirty: tab.buffer.is_dirty(),
-        block_count: tab.buffer.syntax().blocks.len(),
-    })
+    Ok(edit_result_from_tab(tab))
 }
 
 /// Undo the last edit in the active document.
@@ -526,11 +557,7 @@ fn undo(state: tauri::State<'_, Mutex<AppState>>) -> Result<EditResult, String> 
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
     tab.buffer.undo().map_err(|e| e.to_string())?;
-    Ok(EditResult {
-        text: String::from_utf8_lossy(&tab.buffer.serialize()).to_string(),
-        is_dirty: tab.buffer.is_dirty(),
-        block_count: tab.buffer.syntax().blocks.len(),
-    })
+    Ok(edit_result_from_tab(tab))
 }
 
 /// Redo the last undone edit in the active document.
@@ -539,11 +566,7 @@ fn redo(state: tauri::State<'_, Mutex<AppState>>) -> Result<EditResult, String> 
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
     tab.buffer.redo().map_err(|e| e.to_string())?;
-    Ok(EditResult {
-        text: String::from_utf8_lossy(&tab.buffer.serialize()).to_string(),
-        is_dirty: tab.buffer.is_dirty(),
-        block_count: tab.buffer.syntax().blocks.len(),
-    })
+    Ok(edit_result_from_tab(tab))
 }
 
 /// Save the active document to disk.
@@ -635,16 +658,16 @@ fn get_block_data(
         Some(b) => b,
         None => return Ok(None),
     };
-    let full_text = tab.buffer.serialize();
-    let text_str = String::from_utf8_lossy(&full_text).to_string();
     let m = b.meta();
-    let start = m.span.start.0 as usize;
-    let end = m.span.end.0 as usize;
-    let source = if start <= end && end <= text_str.len() {
-        text_str[start..end].to_string()
-    } else {
-        String::new()
-    };
+    let start = m.span.start.0;
+    let end = m.span.end.0;
+    // Extract only this block's byte range — avoids serializing the entire
+    // 100+ MB document for each block request.
+    let range_bytes = tab.buffer.serialize_range(start, end);
+    let source = String::from_utf8_lossy(&range_bytes).to_string();
+    // For AST rendering, we need the block's text context. Use the range bytes
+    // as the text slice — block_to_ast only accesses the block's own span.
+    let text_str = source.clone();
     Ok(Some(SyntaxBlock {
         kind: block_kind_name(b),
         source,
@@ -1466,14 +1489,7 @@ fn open_relative_file(
         buffer,
         file_path: Some(path.clone()),
     };
-    let info = DocumentInfo {
-        text: String::from_utf8_lossy(&tab.buffer.serialize()).to_string(),
-        file_name: tab.file_name(),
-        is_dirty: tab.buffer.is_dirty(),
-        block_count: tab.buffer.syntax().blocks.len(),
-        byte_len: tab.buffer.serialize().len(),
-        tab_id: tab.id,
-    };
+    let info = doc_info_from_tab(&tab);
     s.push_tab(tab);
     Ok(info)
 }
