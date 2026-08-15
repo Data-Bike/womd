@@ -38,9 +38,14 @@ pub fn parse_range(
     len: u64,
     profile: MarkdownProfile,
 ) -> Result<Vec<ast::Block>, editor_domain::DocumentError> {
-    let start = offset as usize;
-    let end = (start + len as usize).min(source.len());
-    if start > source.len() {
+    let source_len = source.len() as u64;
+    // Clamp offset to source length to avoid 32-bit wraparound or out-of-bounds.
+    let start = offset.min(source_len) as usize;
+    // `offset + len` may overflow if either is near u64::MAX. Use saturating add.
+    let end = offset
+        .saturating_add(len)
+        .min(source_len) as usize;
+    if start >= source.len() {
         return Ok(Vec::new());
     }
     let window = &source[start..end];

@@ -236,25 +236,38 @@ impl PieceTable {
         };
         // Keep line starts [0..=containing]; drop line starts strictly inside (old_start, old_end].
         let mut kept: Vec<u64> = self.line_starts[..=containing].to_vec();
+        // Shift tail line starts by `delta` without overflowing i64.
+        let shift = |ls: u64| -> u64 {
+            let shifted = (ls as i128) + (delta as i128);
+            if shifted < 0 {
+                0
+            } else if shifted > u64::MAX as i128 {
+                u64::MAX
+            } else {
+                shifted as u64
+            }
+        };
         let mut tail: Vec<u64> = self
             .line_starts
             .iter()
             .copied()
             .filter(|&ls| ls > old_end)
-            .map(|ls| (((ls as i64) + delta).max(0)) as u64)
+            .map(shift)
             .collect();
 
         // New line starts from the inserted text, at absolute offset old_start + pos + 1
         // for each newline. A trailing newline legitimately starts the next (shifted)
         // line, so we include it; dedup below collapses any collision with shifted tail.
+        // Clamp the end to total_len in case inserted_len overflows u64 (defensive).
+        let inserted_end = old_start.saturating_add(inserted_len).min(self.total_len);
         let inserted_bytes = self.extract_bytes(ByteRange::new(
             ByteOffset(old_start),
-            ByteOffset(old_start + inserted_len),
+            ByteOffset(inserted_end),
         ));
         let mut new_starts: Vec<u64> = Vec::new();
         for (i, &b) in inserted_bytes.iter().enumerate() {
             if b == b'\n' {
-                new_starts.push(old_start + i as u64 + 1);
+                new_starts.push(old_start.saturating_add(i as u64).saturating_add(1));
             }
         }
 

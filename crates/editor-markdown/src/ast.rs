@@ -45,6 +45,19 @@ impl Document {
     /// `parsed_offset` is set to the end of the last block.
     pub fn from_blocks(blocks: Vec<Block>) -> Self {
         let end = blocks.last().map(|b| b.meta().span.end.0).unwrap_or(0);
+        #[cfg(debug_assertions)]
+        {
+            let mut prev_end = 0u64;
+            for b in &blocks {
+                let span = b.meta().span;
+                assert!(span.start.0 == prev_end,
+                    "from_blocks: non-contiguous blocks at offset {}, expected {}",
+                    span.start.0, prev_end);
+                assert!(span.end.0 >= span.start.0,
+                    "from_blocks: negative span {:?}", span);
+                prev_end = span.end.0;
+            }
+        }
         Self {
             span: SourceSpan::new(ByteOffset(0), ByteOffset(end)),
             blocks,
@@ -61,6 +74,19 @@ impl Document {
             return;
         }
         let new_start = new_blocks[0].meta().span.start.0;
+
+        // Defensive: if the new chunk starts after the last kept block, there
+        // is a gap. This should not happen with contiguous chunk parsing, but
+        // log a clear invariant violation in debug builds.
+        #[cfg(debug_assertions)]
+        if let Some(last) = self.blocks.last() {
+            assert!(
+                last.meta().span.end.0 >= new_start,
+                "merge_blocks: gap between existing blocks (end {}) and new chunk (start {})",
+                last.meta().span.end.0, new_start
+            );
+        }
+
         // Remove existing blocks that overlap with the new chunk.
         // Keep blocks whose span ends at or before new_start.
         let split_point = self

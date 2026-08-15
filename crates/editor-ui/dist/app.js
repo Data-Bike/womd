@@ -41,6 +41,8 @@ const AVG_BLOCK_HEIGHT = 60; // default estimate for unknown block heights
 let blockMeta = [];       // lightweight metadata for all blocks
 let blockCache = new Map(); // index -> full SyntaxBlock (source + AST)
 let blockHeights = [];    // cached real heights per block index (px)
+let measuredBlockHeightsSum = 0; // sum of all measured real heights
+let measuredBlockCount = 0;      // count of measured blocks (for average)
 let virtualizedMode = false;
 let visibleRange = { start: 0, end: 50 }; // currently visible blocks
 let renderedRange = { start: 0, end: 0 }; // currently rendered blocks (>= visibleRange)
@@ -48,6 +50,7 @@ let parsedOffset = 0;     // how far parsing has progressed (lazy loading)
 let totalLen = 0;         // total document length in bytes
 let hasMoreToParse = false; // true if there are unparsed chunks
 let chunkParseInProgress = false; // prevent concurrent chunk parsing
+let chunkParseScheduled = false; // prevent overlapping setTimeout recursion
 
 // ── Settings state ─────────────────────────────────────────────────────────
 const SETTINGS_KEY = "womd_settings";
@@ -90,17 +93,15 @@ const blockEditor = document.getElementById("block-editor");
 // Virtualized scroll handler — re-renders visible blocks on scroll for large documents.
 // Uses a larger render window to avoid frequent re-renders during scrolling.
 let scrollRenderPending = false;
-blockEditor.addEventListener("scroll", () => {
+blockEditor.addEventListener("scroll", async () => {
   // Sync line gutter scroll position.
   lineGutter.scrollTop = blockEditor.scrollTop;
   if (!virtualizedMode) return;
-  // If editing a block, exit edit mode first — scrolling away from the edited
-  // block should commit the edit and allow normal scroll handling.
-  // Then return — restoreBlockElement is async and needs to finish before
-  // we destroy and recreate all elements via renderVirtualizedBlocks.
-  // The next scroll event (or explicit scrollTop change) will handle rendering.
+  // If editing a block, exit edit mode first and wait — restoreBlockElement is
+  // async and needs to finish before we destroy and recreate all elements via
+  // renderVirtualizedBlocks. The next scroll event will handle rendering.
   if (editingBlockIndex >= 0) {
-    exitEditMode();
+    try { await exitEditMode(); } catch (e) { console.error("scroll exit:", e); }
     return;
   }
   if (suppressRender) return;
@@ -314,8 +315,9 @@ async function refreshSyntax() {
       } else {
         // Block count changed (initial load, new chunk parsed, etc.) —
         // rebuild but preserve existing entries where possible.
-        // Cached line numbers may point to wrong offsets after a rebuild.
+        // Cached line numbers and per-index heights may map to wrong blocks.
         gutterLineNumbers = {};
+        blockHeights = [];
         const oldBlocks = syntaxBlocks;
         syntaxBlocks = meta.map((m, i) => {
           if (i < oldBlocks.length && oldBlocks[i].kind === m.kind &&
@@ -483,16 +485,14 @@ async function sendReplaceBlock(blockIndex, newSource) {
   return r;
 }
 
-function flushEdits() {
+function flushEdits(force = false) {
   clearTimeout(debounceTimer);
-  // Don't flush while suppressRender is true — we're in a block transition
-  // (enterEditMode called exitEditMode on the previous block, which called
-  // sendReplaceBlock → scheduleAutosave). The autosave timer fires later
-  // and calls flushEdits, but at that point we're editing a new block.
-  // flushEdits would commit the NEW block's edit, resetting suppressRender
-  // and editingBlockIndex, causing refreshSyntax → renderBlocks → scroll reset.
-  if (editingBlockIndex >= 0 && !suppressRender) {
-    // Commit current edit synchronously into currentText.
+  // Don't flush while a previous exitEditMode is in progress —
+  // restoreBlockElement already sends the edit. Flushing again would
+  // double-commit or try to commit the new block's empty text.
+  // But DO flush if the user is actively editing (editingBlockIndex >= 0
+  // and no exit in progress) so save/undo/close pick up the current text.
+  if ((force || editingBlockIndex >= 0) && exitingBlockIndex < 0) {
     const ta = blockEditor.querySelector(".md-block.editing .md-block-textarea");
     if (ta) commitEdit(ta.value);
   }
@@ -589,7 +589,19 @@ function renderAllBlocks() {
   requestAnimationFrame(() => {
     for (let i = 0; i < syntaxBlocks.length; i++) {
       const el = blockEditor.querySelector(`[data-block-index="${i}"]`);
-      if (el && el.offsetHeight > 0) blockHeights[i] = el.offsetHeight;
+      const old = blockHeights[i] || 0;
+      if (el && el.offsetHeight > 0) {
+        const h = el.offsetHeight;
+        if (h !== old) {
+          blockHeights[i] = h;
+          measuredBlockHeightsSum += h - old;
+          if (old === 0) measuredBlockCount++;
+        }
+      } else if (old > 0) {
+        measuredBlockHeightsSum -= old;
+        measuredBlockCount--;
+        delete blockHeights[i];
+      }
     }
     updateLineGutter();
   });
@@ -597,9 +609,11 @@ function renderAllBlocks() {
 
 /// Estimate total document height in pixels, including unparsed region.
 /// Uses parsedOffset/totalLen ratio to extrapolate from parsed block count.
-/// Get the cached height for a block, or the default estimate.
+/// Get the cached height for a block, or the running average estimate.
 function getBlockHeight(i) {
-  return blockHeights[i] || AVG_BLOCK_HEIGHT;
+  if (blockHeights[i] > 0) return blockHeights[i];
+  if (measuredBlockCount > 0) return Math.round(measuredBlockHeightsSum / measuredBlockCount);
+  return AVG_BLOCK_HEIGHT;
 }
 
 /// Measure and cache the real heights of rendered blocks after they are in the DOM.
@@ -609,9 +623,19 @@ function getBlockHeight(i) {
 function measureRenderedBlockHeights() {
   for (let i = renderedRange.start; i <= renderedRange.end && i < syntaxBlocks.length; i++) {
     const el = blockEditor.querySelector(`[data-block-index="${i}"]`);
-    if (el) {
+    const old = blockHeights[i] || 0;
+    if (el && el.offsetHeight > 0) {
       const h = el.offsetHeight;
-      if (h > 0) blockHeights[i] = h;
+      if (h !== old) {
+        blockHeights[i] = h;
+        measuredBlockHeightsSum += h - old;
+        if (old === 0) measuredBlockCount++;
+      }
+    } else if (old > 0) {
+      // Element removed or collapsed; remove its measurement.
+      measuredBlockHeightsSum -= old;
+      measuredBlockCount--;
+      delete blockHeights[i];
     }
   }
 }
@@ -646,7 +670,11 @@ function estimateTotalHeight() {
 /// Uses cached real block heights for spacer calculations to avoid scroll jumps.
 function renderVirtualizedBlocks() {
   // Save scroll position before clearing (innerHTML resets scrollTop to 0).
+  // Restore by ratio so the user stays at the same relative position after
+  // content height changes (e.g. after parsing a new chunk).
   const savedScrollTop = blockEditor.scrollTop;
+  const savedScrollHeight = blockEditor.scrollHeight || 1;
+  const savedScrollRatio = savedScrollTop / savedScrollHeight;
   blockEditor.innerHTML = "";
   if (syntaxBlocks.length === 0) {
     // Nothing parsed yet. If there is more to parse, show a loading indicator.
@@ -657,7 +685,8 @@ function renderVirtualizedBlocks() {
       loading.style.cssText = "padding:24px;text-align:center;color:var(--fg-muted);font-size:14px";
       blockEditor.appendChild(loading);
     }
-    blockEditor.scrollTop = savedScrollTop;
+    blockEditor.scrollTop = Math.round(savedScrollRatio * (blockEditor.scrollHeight || 1));
+    lineGutter.scrollTop = blockEditor.scrollTop;
     return;
   }
   // Compute visible range from saved scroll position.
@@ -723,8 +752,10 @@ function renderVirtualizedBlocks() {
 
   addTrailingBlock();
 
-  // Restore scroll position (innerHTML reset it to 0).
-  blockEditor.scrollTop = savedScrollTop;
+  // Restore scroll position by ratio (innerHTML reset it to 0).
+  const newScrollHeight = blockEditor.scrollHeight || 1;
+  blockEditor.scrollTop = Math.round(savedScrollRatio * newScrollHeight);
+  lineGutter.scrollTop = blockEditor.scrollTop;
 
   // Measure real block heights after DOM is updated (next frame) to
   // improve spacer accuracy for the next render.
@@ -882,7 +913,7 @@ function updateVisibleRange(scrollTopArg) {
 /// Checks by pixel position: if the user is within 2 screens of the end of
 /// parsed content, trigger the next chunk.
 async function maybeParseNextChunk() {
-  if (!hasMoreToParse || chunkParseInProgress) return;
+  if (!hasMoreToParse || chunkParseInProgress || chunkParseScheduled) return;
   const scrollTop = blockEditor.scrollTop || 0;
   const viewportHeight = blockEditor.clientHeight || 600;
   // Estimate where the parsed content ends in pixels.
@@ -908,6 +939,7 @@ async function maybeParseNextChunk() {
     // because it keeps the removed stale block and appends the wrong slice.
     // Rebuild by matching kind+span, preserving any existing loaded data.
     gutterLineNumbers = {};
+    blockHeights = [];
     const oldBlocks = syntaxBlocks;
     syntaxBlocks = meta.map((m, i) => {
       if (i < oldBlocks.length &&
@@ -920,14 +952,17 @@ async function maybeParseNextChunk() {
       return { kind: m.kind, source: "", start: m.start, end: m.end, node: null };
     });
     blockCount.textContent = `${meta.length} ${t("status.blocks")}`;
-    // Re-render to show the newly parsed blocks. Restore scroll position
-    // after re-render — renderVirtualizedBlocks saves/restores scrollTop
-    // internally, but the new blocks may have changed the total height.
+    // Re-render to show the newly parsed blocks. renderVirtualizedBlocks
+    // restores the scroll position by ratio so the user stays in the same
+    // relative place after the document grows.
     renderVirtualizedBlocks();
-    blockEditor.scrollTop = savedScrollTop;
     // Recursively check if we need more chunks (user might have scrolled very far).
-    if (hasMoreToParse) {
-      setTimeout(() => maybeParseNextChunk(), 50);
+    if (hasMoreToParse && !chunkParseScheduled) {
+      chunkParseScheduled = true;
+      setTimeout(() => {
+        chunkParseScheduled = false;
+        maybeParseNextChunk();
+      }, 50);
     }
   } catch (e) {
     console.error("Failed to parse next chunk:", e);
@@ -941,8 +976,10 @@ async function loadBlockData(blockIndex, el) {
   if (blockCache.has(blockIndex)) {
     const block = blockCache.get(blockIndex);
     syntaxBlocks[blockIndex] = block;
-    el.innerHTML = renderBlockHtml(block);
-    attachBlockListeners(el, blockIndex);
+    if (el.isConnected) {
+      el.innerHTML = renderBlockHtml(block);
+      attachBlockListeners(el, blockIndex);
+    }
     return;
   }
   try {
@@ -950,11 +987,15 @@ async function loadBlockData(blockIndex, el) {
     if (block) {
       blockCache.set(blockIndex, block);
       syntaxBlocks[blockIndex] = block;
-      el.innerHTML = renderBlockHtml(block);
-      attachBlockListeners(el, blockIndex);
+      if (el.isConnected) {
+        el.innerHTML = renderBlockHtml(block);
+        attachBlockListeners(el, blockIndex);
+      }
     }
   } catch (e) {
-    el.innerHTML = `<div style="padding:8px;color:var(--diff-del)">Error: ${escapeHtml(String(e))}</div>`;
+    if (el.isConnected) {
+      el.innerHTML = `<div style="padding:8px;color:var(--diff-del)">Error: ${escapeHtml(String(e))}</div>`;
+    }
   }
 }
 
@@ -1167,16 +1208,20 @@ function joinPath(dir, name) {
 // ── Click-to-edit ───────────────────────────────────────────────────────────
 
 async function enterEditMode(blockIndex) {
-  // If already editing another block, exit it first.
-  // suppressBlur/suppressRender are already set by the mousedown handler
-  // on the clicked block, but set them here as fallback for keyboard-initiated
-  // transitions (e.g. Escape then click).
-  if (editingBlockIndex >= 0) {
+  // If already editing another block, exit it first and wait.
+  // Awaiting ensures the old block is restored before we destroy it.
+  if (editingBlockIndex >= 0 && editingBlockIndex !== blockIndex) {
     suppressBlur = true;
     suppressRender = true;
-    exitEditMode();
+    try {
+      await exitEditMode();
+    } catch (e) {
+      console.error("enterEditMode: exitEditMode failed:", e);
+    }
   }
   if (blockIndex < 0 || blockIndex >= syntaxBlocks.length) {
+    editingBlockIndex = -1;
+    suppressBlur = false;
     suppressRender = false;
     return;
   }
@@ -1196,11 +1241,18 @@ async function enterEditMode(blockIndex) {
         blockCache.set(blockIndex, block);
         syntaxBlocks[blockIndex] = block;
       }
-    } catch (e) { /* fallback to empty source */ }
+    } catch (e) {
+      console.warn("enterEditMode: get_block_data failed:", e);
+    }
   }
 
   const blockEl = blockEditor.querySelector(`[data-block-index="${blockIndex}"]`);
-  if (!blockEl) { editingBlockIndex = -1; suppressRender = false; return; }
+  if (!blockEl) {
+    editingBlockIndex = -1;
+    suppressBlur = false;
+    suppressRender = false;
+    return;
+  }
 
   const source = syntaxBlocks[blockIndex].source || "";
   blockEl.classList.add("editing");
@@ -1427,14 +1479,27 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
     blockEditor.scrollTop = savedScroll3;
+  } finally {
+    // Clear the exit guard so exitEditMode can run again.
+    exitingBlockIndex = -1;
+    // Cache the block's new height so renderVirtualizedBlocks uses it.
+    requestAnimationFrame(() => {
+      const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
+      const old = blockHeights[idx] || 0;
+      if (el && el.offsetHeight > 0) {
+        const h = el.offsetHeight;
+        if (h !== old) {
+          blockHeights[idx] = h;
+          measuredBlockHeightsSum += h - old;
+          if (old === 0) measuredBlockCount++;
+        }
+      } else if (old > 0) {
+        measuredBlockHeightsSum -= old;
+        measuredBlockCount--;
+        delete blockHeights[idx];
+      }
+    });
   }
-  // Cache the block's new height so renderVirtualizedBlocks uses it.
-  requestAnimationFrame(() => {
-    const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
-    if (el && el.offsetHeight > 0) blockHeights[idx] = el.offsetHeight;
-  });
-  // Clear the exit guard — restoreBlockElement is done.
-  exitingBlockIndex = -1;
 }
 
 async function commitEdit(newSource) {
