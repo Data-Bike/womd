@@ -1024,7 +1024,7 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     // Source unchanged — just restore rendered HTML in-place.
     blockEl.classList.remove("editing");
     // In virtualized mode, ensure block data (node + source) is loaded.
-    if (virtualizedMode && !syntaxBlocks[idx].node && !syntaxBlocks[idx].source) {
+    if (virtualizedMode && !syntaxBlocks[idx].node) {
       try {
         const block = await tauriInvoke("get_block_data", { blockIndex: idx });
         if (block) {
@@ -1042,18 +1042,34 @@ async function restoreBlockElement(idx, blockEl, newSource) {
   blockEl.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
   try {
     await sendReplaceBlock(idx, newSource);
-    // sendReplaceBlock triggers refreshSyntax which updates syntaxBlocks.
-    // If suppressRender is true (entering another edit mode), renderBlocks
-    // was skipped — update this block element manually.
+    // sendReplaceBlock → refreshSyntax rebuilds syntaxBlocks with empty
+    // source/node (virtualized mode). Must reload block data before rendering.
     if (suppressRender) {
+      // Reload block data — refreshSyntax cleared it.
+      try {
+        const block = await tauriInvoke("get_block_data", { blockIndex: idx });
+        if (block) {
+          blockCache.set(idx, block);
+          syntaxBlocks[idx] = block;
+        }
+      } catch (e) { /* fallback to empty */ }
       const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
       if (el) {
         el.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
         attachBlockListeners(el, idx);
       }
     }
+    // If suppressRender is false, refreshSyntax → renderBlocks already
+    // re-rendered everything — no manual update needed.
   } catch (e) {
-    // Restore original on error.
+    // Restore original on error — reload block data first.
+    try {
+      const block = await tauriInvoke("get_block_data", { blockIndex: idx });
+      if (block) {
+        blockCache.set(idx, block);
+        syntaxBlocks[idx] = block;
+      }
+    } catch (e2) { /* give up */ }
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
   }
