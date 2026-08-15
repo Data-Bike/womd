@@ -1557,7 +1557,7 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io:
         let dest_path = dest.join(entry.file_name());
         if file_type.is_symlink() {
             // Copy the symlink target path itself (don't follow — avoids infinite recursion on cycles).
-            if let Ok(target) = std::fs::read_link(&src_path) {
+            if let Ok(_target) = std::fs::read_link(&src_path) {
                 #[cfg(unix)]
                 {
                     std::os::unix::fs::symlink(&target, &dest_path)?;

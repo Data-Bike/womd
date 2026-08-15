@@ -272,6 +272,7 @@ fn try_atx_heading(bytes: &[u8], line: Line, stripped: &[u8], refs: &Refs) -> Op
         style: HeadingStyle::Atx,
         atx_open_hashes: hashes as u8,
         atx_close_hashes: close as u8,
+        setext_underline_len: 0,
         inlines,
     })
 }
@@ -651,6 +652,7 @@ fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Bl
     let start = lines[idx].start;
     let mut j = idx;
     let mut setext_level: Option<u8> = None;
+    let mut setext_underline_len: u8 = 3;
     loop {
         let c = line_content(bytes, lines[j]);
         if is_blank(c) {
@@ -661,6 +663,7 @@ fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Bl
         // Setext underline?
         if j > idx && is_setext_underline(s) {
             setext_level = Some(if s[0] == b'=' { 1 } else { 2 });
+            setext_underline_len = s.iter().filter(|&&b| b == b'=' || b == b'-').count() as u8;
             j += 1;
             break;
         }
@@ -688,6 +691,7 @@ fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Bl
                 style: HeadingStyle::Setext,
                 atx_open_hashes: 0,
                 atx_close_hashes: 0,
+                setext_underline_len,
                 inlines,
             }),
             j,

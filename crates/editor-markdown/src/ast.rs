@@ -115,6 +115,8 @@ pub struct Heading {
     /// For ATX: number of `#` markers and whether closing `#`s were present.
     pub atx_open_hashes: u8,
     pub atx_close_hashes: u8,
+    /// For Setext: number of underline characters (= or -) in the original source.
+    pub setext_underline_len: u8,
     pub inlines: Vec<Inline>,
 }
 

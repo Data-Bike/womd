@@ -56,7 +56,8 @@ fn regenerate_block(block: &Block, source: &[u8], out: &mut Vec<u8>) {
                 out.extend_from_slice(serialize_inlines(&h.inlines).as_bytes());
                 out.push(b'\n');
                 let underline = if h.level == 1 { b'=' } else { b'-' };
-                for _ in 0..3 {
+                let ulen = if h.setext_underline_len > 0 { h.setext_underline_len } else { 3 };
+                for _ in 0..ulen {
                     out.push(underline);
                 }
             }
@@ -163,12 +164,17 @@ fn serialize_block_with_indent(block: &Block, source: &[u8], out: &mut Vec<u8>, 
         let mut tmp = Vec::new();
         regenerate_block(block, source, &mut tmp);
         let text = String::from_utf8_lossy(&tmp);
-        for line in text.lines() {
+        let lines: Vec<&str> = text.lines().collect();
+        let last_idx = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter().enumerate() {
             for _ in 0..indent {
                 out.push(b' ');
             }
             out.extend_from_slice(line.as_bytes());
-            if text.contains('\n') {
+            // Add newline after each line except the last (unless the original ended with one).
+            if i < last_idx {
+                out.push(b'\n');
+            } else if i == last_idx && tmp.last() == Some(&b'\n') {
                 out.push(b'\n');
             }
         }

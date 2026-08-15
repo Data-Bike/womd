@@ -572,7 +572,7 @@ function renderAstTable(node) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 function escapeAttr(s) { return s.replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
 
@@ -660,6 +660,8 @@ function exitEditMode() {
       const newSource = ta.value;
       commitEdit(newSource);
     }
+    // Restore focus to the block editor so keyboard shortcuts keep working.
+    blockEditor.focus();
   }
 }
 
@@ -2468,6 +2470,7 @@ function renderSyntaxGrid() {
 
 /// Select an interface theme.
 window.selectTheme = function(themeId) {
+  if (!THEMES.some(t => t.id === themeId)) return;
   settings.theme = themeId;
   // Also update syntax theme to match if they're in sync.
   settings.syntaxTheme = themeId;
@@ -2480,6 +2483,7 @@ window.selectTheme = function(themeId) {
 
 /// Select a syntax palette independently.
 window.selectSyntaxTheme = function(themeId) {
+  if (!SYNTAX_PALETTES.some(p => p.id === themeId)) return;
   settings.syntaxTheme = themeId;
   // For now, syntax colors are tied to the interface theme's data-theme attribute.
   // To support independent syntax palettes, we'd need a separate attribute.

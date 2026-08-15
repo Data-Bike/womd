@@ -102,7 +102,7 @@ pub fn correct_utf8_boundaries(bytes: &[u8], base: usize, offset: usize, length:
     while start > 0 && bytes[start - 1] != b'\n' {
         start -= 1;
     }
-    while end < bytes.len() && bytes[end - 1] != b'\n' {
+    while end > 0 && end < bytes.len() && bytes[end - 1] != b'\n' {
         end += 1;
     }
     let _ = base;
