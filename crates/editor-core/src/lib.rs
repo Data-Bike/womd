@@ -279,17 +279,17 @@ impl DocumentBuffer {
     }
 
     fn apply_inverse(&mut self, tx: &EditTransaction) -> Result<(), editor_domain::DocumentError> {
-        // Undo edits in reverse order, tracking the running delta from already-undone
-        // (later-in-original-order) edits so we locate the inserted text correctly.
-        let mut delta: i64 = 0;
+        // Undo edits in reverse order. Each edit's range was in cumulative coordinates
+        // (relative to the document state after all previous edits in the transaction).
+        // After undoing edit N, the document is in the state after edits 1..N-1, which
+        // is exactly the state edit N-1's range refers to — so no delta adjustment needed.
         for edit in tx.edits.iter().rev() {
-            let inserted_start = (edit.range.start.0 as i64 + delta) as u64;
+            let inserted_start = edit.range.start.0;
             let inserted_end = inserted_start + edit.replacement.len() as u64;
             self.table.replace(
                 ByteRange::new(ByteOffset(inserted_start), ByteOffset(inserted_end)),
                 &edit.removed,
             );
-            delta -= edit.delta();
         }
         let bytes = self.table.to_bytes();
         self.syntax = editor_markdown::parse_with(&bytes, self.profile.clone())?;
@@ -450,6 +450,29 @@ mod tests {
         assert_eq!(buf.serialize(), b"abc xyz ghi\n");
         buf.undo().unwrap();
         assert_eq!(buf.serialize(), b"abc def ghi\n");
+    }
+
+    #[test]
+    fn undo_multi_edit_transaction() {
+        // Two sequential inserts in one transaction: insert "X" at pos 1, then "Y" at pos 3
+        // (pos 3 is in the document AFTER the first insert, i.e. cumulative coordinates).
+        let mut buf = open(b"abc\n");
+        let tx = EditTransaction::new(
+            vec![
+                TextEdit::insert(ByteOffset(1), b"X"),
+                TextEdit::insert(ByteOffset(3), b"Y"),
+            ],
+            Selection::caret(ByteOffset(1)),
+            Selection::caret(ByteOffset(4)),
+        );
+        buf.apply(tx).unwrap();
+        assert_eq!(buf.serialize(), b"aXbYc\n");
+        // Undo should restore the original.
+        buf.undo().unwrap();
+        assert_eq!(buf.serialize(), b"abc\n");
+        // Redo should re-apply both edits.
+        buf.redo().unwrap();
+        assert_eq!(buf.serialize(), b"aXbYc\n");
     }
 
     #[test]

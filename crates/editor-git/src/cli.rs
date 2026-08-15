@@ -496,6 +496,14 @@ pub struct FileHistoryEntry {
 
 /// Read a file at a given revision (for "open old version read-only", §45).
 pub fn read_file_at_revision(repo: &GitCli, path: &str, rev: &str) -> GitResult<Vec<u8>> {
+    // Security: reject paths/revs containing newlines or control chars to prevent
+    // git argument injection (git interprets newlines as argument separators).
+    if path.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
+        return Err(GitError::Other("invalid characters in path".into()));
+    }
+    if rev.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
+        return Err(GitError::Other("invalid characters in revision".into()));
+    }
     let out = repo.exec(&["show", &format!("{rev}:{path}")])?;
     Ok(out.stdout)
 }

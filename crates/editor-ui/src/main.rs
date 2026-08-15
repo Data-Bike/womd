@@ -744,6 +744,9 @@ fn git_unstage_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String)
 /// Commit staged changes.
 #[tauri::command]
 fn git_commit(state: tauri::State<'_, Mutex<AppState>>, message: String) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("commit message cannot be empty".to_string());
+    }
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
     let path = tab.file_path.as_ref().ok_or("no file open")?;
@@ -1375,11 +1378,17 @@ fn open_relative_file(
     let active = s.active_tab()?;
     let base_dir = active.file_path.as_ref()
         .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
         .ok_or("no base directory")?;
     let resolved = base_dir.join(&relative_path);
     drop(s);
 
     let path = resolved.canonicalize().unwrap_or(resolved);
+    // Security: prevent path traversal — ensure the resolved path is within base_dir.
+    let canonical_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
+    if !path.starts_with(&canonical_base) {
+        return Err("path traversal denied: resolved path is outside the base directory".to_string());
+    }
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let file_name = path.file_name()
         .map(|s| s.to_string_lossy().to_string())

@@ -243,19 +243,28 @@ async function refreshTabs() {
   } catch (e) { /* non-fatal */ }
 }
 
+let switchTabInProgress = false;
 async function switchTab(tabId) {
   if (tabId === activeTabId) return;
-  flushEdits();
-  const info = await tauriInvoke("switch_tab", { tabId });
-  currentText = info.text;
-  activeTabId = info.tab_id;
-  updateUI(info);
-  await refreshSyntax();
-  await refreshTabs();
-  refreshGitAll();
-  // Sync diff tab if it's currently visible.
-  syncDiffTabIfVisible();
-  editorFocusFirst();
+  if (switchTabInProgress) return; // Guard against rapid switching race conditions
+  switchTabInProgress = true;
+  try {
+    flushEdits();
+    const info = await tauriInvoke("switch_tab", { tabId });
+    // Verify the tab is still the one we want (user may have switched again).
+    if (info.tab_id !== tabId) return;
+    currentText = info.text;
+    activeTabId = info.tab_id;
+    updateUI(info);
+    await refreshSyntax();
+    await refreshTabs();
+    refreshGitAll();
+    // Sync diff tab if it's currently visible.
+    syncDiffTabIfVisible();
+    editorFocusFirst();
+  } finally {
+    switchTabInProgress = false;
+  }
 }
 
 async function closeTab(tabId) {
@@ -781,7 +790,7 @@ function getActiveTextarea() {
 
 // Apply inline formatting (bold, italic, code, strike) to current selection.
 // Works in both rendered and edit modes.
-function applyInlineFormat(prefix, suffix) {
+async function applyInlineFormat(prefix, suffix) {
   const ta = getActiveTextarea();
   if (ta) {
     // Edit mode: operate on textarea selection.
@@ -843,7 +852,7 @@ function applyInlineFormat(prefix, suffix) {
   } else {
     newText = newSource; // fallback: replace everything
   }
-  sendReplace(0, currentText.length, newText);
+  await sendReplace(0, currentText.length, newText);
 }
 
 // Helper: replace a block's source in currentText using string matching.
@@ -856,7 +865,7 @@ function replaceBlockSource(block, newSource) {
 }
 
 // Apply line-prefix formatting (list, quote, heading) to current selection.
-function applyLineFormat(prefix) {
+async function applyLineFormat(prefix) {
   const ta = getActiveTextarea();
   if (ta) {
     toggleLinePrefix(ta, prefix);
@@ -885,11 +894,11 @@ function applyLineFormat(prefix) {
     newSource = prefix + source;
   }
   const newText = replaceBlockSource(block, newSource);
-  sendReplace(0, currentText.length, newText);
+  await sendReplace(0, currentText.length, newText);
 }
 
 // Apply heading level to current block.
-function applyHeading(level) {
+async function applyHeading(level) {
   const ta = getActiveTextarea();
   if (ta) {
     toggleHeadingInTextarea(ta, level);
@@ -915,11 +924,11 @@ function applyHeading(level) {
   const prefix = level > 0 ? "#".repeat(level) + " " : "";
   const newSource = prefix + stripped;
   const newText = replaceBlockSource(block, newSource);
-  sendReplace(0, currentText.length, newText);
+  await sendReplace(0, currentText.length, newText);
 }
 
 // Insert a link around the current selection.
-function applyLink() {
+async function applyLink() {
   const ta = getActiveTextarea();
   if (ta) {
     insertLinkInTextarea(ta);
@@ -954,7 +963,7 @@ function applyLink() {
     `[${source.substring(result.start, result.end)}](${url})` +
     source.substring(result.end);
   const newText = replaceBlockSource(block, newSource);
-  sendReplace(0, currentText.length, newText);
+  await sendReplace(0, currentText.length, newText);
 }
 
 // Find a plain-text string in Markdown source, returning {start, end} byte offsets.
@@ -1066,6 +1075,7 @@ function renderTabs() {
       el.classList.remove("dragging");
       // Check if the drop happened outside the tab bar (tear-off).
       const tabBar = document.getElementById("tab-bar");
+      if (!tabBar) return;
       const barRect = tabBar.getBoundingClientRect();
       const outside = e.clientX < barRect.left || e.clientX > barRect.right ||
                       e.clientY < barRect.top || e.clientY > barRect.bottom;
@@ -1485,11 +1495,14 @@ window.gitShowDiff = async function() {
   try {
     let diffs;
     if (mode === "wt-vs-commit") {
-      const commit = document.getElementById("diff-commit-a").value;
+      const commitEl = document.getElementById("diff-commit-a");
+      const commit = commitEl ? commitEl.value : "";
       diffs = await tauriInvoke("git_diff_vs_commit", { commit });
     } else {
-      const a = document.getElementById("diff-commit-a").value;
-      const b = document.getElementById("diff-commit-b").value;
+      const aEl = document.getElementById("diff-commit-a");
+      const bEl = document.getElementById("diff-commit-b");
+      const a = aEl ? aEl.value : "";
+      const b = bEl ? bEl.value : "";
       diffs = await tauriInvoke("git_diff_commits", { commitA: a, commitB: b });
     }
 
@@ -1513,11 +1526,14 @@ window.gitShowDiff = async function() {
         // Fetch line-level diff for this specific file.
         let fileDiff;
         if (mode === "wt-vs-commit") {
-          const commit = document.getElementById("diff-commit-a").value;
+          const commitEl = document.getElementById("diff-commit-a");
+          const commit = commitEl ? commitEl.value : "";
           fileDiff = await tauriInvoke("git_diff_file_vs_commit", { filePath: file.path, commit });
         } else {
-          const a = document.getElementById("diff-commit-a").value;
-          const b = document.getElementById("diff-commit-b").value;
+          const aEl = document.getElementById("diff-commit-a");
+          const bEl = document.getElementById("diff-commit-b");
+          const a = aEl ? aEl.value : "";
+          const b = bEl ? bEl.value : "";
           fileDiff = await tauriInvoke("git_diff_file_commits", { filePath: file.path, commitA: a, commitB: b });
         }
         html += renderDiffHtml(fileDiff);
@@ -1673,7 +1689,7 @@ btnOl.addEventListener("click", () => applyLineFormat("1. "));
 btnQuote.addEventListener("click", () => applyLineFormat("> "));
 btnTask.addEventListener("click", () => applyLineFormat("- [ ] "));
 
-btnHr.addEventListener("click", () => {
+btnHr.addEventListener("click", async () => {
   const ta = getActiveTextarea();
   if (ta) {
     const start = ta.selectionStart;
@@ -1700,11 +1716,11 @@ btnHr.addEventListener("click", () => {
     const pos = currentText.indexOf(block.source);
     const insertPos = pos >= 0 ? pos + block.source.length : currentText.length;
     const newText = currentText.substring(0, insertPos) + "\n---\n" + currentText.substring(insertPos);
-    sendReplace(0, currentText.length, newText);
+    await sendReplace(0, currentText.length, newText);
   }
 });
 
-btnCodeblock.addEventListener("click", () => {
+btnCodeblock.addEventListener("click", async () => {
   const ta = getActiveTextarea();
   if (ta) {
     const lang = prompt("Language (optional):", "");
@@ -1733,7 +1749,7 @@ btnCodeblock.addEventListener("click", () => {
     const pos = currentText.indexOf(block.source);
     const insertPos = pos >= 0 ? pos + block.source.length : currentText.length;
     const newText = currentText.substring(0, insertPos) + "\n```" + lang + "\n// code here\n```\n" + currentText.substring(insertPos);
-    sendReplace(0, currentText.length, newText);
+    await sendReplace(0, currentText.length, newText);
   }
 });
 
@@ -1880,6 +1896,14 @@ blockEditor.addEventListener("click", (e) => {
 async function openRelativeFile(relativePath) {
   try {
     const info = await tauriInvoke("open_relative_file", { relativePath });
+    // If this file is already open in another tab, switch to it instead of creating a duplicate.
+    const existing = openTabs.find(tab => tab.file_name === info.file_name);
+    if (existing && existing.id !== info.tab_id) {
+      // The backend already created a new tab — close it and switch to the existing one.
+      tauriInvoke("close_tab", { tabId: info.tab_id });
+      await switchTab(existing.id);
+      return;
+    }
     currentText = info.text;
     activeTabId = info.tab_id;
     updateUI(info);
@@ -2107,6 +2131,12 @@ function getFileIcon(name) {
 /// Open a file from the tree.
 async function openFileFromTree(filePath) {
   try {
+    // If this file is already open in a tab, switch to it instead of creating a duplicate.
+    const existing = openTabs.find(tab => tab.file_path === filePath);
+    if (existing) {
+      await switchTab(existing.id);
+      return;
+    }
     const info = await tauriInvoke("open_document", { path: filePath });
     currentText = info.text;
     activeTabId = info.tab_id;
@@ -2167,9 +2197,15 @@ function showFileContextMenu(x, y, entry) {
     });
     fileContextMenu.appendChild(pasteEl);
   }
-  fileContextMenu.style.left = x + "px";
-  fileContextMenu.style.top = y + "px";
+  // Clamp to viewport so the menu doesn't go off-screen.
   fileContextMenu.classList.remove("hidden");
+  const menuRect = fileContextMenu.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const clampedX = Math.min(x, vw - menuRect.width - 4);
+  const clampedY = Math.min(y, vh - menuRect.height - 4);
+  fileContextMenu.style.left = Math.max(0, clampedX) + "px";
+  fileContextMenu.style.top = Math.max(0, clampedY) + "px";
 }
 
 /// Close file context menu on click outside.
@@ -2401,6 +2437,7 @@ window.selectLanguage = function(code) {
 /// Render the interface theme grid.
 function renderThemeGrid() {
   const grid = document.getElementById("theme-grid");
+  if (!grid) return;
   let html = "";
   for (const theme of THEMES) {
     const selected = settings.theme === theme.id ? " selected" : "";
@@ -2416,6 +2453,7 @@ function renderThemeGrid() {
 /// Render the syntax palette grid.
 function renderSyntaxGrid() {
   const grid = document.getElementById("syntax-grid");
+  if (!grid) return;
   let html = "";
   for (const palette of SYNTAX_PALETTES) {
     const selected = settings.syntaxTheme === palette.id ? " selected" : "";

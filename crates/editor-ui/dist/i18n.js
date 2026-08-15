@@ -207,7 +207,7 @@ const I18N_STRINGS = {
   es: {
     "tb.new": "Nuevo", "tb.open": "Abrir", "tb.save": "Guardar",
     "tb.undo": "Deshacer", "tb.redo": "Rehacer",
-    "tb.heading": "Nivel de encabezado", "tb.heading.normal": "Texto normal", "tb.heading.1": "Título 1", "tb.heading.2": "Título 2", "tb.heading.3": "Título 3", "tb.heading.4": "Título 4", "tb.heading.5": "Título 5", "tb.heading.6": "Título 6", "tb.heading.1": "Encabezado 1", "tb.heading.2": "Encabezado 2", "tb.heading.3": "Encabezado 3", "tb.heading.4": "Encabezado 4", "tb.heading.5": "Encabezado 5", "tb.heading.6": "Encabezado 6",
+    "tb.heading": "Nivel de encabezado", "tb.heading.normal": "Texto normal", "tb.heading.1": "Encabezado 1", "tb.heading.2": "Encabezado 2", "tb.heading.3": "Encabezado 3", "tb.heading.4": "Encabezado 4", "tb.heading.5": "Encabezado 5", "tb.heading.6": "Encabezado 6",
     "tb.bold": "Negrita", "tb.italic": "Cursiva", "tb.strike": "Tachado",
     "tb.code": "Código", "tb.link": "Enlace",
     "tb.ul": "Lista con viñetas", "tb.ol": "Lista numerada",
@@ -627,7 +627,7 @@ const I18N_STRINGS = {
   pt: {
     "tb.new": "Novo", "tb.open": "Abrir", "tb.save": "Salvar",
     "tb.undo": "Desfazer", "tb.redo": "Refazer",
-    "tb.heading": "Nível de título", "tb.heading.normal": "Texto normal",
+    "tb.heading": "Nível de título", "tb.heading.normal": "Texto normal", "tb.heading.1": "Título 1", "tb.heading.2": "Título 2", "tb.heading.3": "Título 3", "tb.heading.4": "Título 4", "tb.heading.5": "Título 5", "tb.heading.6": "Título 6",
     "tb.bold": "Negrito", "tb.italic": "Itálico", "tb.strike": "Tachado",
     "tb.code": "Código", "tb.link": "Link",
     "tb.ul": "Lista com marcadores", "tb.ol": "Lista numerada",
