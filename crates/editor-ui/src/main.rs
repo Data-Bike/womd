@@ -706,15 +706,17 @@ fn get_block_data(
     // 100+ MB document for each block request.
     let range_bytes = tab.buffer.serialize_range(start, end);
     let source = String::from_utf8_lossy(&range_bytes).to_string();
-    // For AST rendering, we need the block's text context. Use the range bytes
-    // as the text slice — block_to_ast only accesses the block's own span.
-    let text_str = source.clone();
+    // For AST rendering, block_to_ast uses span_text() with absolute byte offsets
+    // from the block's meta.span. Since we only have the block's local bytes (not
+    // the full document), we must rebase offsets to be relative to the block start.
+    // block_to_ast_relative subtracts `start` from all span accesses.
+    let node = block_to_ast_relative(b, &source, start);
     Ok(Some(SyntaxBlock {
         kind: block_kind_name(b),
         source,
         start: m.span.start.0,
         end: m.span.end.0,
-        node: block_to_ast(b, &text_str),
+        node,
     }))
 }
 
@@ -1847,6 +1849,132 @@ fn span_text(span: editor_markdown::SourceSpan, text: &str) -> String {
     let s = span.start.0 as usize;
     let e = span.end.0 as usize;
     if s <= e && e <= text.len() { text[s..e].to_string() } else { String::new() }
+}
+
+/// Like span_text but rebases offsets by subtracting `base` (for virtualized
+/// rendering where only the block's local bytes are available, not the full document).
+fn span_text_relative(span: editor_markdown::SourceSpan, text: &str, base: u64) -> String {
+    let s = span.start.0.saturating_sub(base) as usize;
+    let e = span.end.0.saturating_sub(base) as usize;
+    if s <= e && e <= text.len() { text[s..e].to_string() } else { String::new() }
+}
+
+/// Like block_to_ast but uses relative offsets (subtracts `base` from all spans).
+/// Used by get_block_data for virtualized rendering where only the block's local
+/// bytes are available, not the full 120MB document.
+fn block_to_ast_relative(block: &editor_markdown::Block, text: &str, base: u64) -> Option<AstNode> {
+    use editor_markdown::Block;
+    match block {
+        Block::BlankLine(_) => Some(AstNode::BlankLine),
+        Block::ThematicBreak(_) => Some(AstNode::ThematicBreak),
+        Block::Heading(h) => Some(AstNode::Heading {
+            level: h.level,
+            children: h.inlines.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
+        }),
+        Block::Paragraph(p) => Some(AstNode::Paragraph {
+            children: p.inlines.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
+        }),
+        Block::BlockQuote(bq) => Some(AstNode::BlockQuote {
+            children: bq.children.iter().filter_map(|b| block_to_ast_relative(b, text, base)).collect(),
+        }),
+        Block::List(l) => Some(AstNode::List {
+            ordered: l.ordered,
+            start: l.start,
+            items: l.items.iter().map(|item| ListItemNode {
+                task: item.task.map(|t| match t {
+                    editor_markdown::TaskState::Open => "open".to_string(),
+                    editor_markdown::TaskState::Done => "done".to_string(),
+                }),
+                children: item.children.iter().filter_map(|b| block_to_ast_relative(b, text, base)).collect(),
+            }).collect(),
+        }),
+        Block::CodeBlock(cb) => {
+            let raw = span_text_relative(cb.meta.span, text, base);
+            let content = if cb.fenced {
+                let lines: Vec<&str> = raw.lines().collect();
+                if lines.len() >= 2 {
+                    lines[1..lines.len()-1].join("\n")
+                } else {
+                    raw
+                }
+            } else {
+                raw.lines().map(|l| {
+                    if l.starts_with("    ") { l[4..].to_string() }
+                    else if l.starts_with('\t') { l[1..].to_string() }
+                    else { l.to_string() }
+                }).collect::<Vec<_>>().join("\n")
+            };
+            Some(AstNode::CodeBlock {
+                fenced: cb.fenced,
+                language: cb.info_string.clone(),
+                content,
+            })
+        }
+        Block::Table(t) => {
+            let alignments: Vec<String> = t.alignments.iter().map(|a| match a {
+                editor_markdown::TableAlign::Left => "left".to_string(),
+                editor_markdown::TableAlign::Center => "center".to_string(),
+                editor_markdown::TableAlign::Right => "right".to_string(),
+                editor_markdown::TableAlign::None => "none".to_string(),
+            }).collect();
+            let mut header = Vec::new();
+            let mut rows: Vec<Vec<TableCellNode>> = Vec::new();
+            for row in &t.rows {
+                let cells: Vec<TableCellNode> = row.cells.iter().map(|c| TableCellNode {
+                    align: "none".to_string(),
+                    children: c.inlines.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
+                }).collect();
+                if row.header { header = cells; }
+                else { rows.push(cells); }
+            }
+            Some(AstNode::Table { alignments, header, rows })
+        }
+        Block::HtmlBlock(hb) => Some(AstNode::HtmlBlock {
+            content: span_text_relative(hb.meta.span, text, base),
+        }),
+        Block::LinkReferenceDefinition(d) => Some(AstNode::LinkRefDef {
+            label: d.label.clone(),
+            destination: d.destination.clone(),
+            title: d.title.clone(),
+        }),
+        Block::UnknownBlock(ub) => Some(AstNode::HtmlBlock {
+            content: span_text_relative(ub.meta.span, text, base),
+        }),
+    }
+}
+
+/// Like inline_to_ast but uses relative offsets for span-based content extraction.
+/// Most inline variants store content directly (Text, CodeSpan, Autolink) so
+/// they don't need rebasing. Only RawHtml and UnknownInline use span_text.
+fn inline_to_ast_relative(inline: &editor_markdown::Inline, text: &str, base: u64) -> AstNode {
+    use editor_markdown::Inline;
+    match inline {
+        Inline::Text(_m, s) => AstNode::Text { text: s.clone() },
+        Inline::Emphasis(_, children, _) => AstNode::Emphasis {
+            children: children.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
+        },
+        Inline::Strong(_, children, _) => AstNode::Strong {
+            children: children.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
+        },
+        Inline::Strikethrough(_, children) => AstNode::Strikethrough {
+            children: children.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
+        },
+        Inline::CodeSpan(_, s, _) => AstNode::CodeSpan { text: s.clone() },
+        Inline::Link(l) => AstNode::Link {
+            children: l.inlines.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
+            destination: l.destination.clone(),
+            title: l.title.clone(),
+        },
+        Inline::Image(img) => AstNode::Image {
+            alt: img.alt.clone(),
+            destination: img.destination.clone(),
+            title: img.title.clone(),
+        },
+        Inline::Autolink(_, url) => AstNode::Autolink { url: url.clone() },
+        Inline::HardBreak(_) => AstNode::HardBreak,
+        Inline::RawHtml(m) => AstNode::RawHtml { content: span_text_relative(m.span, text, base) },
+        Inline::UnknownInline(m) => AstNode::Text { text: span_text_relative(m.span, text, base) },
+    }
 }
 
 fn block_to_ast(block: &editor_markdown::Block, text: &str) -> Option<AstNode> {
