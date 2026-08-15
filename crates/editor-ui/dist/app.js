@@ -439,7 +439,13 @@ async function sendReplaceBlock(blockIndex, newSource) {
 
 function flushEdits() {
   clearTimeout(debounceTimer);
-  if (editingBlockIndex >= 0) {
+  // Don't flush while suppressRender is true — we're in a block transition
+  // (enterEditMode called exitEditMode on the previous block, which called
+  // sendReplaceBlock → scheduleAutosave). The autosave timer fires later
+  // and calls flushEdits, but at that point we're editing a new block.
+  // flushEdits would commit the NEW block's edit, resetting suppressRender
+  // and editingBlockIndex, causing refreshSyntax → renderBlocks → scroll reset.
+  if (editingBlockIndex >= 0 && !suppressRender) {
     // Commit current edit synchronously into currentText.
     const ta = blockEditor.querySelector(".md-block.editing .md-block-textarea");
     if (ta) commitEdit(ta.value);
