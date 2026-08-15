@@ -1046,9 +1046,13 @@ async function enterEditMode(blockIndex) {
   // never receives a scroll event, so the user can't scroll while editing.
   ta.addEventListener("wheel", (e) => {
     e.preventDefault();
+    // Save scrollTop BEFORE exitEditMode — replacing textarea with rendered
+    // HTML changes the block's height, causing the browser to adjust scrollTop.
+    // We restore the saved position and add deltaY on top to avoid jumps.
+    const savedScrollTop = blockEditor.scrollTop;
     suppressBlur = false;
     const restorePromise = exitEditMode();
-    blockEditor.scrollTop += e.deltaY;
+    blockEditor.scrollTop = savedScrollTop + e.deltaY;
     restorePromise.then(() => {
       if (editingBlockIndex < 0) {
         suppressRender = false;
@@ -1070,14 +1074,12 @@ async function enterEditMode(blockIndex) {
                         : e.key === "PageDown" ? viewportHeight
                         : e.key === "Home" ? -blockEditor.scrollTop
                         : blockEditor.scrollHeight;
-      // Force standalone exit — clear suppressBlur so exitEditMode resets
-      // suppressRender synchronously.
+      // Save scrollTop BEFORE exitEditMode — replacing textarea with rendered
+      // HTML changes the block's height, causing the browser to adjust scrollTop.
+      const savedScrollTop = blockEditor.scrollTop;
       suppressBlur = false;
       const restorePromise = exitEditMode();
-      blockEditor.scrollTop += scrollDelta;
-      // Wait for restoreBlockElement to finish (including sendReplaceBlock
-      // → refreshSyntax) before rendering. If we render before, refreshSyntax
-      // will fire later and call renderBlocks() → innerHTML='' → scroll reset.
+      blockEditor.scrollTop = savedScrollTop + scrollDelta;
       restorePromise.then(() => {
         if (editingBlockIndex < 0) {
           suppressRender = false;
