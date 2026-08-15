@@ -239,6 +239,7 @@ async function newDocument() {
   await refreshTabs();
   blockHeights = [];
   gutterLineNumbers = {};
+  exitingBlockIndex = -1;
   await refreshSyntax();
   editorFocusFirst();
 }
@@ -1303,9 +1304,16 @@ async function enterEditMode(blockIndex) {
   });
 }
 
+// Guard: track which block is being restored to prevent double-exit races.
+let exitingBlockIndex = -1;
+
 function exitEditMode() {
   if (editingBlockIndex < 0) return Promise.resolve();
+  // Prevent double-exit: if a previous exitEditMode is still running
+  // (restoreBlockElement is async), don't start another one.
+  if (exitingBlockIndex >= 0) return Promise.resolve();
   const idx = editingBlockIndex;
+  exitingBlockIndex = idx;
   editingBlockIndex = -1;
   // If suppressRender is true, it was set by a mousedown handler for a
   // block transition (enterEditMode will be called next). In that case,
@@ -1324,9 +1332,10 @@ function exitEditMode() {
   if (blockEl) {
     const ta = blockEl.querySelector(".md-block-textarea");
     if (ta) {
+      // CRITICAL: capture ta.value synchronously BEFORE any async work.
+      // The textarea may be destroyed by a concurrent renderVirtualizedBlocks.
+      // This is the only safe point to read the user's text.
       const newSource = ta.value;
-      // Restore the block element in-place instead of full re-render.
-      // Return the promise so callers can await completion before rendering.
       restorePromise = restoreBlockElement(idx, blockEl, newSource);
     }
     blockEditor.focus({ preventScroll: true });
@@ -1339,52 +1348,29 @@ function exitEditMode() {
 
 /// Restore a single block element from textarea back to rendered HTML.
 /// Avoids full renderBlocks() which would destroy all elements and reset scroll.
-/// At the end, resets suppressRender to false if this is a standalone exit
-/// (editingBlockIndex < 0). If editingBlockIndex >= 0 (transition to another
-/// block), leaves suppressRender true so the new edit mode is not disrupted.
+///
+/// SAFETY: This function ALWAYS sends newSource to the backend, even if it
+/// appears unchanged. The "source unchanged" optimization is skipped because
+/// syntaxBlocks[idx].source may be stale (empty in virtualized mode, or
+/// outdated after a concurrent refreshSyntax). Always sending guarantees
+/// the user's text is preserved.
 async function restoreBlockElement(idx, blockEl, newSource) {
-  const oldSource = syntaxBlocks[idx].source;
-  if (newSource === oldSource) {
-    // Source unchanged — just restore rendered HTML in-place.
-    blockEl.classList.remove("editing");
-    // In virtualized mode, ensure block data (node + source) is loaded.
-    if (virtualizedMode && !syntaxBlocks[idx].node) {
-      try {
-        const block = await tauriInvoke("get_block_data", { blockIndex: idx });
-        if (block) {
-          blockCache.set(idx, block);
-          syntaxBlocks[idx] = block;
-        }
-      } catch (e) { /* fallback to empty */ }
-    }
-    // Save scrollTop before DOM change — replacing content changes block
-    // height, causing the browser to adjust scrollTop.
-    const savedScroll = blockEditor.scrollTop;
-    blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
-    attachBlockListeners(blockEl, idx);
-    blockEditor.scrollTop = savedScroll;
-    // Cache the block's new height so renderVirtualizedBlocks uses it.
-    requestAnimationFrame(() => {
-      const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
-      if (el && el.offsetHeight > 0) blockHeights[idx] = el.offsetHeight;
-    });
-    return;
-  }
-  // Source changed — send to backend, then update in-place.
-  // Keep suppressRender=true during sendReplaceBlock → refreshSyntax to
-  // prevent refreshSyntax from calling renderBlocks() (which would do
-  // innerHTML='' and reset scroll). We'll update the block element manually.
-  blockEl.classList.remove("editing");
-  const savedScroll1 = blockEditor.scrollTop;
-  blockEl.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
-  blockEditor.scrollTop = savedScroll1;
-  const wasSuppressRender = suppressRender;
-  suppressRender = true;
   try {
+    // Keep suppressRender=true during sendReplaceBlock → refreshSyntax to
+    // prevent refreshSyntax from calling renderBlocks() (which would do
+    // innerHTML='' and reset scroll). We'll update the block element manually.
+    blockEl.classList.remove("editing");
+    const savedScroll1 = blockEditor.scrollTop;
+    blockEl.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
+    blockEditor.scrollTop = savedScroll1;
+    const wasSuppressRender = suppressRender;
+    suppressRender = true;
+    // ALWAYS send to backend — don't skip even if source appears unchanged.
+    // The comparison newSource === oldSource is unreliable because
+    // syntaxBlocks[idx].source may be stale/empty in virtualized mode.
     await sendReplaceBlock(idx, newSource);
-    // sendReplaceBlock → refreshSyntax rebuilds syntaxBlocks with empty
-    // source/node (virtualized mode). Must reload block data before rendering.
-    // Reload block data — refreshSyntax cleared it.
+    // sendReplaceBlock → refreshSyntax rebuilds syntaxBlocks. Must reload
+    // block data before rendering — refreshSyntax may have changed indices.
     try {
       const block = await tauriInvoke("get_block_data", { blockIndex: idx });
       if (block) {
@@ -1399,7 +1385,10 @@ async function restoreBlockElement(idx, blockEl, newSource) {
       attachBlockListeners(el, idx);
       blockEditor.scrollTop = savedScroll2;
     }
+    // Restore suppressRender to its previous value.
+    suppressRender = wasSuppressRender;
   } catch (e) {
+    console.error("restoreBlockElement failed:", e);
     // Restore original on error — reload block data first.
     try {
       const block = await tauriInvoke("get_block_data", { blockIndex: idx });
@@ -1413,31 +1402,31 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     attachBlockListeners(blockEl, idx);
     blockEditor.scrollTop = savedScroll3;
   }
-  // Restore suppressRender to its previous value — if it was false before
-  // (standalone exit), keep it false so the caller can render. If it was
-  // true (transition), keep it true.
-  suppressRender = wasSuppressRender;
   // Cache the block's new height so renderVirtualizedBlocks uses it.
   requestAnimationFrame(() => {
     const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
     if (el && el.offsetHeight > 0) blockHeights[idx] = el.offsetHeight;
   });
+  // Clear the exit guard — restoreBlockElement is done.
+  exitingBlockIndex = -1;
 }
 
 async function commitEdit(newSource) {
   // Legacy path — called from flushEdits before save/undo/redo.
   // exitEditMode now handles the in-place restoration directly.
+  // Don't commit if a restoreBlockElement is in progress — it already
+  // sent the edit to the backend. Double-committing would corrupt data.
+  if (exitingBlockIndex >= 0) return;
   const idx = editingBlockIndex;
   if (idx < 0) return;
   editingBlockIndex = -1;
   suppressRender = false;
 
   if (idx >= syntaxBlocks.length) return;
-  const oldSource = syntaxBlocks[idx].source;
-  if (newSource === oldSource) {
-    renderBlocks();
-    return;
-  }
+  // Always send to backend — don't skip on "source unchanged" because
+  // syntaxBlocks[idx].source may be stale in virtualized mode.
+  await sendReplaceBlock(idx, newSource);
+}
 
   // Use replace_block: backend uses exact byte spans from the AST,
   // avoiding JS string index vs byte offset mismatch for non-ASCII text.
