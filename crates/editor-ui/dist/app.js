@@ -89,7 +89,13 @@ const blockEditor = document.getElementById("block-editor");
 // Uses a larger render window to avoid frequent re-renders during scrolling.
 let scrollRenderPending = false;
 blockEditor.addEventListener("scroll", () => {
-  if (!virtualizedMode || editingBlockIndex >= 0 || suppressRender) return;
+  if (!virtualizedMode) return;
+  // If editing a block, exit edit mode first — scrolling away from the edited
+  // block should commit the edit and allow normal scroll handling.
+  if (editingBlockIndex >= 0) {
+    exitEditMode();
+  }
+  if (suppressRender) return;
   if (scrollRenderPending) return;
   scrollRenderPending = true;
   requestAnimationFrame(() => {
@@ -996,10 +1002,18 @@ function exitEditMode() {
   if (editingBlockIndex < 0) return;
   const idx = editingBlockIndex;
   editingBlockIndex = -1;
-  // Don't reset suppressRender here — restoreBlockElement may trigger
-  // sendReplaceBlock -> refreshSyntax -> renderBlocks which would destroy
-  // all elements and reset scroll. The caller (enterEditMode or commitEdit)
-  // is responsible for resetting suppressRender when appropriate.
+  // If suppressRender is true, it was set by a mousedown handler for a
+  // block transition (enterEditMode will be called next). In that case,
+  // don't reset it — enterEditMode manages it.
+  // If suppressRender is false (standalone exit: blur, scroll, Escape),
+  // keep it false — restoreBlockElement will handle the DOM update.
+  // If suppressRender is true but we're NOT in a transition (e.g. scroll
+  // triggered exit), reset it so future renders work.
+  // We detect transition by checking if suppressBlur is true (set by
+  // mousedown for transitions, not for scroll/blur/Escape exits).
+  if (suppressRender && !suppressBlur) {
+    suppressRender = false;
+  }
   const blockEl = blockEditor.querySelector(`[data-block-index="${idx}"]`);
   if (blockEl) {
     const ta = blockEl.querySelector(".md-block-textarea");
@@ -1010,10 +1024,9 @@ function exitEditMode() {
     }
     blockEditor.focus({ preventScroll: true });
   }
-  // Now safe to re-render — but only if we're not entering another edit mode.
+  // If suppressRender is still true (transition), don't reset — enterEditMode will.
   if (suppressRender) return;
   suppressRender = false;
-  // No re-render needed — restoreBlockElement already updated the DOM.
 }
 
 /// Restore a single block element from textarea back to rendered HTML.
@@ -1038,8 +1051,6 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     }
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
-    // Reset suppressRender if standalone exit (not transitioning to another block).
-    if (editingBlockIndex < 0) suppressRender = false;
     return;
   }
   // Source changed — send to backend, then update in-place.
@@ -1078,8 +1089,6 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
   }
-  // Reset suppressRender if standalone exit (not transitioning to another block).
-  if (editingBlockIndex < 0) suppressRender = false;
 }
 
 async function commitEdit(newSource) {
