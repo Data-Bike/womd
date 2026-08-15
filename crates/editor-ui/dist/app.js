@@ -1428,11 +1428,6 @@ async function commitEdit(newSource) {
   await sendReplaceBlock(idx, newSource);
 }
 
-  // Use replace_block: backend uses exact byte spans from the AST,
-  // avoiding JS string index vs byte offset mismatch for non-ASCII text.
-  await sendReplaceBlock(idx, newSource);
-}
-
 function autoSizeTextarea(ta) {
   ta.style.height = "auto";
   ta.style.height = ta.scrollHeight + "px";
