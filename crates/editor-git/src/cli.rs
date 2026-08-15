@@ -317,6 +317,22 @@ fn parse_rename(s: &str) -> (String, Option<String>) {
     (s.trim().to_string(), None)
 }
 
+/// Validate a commit reference — reject anything that looks like a CLI flag or
+/// contains shell metacharacters. Legitimate refs are SHAs (hex), ref names
+/// (HEAD, main, tags/v1.0), and relative refs (HEAD~1, HEAD^2).
+fn validate_commit_ref(s: &str) -> GitResult<()> {
+    if s.is_empty() {
+        return Err(GitError::Other("empty commit reference".into()));
+    }
+    if s.starts_with('-') {
+        return Err(GitError::Other(format!("invalid commit reference: {:?}", s)));
+    }
+    if s.chars().any(|c| c == '\n' || c == '\r' || c == '\0' || c == '`' || c == '$' || c == '!' || c == '&' || c == '|' || c == ';' || c == '(' || c == ')') {
+        return Err(GitError::Other(format!("invalid characters in commit reference: {:?}", s)));
+    }
+    Ok(())
+}
+
 /// Parse `git diff --raw` output into `FileDiff`s (without hunks; hunks come from a
 /// follow-up `git diff <path>` call when the UI expands a file).
 fn parse_raw_diff(text: &str) -> Vec<FileDiff> {
@@ -504,9 +520,7 @@ pub fn read_file_at_revision(repo: &GitCli, path: &str, rev: &str) -> GitResult<
     if path.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
         return Err(GitError::Other("invalid characters in path".into()));
     }
-    if rev.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
-        return Err(GitError::Other("invalid characters in revision".into()));
-    }
+    validate_commit_ref(rev)?;
     let out = repo.exec(&["show", &format!("{rev}:{path}")])?;
     Ok(out.stdout)
 }
@@ -628,6 +642,7 @@ impl GitExtended for GitCli {
 
     // ── Cherry-pick / Revert ───────────────────────────────────────────────
     fn cherry_pick(&self, commit: &str) -> GitResult<()> {
+        validate_commit_ref(commit)?;
         self.exec(&["cherry-pick", commit])?;
         Ok(())
     }
@@ -643,6 +658,7 @@ impl GitExtended for GitCli {
     }
 
     fn revert(&self, commit: &str) -> GitResult<()> {
+        validate_commit_ref(commit)?;
         self.exec(&["revert", "--no-edit", commit])?;
         Ok(())
     }
@@ -749,7 +765,8 @@ impl GitExtended for GitCli {
     // ── Log ────────────────────────────────────────────────────────────────
     fn log(&self, max_count: usize) -> GitResult<Vec<CommitEntry>> {
         let limit = format!("-{}", max_count);
-        let fmt = "%H%x09%h%x09%an%x09%ae%x09%ad%x09%s%x09%b%x09%p";
+        // %x1e = ASCII record separator — robust against newlines in commit bodies (%b).
+        let fmt = "%H%x09%h%x09%an%x09%ae%x09%ad%x09%s%x09%b%x09%p%x1e";
         let pretty = format!("format:{}", fmt);
         let text = self.exec_text(&["log", &format!("--pretty={}", pretty), "--date=short", limit.as_str()])?;
         Ok(parse_log(&text))
@@ -760,7 +777,7 @@ impl GitExtended for GitCli {
             return Err(GitError::Other("invalid characters in path".into()));
         }
         let limit = format!("-{}", max_count);
-        let fmt = "%H%x09%h%x09%an%x09%ae%x09%ad%x09%s%x09%b%x09%p";
+        let fmt = "%H%x09%h%x09%an%x09%ae%x09%ad%x09%s%x09%b%x09%p%x1e";
         let pretty = format!("format:{}", fmt);
         let text = self.exec_text(&["log", "--follow", "-M", &format!("--pretty={}", pretty), "--date=short", limit.as_str(), "--", path])?;
         Ok(parse_log(&text))
@@ -768,32 +785,40 @@ impl GitExtended for GitCli {
 
     // ── Diff (extended) ────────────────────────────────────────────────────
     fn diff_commits(&self, a: &str, b: &str) -> GitResult<Vec<FileDiff>> {
+        validate_commit_ref(a)?;
+        validate_commit_ref(b)?;
         let text = self.exec_text(&["diff", "--raw", a, b])?;
         Ok(parse_raw_diff(&text))
     }
 
     fn diff_working_tree_vs_commit(&self, commit: &str) -> GitResult<Vec<FileDiff>> {
+        validate_commit_ref(commit)?;
         let text = self.exec_text(&["diff", "--raw", commit])?;
         Ok(parse_raw_diff(&text))
     }
 
     fn diff_file_at_commits(&self, path: &str, a: &str, b: &str) -> GitResult<Vec<FileDiff>> {
+        validate_commit_ref(a)?;
+        validate_commit_ref(b)?;
         let text = self.exec_text(&["diff", "--raw", a, b, "--", path])?;
         Ok(parse_raw_diff(&text))
     }
 
     // ── Reset / Clean ──────────────────────────────────────────────────────
     fn reset_soft(&self, commit: &str) -> GitResult<()> {
+        validate_commit_ref(commit)?;
         self.exec(&["reset", "--soft", commit])?;
         Ok(())
     }
 
     fn reset_mixed(&self, commit: &str) -> GitResult<()> {
+        validate_commit_ref(commit)?;
         self.exec(&["reset", "--mixed", commit])?;
         Ok(())
     }
 
     fn reset_hard(&self, commit: &str) -> GitResult<()> {
+        validate_commit_ref(commit)?;
         self.exec(&["reset", "--hard", commit])?;
         Ok(())
     }
@@ -849,10 +874,13 @@ impl GitExtended for GitCli {
     }
 
     fn diff_file_commits_raw(&self, path: &str, commit_a: &str, commit_b: &str) -> GitResult<String> {
+        validate_commit_ref(commit_a)?;
+        validate_commit_ref(commit_b)?;
         self.exec_text(&["diff", commit_a, commit_b, "--", path])
     }
 
     fn diff_file_vs_commit_raw(&self, path: &str, commit: &str) -> GitResult<String> {
+        validate_commit_ref(commit)?;
         self.exec_text(&["diff", commit, "--", path])
     }
 
@@ -883,9 +911,11 @@ impl GitExtended for GitCli {
 /// Parse `git log --pretty=format` output with tab-separated fields.
 fn parse_log(text: &str) -> Vec<CommitEntry> {
     let mut out = Vec::new();
-    for line in text.lines() {
-        if line.is_empty() { continue; }
-        let mut f = line.split('\t');
+    // Split on ASCII record separator (\x1e) — robust against newlines in commit bodies.
+    for record in text.split('\x1e') {
+        let record = record.trim();
+        if record.is_empty() { continue; }
+        let mut f = record.split('\t');
         let sha = f.next().unwrap_or("").to_string();
         let short_sha = f.next().unwrap_or("").to_string();
         let author = f.next().unwrap_or("").to_string();
