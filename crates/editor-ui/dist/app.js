@@ -746,7 +746,27 @@ async function maybeParseNextChunk() {
     // Re-fetch metadata and re-render with the new blocks.
     const meta = await tauriInvoke("get_syntax_tree_meta");
     blockMeta = meta;
-    syntaxBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
+    // Preserve existing block data — only add new blocks from the parsed chunk.
+    // Rebuilding the entire array with empty source/node would destroy all
+    // loaded block data, causing every visible block to show a placeholder
+    // and reload asynchronously → height changes → scroll jumps.
+    const oldLen = syntaxBlocks.length;
+    const newBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
+    if (meta.length > oldLen) {
+      // New blocks were added — append only the new ones.
+      syntaxBlocks = syntaxBlocks.concat(newBlocks.slice(oldLen));
+    } else if (meta.length === oldLen) {
+      // No new blocks (edge case) — keep existing data, just update metadata.
+      for (let i = 0; i < oldLen; i++) {
+        syntaxBlocks[i].kind = meta[i].kind;
+        syntaxBlocks[i].start = meta[i].start;
+        syntaxBlocks[i].end = meta[i].end;
+      }
+    } else {
+      // Block count decreased (shouldn't happen with append-only parsing,
+      // but handle it defensively).
+      syntaxBlocks = newBlocks;
+    }
     blockCount.textContent = `${meta.length} ${t("status.blocks")}`;
     // Re-render to show the newly parsed blocks. Restore scroll position
     // after re-render — renderVirtualizedBlocks saves/restores scrollTop
