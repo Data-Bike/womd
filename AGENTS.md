@@ -98,13 +98,7 @@
 - `editor-ui` sends full-text replace on each edit (debounced 300ms). Granular
   range-based edits via `replace_text` command are available but not yet wired to
   fine-grained DOM diffing in the frontend.
-- `editor-ui` uses `GitCli` directly (concrete impl) instead of the `VersionControl`
-  /`GitExtended` traits. 9 `exec_text()` calls bypass the port. Refactoring to trait
-  methods requires adding diff-vs-commit, file-history, rev-parse, and branch-list
-  operations to the port interface.
-- `editor-ui` uses `std::fs` directly for file I/O instead of the `editor-storage`
+- `editor-ui` uses `std::fs::read` for file reads instead of the `editor-storage`
   `DocumentStorage` port. Integrating `MmapStorage` would enable mmap-backed large
-  file support and atomic saves as designed in §51-57.
-- `editor-ui` depends on `editor-platform` but doesn't use its traits (`Clipboard`,
-  `FileWatcher`, `SecureStorage`, `UrlOpener`). Either wire the platform abstractions
-  or remove the dependency.
+  file support (>RAM files) as designed in §51-57. File saves already use
+  `editor_storage::atomic_save` (temp + rename, §55).

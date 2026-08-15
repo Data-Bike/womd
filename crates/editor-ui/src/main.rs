@@ -544,7 +544,7 @@ fn save_document(
     let bytes = tab.buffer.serialize();
     let save_path = path.map(PathBuf::from).or_else(|| tab.file_path.clone());
     let save_path = save_path.ok_or("no file path to save to")?;
-    std::fs::write(&save_path, &bytes).map_err(|e| e.to_string())?;
+    editor_storage::atomic_save(&save_path, &bytes).map_err(|e| e.to_string())?;
     tab.buffer.mark_saved();
     tab.file_path = Some(save_path);
     Ok(true)
@@ -658,12 +658,7 @@ fn root_pathspec(path: &str) -> String {
 fn git_diff_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
     let ps = root_pathspec(&file_path);
-    // Get the unified diff text for this file.
-    let text = git.exec_text(&["diff", "HEAD", "--", &ps]).map_err(|e| e.to_string())?;
-    // If empty (no unstaged changes), try staged (index vs HEAD).
-    let text = if text.trim().is_empty() {
-        git.exec_text(&["diff", "--cached", "HEAD", "--", &ps]).map_err(|e| e.to_string())?
-    } else { text };
+    let text = git.diff_file_raw(&ps).map_err(|e| e.to_string())?;
     let hunks = parse_unified_diff(&text);
     Ok(GitFileDiff { path: file_path, old_path: None, hunks })
 }
@@ -673,7 +668,7 @@ fn git_diff_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) ->
 fn git_diff_file_commits(state: tauri::State<'_, Mutex<AppState>>, file_path: String, commit_a: String, commit_b: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
     let ps = root_pathspec(&file_path);
-    let text = git.exec_text(&["diff", &commit_a, &commit_b, "--", &ps]).map_err(|e| e.to_string())?;
+    let text = git.diff_file_commits_raw(&ps, &commit_a, &commit_b).map_err(|e| e.to_string())?;
     let hunks = parse_unified_diff(&text);
     Ok(GitFileDiff { path: file_path, old_path: None, hunks })
 }
@@ -683,7 +678,7 @@ fn git_diff_file_commits(state: tauri::State<'_, Mutex<AppState>>, file_path: St
 fn git_diff_file_vs_commit(state: tauri::State<'_, Mutex<AppState>>, file_path: String, commit: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
     let ps = root_pathspec(&file_path);
-    let text = git.exec_text(&["diff", &commit, "--", &ps]).map_err(|e| e.to_string())?;
+    let text = git.diff_file_vs_commit_raw(&ps, &commit).map_err(|e| e.to_string())?;
     let hunks = parse_unified_diff(&text);
     Ok(GitFileDiff { path: file_path, old_path: None, hunks })
 }
@@ -693,7 +688,7 @@ fn git_diff_file_vs_commit(state: tauri::State<'_, Mutex<AppState>>, file_path: 
 fn git_discard_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
     let ps = root_pathspec(&file_path);
-    git.exec_text(&["checkout", "--", &ps]).map_err(|e| e.to_string())?;
+    git.discard_file(&ps).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -702,7 +697,7 @@ fn git_discard_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String)
 fn git_remove_untracked(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
     let ps = root_pathspec(&file_path);
-    git.exec_text(&["clean", "-f", "--", &ps]).map_err(|e| e.to_string())?;
+    git.clean_files(&ps).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -795,19 +790,13 @@ fn git_log(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitCommitInfo
     let path = tab.file_path.as_ref().ok_or("no file open")?;
     let dir = path.parent().ok_or("no parent directory")?;
     let git = editor_git::GitCli::open(dir).map_err(|e| e.to_string())?;
-    // Use git log directly via the CLI.
-    let text = git.exec_text(&["log", "--pretty=format:%H%x09%an%x09%ad%x09%s", "--date=short", "-50"]).map_err(|e| e.to_string())?;
-    let mut commits = Vec::new();
-    for line in text.lines() {
-        let mut f = line.split('\t');
-        let sha = f.next().unwrap_or("").to_string();
-        let author = f.next().unwrap_or("").to_string();
-        let date = f.next().unwrap_or("").to_string();
-        let message = f.next().unwrap_or("").to_string();
-        if !sha.is_empty() {
-            commits.push(GitCommitInfo { sha, author, date, message });
-        }
-    }
+    let entries = git.log(50).map_err(|e| e.to_string())?;
+    let commits = entries.into_iter().map(|c| GitCommitInfo {
+        sha: c.sha,
+        author: c.author,
+        date: c.date,
+        message: c.message,
+    }).collect();
     Ok(commits)
 }
 
@@ -1114,12 +1103,8 @@ fn git_head_commit(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, S
 fn git_read_file_at_revision(state: tauri::State<'_, Mutex<AppState>>, file_path: String, revision: String) -> Result<String, String> {
     let git = open_git_for_active(&state)?;
     if revision.is_empty() {
-        // Read from working tree (for untracked files).
-        // file_path is relative to repo root, but work_dir might be a subdirectory.
-        // Resolve via git rev-parse --show-toplevel to get the repo root.
-        let root = git.exec_text(&["rev-parse", "--show-toplevel"]).map_err(|e| e.to_string())?;
-        let root = root.trim();
-        let full = std::path::Path::new(root).join(&file_path);
+        let root = git.repo_root().map_err(|e| e.to_string())?;
+        let full = std::path::Path::new(&root).join(&file_path);
         let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&bytes).to_string())
     } else {
@@ -1315,14 +1300,8 @@ fn github_pull_requests(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<
 #[tauri::command]
 fn github_remote_branches(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GithubRemoteBranch>, String> {
     let git = open_git_for_active(&state)?;
-    let text = git.exec_text(&["branch", "-r", "--list"]).map_err(|e| e.to_string())?;
-    let mut branches = Vec::new();
-    for line in text.lines() {
-        let name = line.trim().to_string();
-        if !name.is_empty() && !name.contains(" -> ") {
-            branches.push(GithubRemoteBranch { name });
-        }
-    }
+    let names = git.remote_branches().map_err(|e| e.to_string())?;
+    let branches = names.into_iter().map(|name| GithubRemoteBranch { name }).collect();
     Ok(branches)
 }
 

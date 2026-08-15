@@ -278,6 +278,22 @@ pub trait GitExtended {
     fn current_branch(&self) -> GitResult<String>;
     fn head_commit(&self) -> GitResult<CommitId>;
     fn is_clean(&self) -> GitResult<bool>;
+
+    // ── File-level operations (raw unified diff text for UI) ───────────────
+    /// Raw unified diff text for a single file (working tree + staged vs HEAD).
+    fn diff_file_raw(&self, path: &str) -> GitResult<String>;
+    /// Raw unified diff text for a single file between two commits.
+    fn diff_file_commits_raw(&self, path: &str, commit_a: &str, commit_b: &str) -> GitResult<String>;
+    /// Raw unified diff text for a single file vs a specific commit.
+    fn diff_file_vs_commit_raw(&self, path: &str, commit: &str) -> GitResult<String>;
+    /// Discard local changes to a file (`git checkout -- <file>`).
+    fn discard_file(&self, path: &str) -> GitResult<()>;
+    /// Remove untracked file(s) (`git clean -f -- <pathspec>`).
+    fn clean_files(&self, pathspec: &str) -> GitResult<()>;
+    /// Get the repository root directory (`git rev-parse --show-toplevel`).
+    fn repo_root(&self) -> GitResult<String>;
+    /// List remote branches (`git branch -r --list`).
+    fn remote_branches(&self) -> GitResult<Vec<String>>;
 }
 
 /// Credentials for a remote (§35). Secrets are never logged (§87).

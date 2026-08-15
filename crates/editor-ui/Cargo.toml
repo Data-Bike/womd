@@ -11,7 +11,7 @@ editor-core = { path = "../editor-core" }
 editor-markdown = { path = "../editor-markdown" }
 editor-git = { path = "../editor-git" }
 editor-diff = { path = "../editor-diff" }
-editor-platform = { path = "../editor-platform" }
+editor-storage = { path = "../editor-storage" }
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"

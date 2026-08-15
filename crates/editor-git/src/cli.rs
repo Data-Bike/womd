@@ -838,6 +838,46 @@ impl GitExtended for GitCli {
         let st = self.status()?;
         Ok(st.changes.is_empty() && st.staged.is_empty() && st.untracked.is_empty() && st.conflicted.is_empty())
     }
+
+    fn diff_file_raw(&self, path: &str) -> GitResult<String> {
+        let text = self.exec_text(&["diff", "HEAD", "--", path])?;
+        if text.trim().is_empty() {
+            self.exec_text(&["diff", "--cached", "HEAD", "--", path])
+        } else {
+            Ok(text)
+        }
+    }
+
+    fn diff_file_commits_raw(&self, path: &str, commit_a: &str, commit_b: &str) -> GitResult<String> {
+        self.exec_text(&["diff", commit_a, commit_b, "--", path])
+    }
+
+    fn diff_file_vs_commit_raw(&self, path: &str, commit: &str) -> GitResult<String> {
+        self.exec_text(&["diff", commit, "--", path])
+    }
+
+    fn discard_file(&self, path: &str) -> GitResult<()> {
+        self.exec_text(&["checkout", "--", path])?;
+        Ok(())
+    }
+
+    fn clean_files(&self, pathspec: &str) -> GitResult<()> {
+        self.exec_text(&["clean", "-f", "--", pathspec])?;
+        Ok(())
+    }
+
+    fn repo_root(&self) -> GitResult<String> {
+        let root = self.exec_text(&["rev-parse", "--show-toplevel"])?;
+        Ok(root.trim().to_string())
+    }
+
+    fn remote_branches(&self) -> GitResult<Vec<String>> {
+        let text = self.exec_text(&["branch", "-r", "--list"])?;
+        Ok(text.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.contains(" -> "))
+            .collect())
+    }
 }
 
 /// Parse `git log --pretty=format` output with tab-separated fields.
