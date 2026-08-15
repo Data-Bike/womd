@@ -1017,6 +1017,8 @@ async function maybeParseNextChunk() {
 
 /// Load full block data on demand and update the placeholder element.
 async function loadBlockData(blockIndex, el) {
+  // Never overwrite the element while it is being edited or restored.
+  if (editingBlockIndex === blockIndex || exitingBlockIndex === blockIndex) return;
   if (blockCache.has(blockIndex)) {
     const block = blockCache.get(blockIndex);
     syntaxBlocks[blockIndex] = block;
@@ -1028,6 +1030,7 @@ async function loadBlockData(blockIndex, el) {
   }
   try {
     const block = await tauriInvoke("get_block_data", { blockIndex });
+    if (editingBlockIndex === blockIndex || exitingBlockIndex === blockIndex) return;
     if (block) {
       blockCache.set(blockIndex, block);
       syntaxBlocks[blockIndex] = block;
@@ -1252,9 +1255,11 @@ function joinPath(dir, name) {
 // ── Click-to-edit ───────────────────────────────────────────────────────────
 
 async function enterEditMode(blockIndex) {
+  // Already editing this exact block — nothing to do (preserve selection/cursor).
+  if (editingBlockIndex === blockIndex) return;
   // If already editing another block, exit it first and wait.
   // Awaiting ensures the old block is restored before we destroy it.
-  if (editingBlockIndex >= 0 && editingBlockIndex !== blockIndex) {
+  if (editingBlockIndex >= 0) {
     suppressBlur = true;
     suppressRender = true;
     try {
@@ -1290,6 +1295,13 @@ async function enterEditMode(blockIndex) {
     }
   }
 
+  // If another edit was initiated during the async load, abort.
+  if (editingBlockIndex >= 0 && editingBlockIndex !== blockIndex) {
+    suppressRender = false;
+    suppressBlur = false;
+    return;
+  }
+
   const blockEl = blockEditor.querySelector(`[data-block-index="${blockIndex}"]`);
   if (!blockEl) {
     editingBlockIndex = -1;
@@ -1312,7 +1324,12 @@ async function enterEditMode(blockIndex) {
   autoSizeTextarea(ta);
 
   // focus with preventScroll to avoid the browser scrolling to the element.
+  // Belt-and-suspenders: capture scrollTop and restore it after focus, because
+  // some WebView implementations ignore preventScroll and jump to the element.
+  const preFocusScrollTop = blockEditor.scrollTop;
   ta.focus({ preventScroll: true });
+  blockEditor.scrollTop = preFocusScrollTop;
+  lineGutter.scrollTop = preFocusScrollTop;
   // Place cursor at end.
   ta.selectionStart = ta.value.length;
   ta.selectionEnd = ta.value.length;
@@ -1482,7 +1499,11 @@ function exitEditMode() {
       blockRestorePromise = Promise.resolve();
       restorePromise = blockRestorePromise;
     }
+    // Some WebViews ignore preventScroll; capture and restore scrollTop.
+    const preFocusScrollTop = blockEditor.scrollTop;
     blockEditor.focus({ preventScroll: true });
+    blockEditor.scrollTop = preFocusScrollTop;
+    lineGutter.scrollTop = preFocusScrollTop;
   }
   // If blockEl wasn't found, nothing to restore; clear the guard.
   if (!blockEl) {
