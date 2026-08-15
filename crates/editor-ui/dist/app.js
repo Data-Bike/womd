@@ -528,6 +528,7 @@ function scheduleAutosave() {
 
 function renderBlocks() {
   if (editingBlockIndex >= 0) return; // don't re-render while editing
+  if (exitingBlockIndex >= 0) return; // don't re-render while restoring a block
   if (suppressRender) return;
   blockEditor.innerHTML = "";
 
@@ -581,6 +582,7 @@ function renderBlocks() {
 
 /// Render all blocks (small documents).
 function renderAllBlocks() {
+  if (editingBlockIndex >= 0 || exitingBlockIndex >= 0) return;
   for (let i = 0; i < syntaxBlocks.length; i++) {
     const block = syntaxBlocks[i];
     if (block.kind === "blank-line") continue;
@@ -678,6 +680,8 @@ function estimateTotalHeight() {
 /// re-renders on every frame. Re-render only when scroll moves outside the window.
 /// Uses cached real block heights for spacer calculations to avoid scroll jumps.
 function renderVirtualizedBlocks() {
+  if (editingBlockIndex >= 0 || exitingBlockIndex >= 0) return;
+  if (suppressRender) return;
   // Save scroll position before clearing (innerHTML resets scrollTop to 0).
   // We restore to the same absolute pixel position so the user keeps reading
   // the same content region. With lazy loading the bottom spacer is now small,
@@ -1436,12 +1440,16 @@ async function enterEditMode(blockIndex) {
 
 // Guard: track which block is being restored to prevent double-exit races.
 let exitingBlockIndex = -1;
+// The in-flight restoreBlockElement promise. Callers can await this to wait
+// for a block exit that was already initiated (e.g. rapid block-to-block click).
+let blockRestorePromise = Promise.resolve();
 
 function exitEditMode() {
-  if (editingBlockIndex < 0) return Promise.resolve();
+  if (editingBlockIndex < 0) return blockRestorePromise;
   // Prevent double-exit: if a previous exitEditMode is still running
-  // (restoreBlockElement is async), don't start another one.
-  if (exitingBlockIndex >= 0) return Promise.resolve();
+  // (restoreBlockElement is async), don't start another one. Return the
+  // in-flight promise so callers (e.g. enterEditMode) wait for it.
+  if (exitingBlockIndex >= 0) return blockRestorePromise;
   const idx = editingBlockIndex;
   exitingBlockIndex = idx;
   editingBlockIndex = -1;
@@ -1466,9 +1474,19 @@ function exitEditMode() {
       // The textarea may be destroyed by a concurrent renderVirtualizedBlocks.
       // This is the only safe point to read the user's text.
       const newSource = ta.value;
-      restorePromise = restoreBlockElement(idx, blockEl, newSource);
+      blockRestorePromise = restoreBlockElement(idx, blockEl, newSource);
+      restorePromise = blockRestorePromise;
+    } else {
+      // Textarea is gone (probably a concurrent render). Still clear the guard.
+      exitingBlockIndex = -1;
+      blockRestorePromise = Promise.resolve();
+      restorePromise = blockRestorePromise;
     }
     blockEditor.focus({ preventScroll: true });
+  }
+  // If blockEl wasn't found, nothing to restore; clear the guard.
+  if (!blockEl) {
+    exitingBlockIndex = -1;
   }
   // If suppressRender is still true (transition), don't reset — enterEditMode will.
   if (suppressRender) return restorePromise;
@@ -1534,6 +1552,8 @@ async function restoreBlockElement(idx, blockEl, newSource) {
   } finally {
     // Clear the exit guard so exitEditMode can run again.
     exitingBlockIndex = -1;
+    // Clear the in-flight promise once the restore is done.
+    blockRestorePromise = Promise.resolve();
     // Cache the block's new height so renderVirtualizedBlocks uses it.
     requestAnimationFrame(() => {
       const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
@@ -2637,8 +2657,8 @@ btnGit.addEventListener("click", () => {
 });
 
 // ── View toggle: rendered Markdown ↔ raw source ────────────────────────────
-function toggleViewMode() {
-  if (editingBlockIndex >= 0) exitEditMode();
+async function toggleViewMode() {
+  if (editingBlockIndex >= 0) await exitEditMode();
   viewMode = viewMode === "rendered" ? "source" : "rendered";
   btnViewToggle.classList.toggle("active", viewMode === "source");
   renderBlocks();
@@ -2835,6 +2855,7 @@ document.addEventListener("keydown", (e) => {
     // Let the browser handle the scroll, then check for chunk loading.
     setTimeout(() => {
       if (scrollRenderPending) return;
+      if (editingBlockIndex >= 0 || exitingBlockIndex >= 0) return;
       updateVisibleRange();
       const parsedHeight = cumulativeHeight(syntaxBlocks.length);
       const scrolledBeyondParsed = blockEditor.scrollTop > parsedHeight * 0.9;
