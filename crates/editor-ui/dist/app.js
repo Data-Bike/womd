@@ -612,7 +612,12 @@ function renderAllBlocks() {
 }
 
 /// Estimate total document height in pixels, including unparsed region.
-/// Uses parsedOffset/totalLen ratio to extrapolate from parsed block count.
+/// For lazy loading we deliberately do NOT extrapolate to the full file size:
+/// a huge bottom spacer lets the user scroll far beyond parsed content into
+/// a blank area and makes scrollTop ratio restoration land in empty space.
+/// Instead we add only a small "load more" pad below the parsed content; the
+/// scrollbar grows as more chunks are parsed, which is the standard lazy-load
+/// behavior and keeps the user at the bottom of actually loaded content.
 /// Get the cached height for a block, or the running average estimate.
 function getBlockHeight(i) {
   if (blockHeights[i] > 0) return blockHeights[i];
@@ -660,12 +665,12 @@ function estimateTotalHeight() {
   if (!hasMoreToParse || parsedOffset === 0) {
     return parsedHeight;
   }
-  // Extrapolate: if parsedOffset bytes produced syntaxBlocks.length blocks,
-  // totalLen bytes would produce proportionally more.
-  const ratio = totalLen / parsedOffset;
-  const estimatedTotalBlocks = syntaxBlocks.length * ratio;
-  const avgPerBlock = parsedHeight / syntaxBlocks.length;
-  return parsedHeight + (estimatedTotalBlocks - syntaxBlocks.length) * avgPerBlock;
+  // Add a small pad below the parsed content to give the user something to
+  // scroll into and trigger the next chunk. Don't extrapolate to the full
+  // file size — that creates an unusably long scrollbar and places the user
+  // in empty space while chunks load.
+  const viewportHeight = blockEditor.clientHeight || 600;
+  return parsedHeight + Math.max(viewportHeight * 2, 200);
 }
 
 /// Render only visible blocks with spacers for virtualized scrolling (large documents).
@@ -674,11 +679,12 @@ function estimateTotalHeight() {
 /// Uses cached real block heights for spacer calculations to avoid scroll jumps.
 function renderVirtualizedBlocks() {
   // Save scroll position before clearing (innerHTML resets scrollTop to 0).
-  // Restore by ratio so the user stays at the same relative position after
-  // content height changes (e.g. after parsing a new chunk).
+  // We restore to the same absolute pixel position so the user keeps reading
+  // the same content region. With lazy loading the bottom spacer is now small,
+  // so the absolute value reliably lands inside parsed content after a chunk
+  // parse (rather than far below the new content in a huge spacer).
   const savedScrollTop = blockEditor.scrollTop;
   const savedScrollHeight = blockEditor.scrollHeight || 1;
-  const savedScrollRatio = savedScrollTop / savedScrollHeight;
   blockEditor.innerHTML = "";
   if (syntaxBlocks.length === 0) {
     // Nothing parsed yet. If there is more to parse, show a loading indicator.
@@ -689,7 +695,7 @@ function renderVirtualizedBlocks() {
       loading.style.cssText = "padding:24px;text-align:center;color:var(--fg-muted);font-size:14px";
       blockEditor.appendChild(loading);
     }
-    blockEditor.scrollTop = Math.round(savedScrollRatio * (blockEditor.scrollHeight || 1));
+    blockEditor.scrollTop = savedScrollTop;
     lineGutter.scrollTop = blockEditor.scrollTop;
     return;
   }
@@ -768,9 +774,13 @@ function renderVirtualizedBlocks() {
 
   addTrailingBlock();
 
-  // Restore scroll position by ratio (innerHTML reset it to 0).
-  const newScrollHeight = blockEditor.scrollHeight || 1;
-  blockEditor.scrollTop = Math.round(savedScrollRatio * newScrollHeight);
+  // Restore absolute scroll position (innerHTML reset it to 0).
+  // Clamp to the parsed content so the user isn't dropped into the small bottom
+  // spacer/blank area after a chunk parse.
+  const totalParsedHeight = cumulativeHeight(syntaxBlocks.length);
+  const clientHeight = blockEditor.clientHeight || 600;
+  const maxScrollTop = Math.max(0, totalParsedHeight - clientHeight + 100);
+  blockEditor.scrollTop = Math.max(0, Math.min(savedScrollTop, maxScrollTop));
   lineGutter.scrollTop = blockEditor.scrollTop;
 
   // Measure real block heights after DOM is updated (next frame) to
@@ -944,8 +954,12 @@ async function maybeParseNextChunk() {
   const viewportHeight = blockEditor.clientHeight || 600;
   // Estimate where the parsed content ends in pixels.
   const parsedContentHeight = cumulativeHeight(syntaxBlocks.length);
-  // If user is within 2 viewport heights of the end of parsed content, trigger.
-  if (scrollTop + viewportHeight * 2 < parsedContentHeight) return;
+  // Trigger only when the user has scrolled into the small pad beyond parsed
+  // content. The pad is exactly 2 viewports, so this fires when the viewport
+  // reaches the end of parsed content (scrollTop == parsedContentHeight), not
+  // when the user is still comfortably reading the last blocks. This prevents
+  // recursive auto-loading all chunks while keeping lazy load responsive.
+  if (scrollTop < parsedContentHeight) return;
   chunkParseInProgress = true;
   // Save scroll position before async operations — the await calls below
   // may take time, and the user may scroll further during parsing.
@@ -979,8 +993,8 @@ async function maybeParseNextChunk() {
     });
     blockCount.textContent = `${meta.length} ${t("status.blocks")}`;
     // Re-render to show the newly parsed blocks. renderVirtualizedBlocks
-    // restores the scroll position by ratio so the user stays in the same
-    // relative place after the document grows.
+    // restores the scroll position absolutely and clamps it to the parsed
+    // content so the user keeps reading the same region after the chunk grows.
     renderVirtualizedBlocks();
     // Recursively check if we need more chunks (user might have scrolled very far).
     if (hasMoreToParse && !chunkParseScheduled) {
@@ -1343,7 +1357,7 @@ async function enterEditMode(blockIndex) {
         const viewportHeight = blockEditor.clientHeight || 600;
         const parsedContentHeight = cumulativeHeight(syntaxBlocks.length);
         const needsChunk = hasMoreToParse && !chunkParseInProgress &&
-                           scrollTopNow + viewportHeight * 2 >= parsedContentHeight;
+                           scrollTopNow >= parsedContentHeight;
         if (needsChunk) {
           // maybeParseNextChunk will render after parsing.
           maybeParseNextChunk();
@@ -1386,7 +1400,7 @@ async function enterEditMode(blockIndex) {
           const scrollTopNow = blockEditor.scrollTop || 0;
           const parsedContentHeight = cumulativeHeight(syntaxBlocks.length);
           const needsChunk = hasMoreToParse && !chunkParseInProgress &&
-                             scrollTopNow + viewportHeight * 2 >= parsedContentHeight;
+                             scrollTopNow >= parsedContentHeight;
           if (needsChunk) {
             maybeParseNextChunk();
           } else {
