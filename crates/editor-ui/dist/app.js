@@ -91,6 +91,8 @@ const blockEditor = document.getElementById("block-editor");
 // Uses a larger render window to avoid frequent re-renders during scrolling.
 let scrollRenderPending = false;
 blockEditor.addEventListener("scroll", () => {
+  // Sync line gutter scroll position.
+  lineGutter.scrollTop = blockEditor.scrollTop;
   if (!virtualizedMode) return;
   // If editing a block, exit edit mode first — scrolling away from the edited
   // block should commit the edit and allow normal scroll handling.
@@ -125,6 +127,7 @@ const dirtyIndicator = document.getElementById("dirty-indicator");
 const gitBranchInfo = document.getElementById("git-branch-info");
 const cursorPos = document.getElementById("cursor-pos");
 const blockCount = document.getElementById("block-count");
+const lineGutter = document.getElementById("line-gutter");
 const btnNew = document.getElementById("btn-new");
 const btnOpen = document.getElementById("btn-open");
 const btnSave = document.getElementById("btn-save");
@@ -235,6 +238,7 @@ async function newDocument() {
   updateUI(info);
   await refreshTabs();
   blockHeights = [];
+  gutterLineNumbers = {};
   await refreshSyntax();
   editorFocusFirst();
 }
@@ -250,6 +254,7 @@ async function openDocument(path) {
     await refreshTabs();
     // Clear cached block heights — new document, old heights are invalid.
     blockHeights = [];
+    gutterLineNumbers = {};
     await refreshSyntax();
     refreshGitAll();
     syncDiffTabIfVisible();
@@ -368,6 +373,7 @@ async function switchTab(tabId) {
     activeTabId = info.tab_id;
     updateUI(info);
     blockHeights = [];
+    gutterLineNumbers = {};
     await refreshSyntax();
     await refreshTabs();
     refreshGitAll();
@@ -562,6 +568,7 @@ function renderBlocks() {
     renderVirtualizedBlocks();
   } else {
     renderAllBlocks();
+    updateLineGutter();
   }
 }
 
@@ -701,6 +708,106 @@ function renderVirtualizedBlocks() {
   requestAnimationFrame(() => {
     measureRenderedBlockHeights();
   });
+
+  // Update line number gutter to match the rendered blocks.
+  updateLineGutter();
+}
+
+/// Update the line-number gutter to match the currently rendered blocks.
+/// Fetches line numbers from the backend for the rendered range and displays
+/// them aligned with the block content.
+let gutterLineNumbers = {}; // blockIndex -> line number (cached)
+async function updateLineGutter() {
+  if (!virtualizedMode) {
+    // Small document — count lines from currentText.
+    renderLineGutterSimple();
+    return;
+  }
+  // For virtualized mode, fetch line numbers from backend for rendered range.
+  const start = renderedRange.start;
+  const end = Math.min(renderedRange.end, syntaxBlocks.length - 1);
+  const count = end - start + 1;
+  if (count <= 0) {
+    lineGutter.innerHTML = "";
+    return;
+  }
+  // Check cache — do we have all line numbers for this range?
+  let allCached = true;
+  for (let i = start; i <= end; i++) {
+    if (gutterLineNumbers[i] == null) { allCached = false; break; }
+  }
+  if (allCached) {
+    renderLineGutterFromCache(start, end);
+    return;
+  }
+  // Fetch from backend.
+  try {
+    const nums = await tauriInvoke("get_block_line_numbers", { startIndex: start, count });
+    for (let j = 0; j < nums.length; j++) {
+      gutterLineNumbers[start + j] = nums[j];
+    }
+    renderLineGutterFromCache(start, end);
+  } catch (e) {
+    // Fallback — show block indices as line numbers.
+    renderLineGutterFallback(start, end);
+  }
+}
+
+/// Render gutter from cached line numbers.
+function renderLineGutterFromCache(start, end) {
+  const topHeight = cumulativeHeight(start);
+  let html = `<div style="height:${topHeight}px"></div>`;
+  for (let i = start; i <= end && i < syntaxBlocks.length; i++) {
+    const block = syntaxBlocks[i];
+    if (block.kind === "blank-line" || block.kind === "link-ref-def") {
+      html += `<div class="gutter-line"></div>`;
+    } else {
+      const ln = gutterLineNumbers[i] || (i + 1);
+      html += `<div class="gutter-line">${ln}</div>`;
+    }
+  }
+  lineGutter.innerHTML = html;
+  // Sync gutter scroll with block editor.
+  lineGutter.scrollTop = blockEditor.scrollTop;
+}
+
+/// Render gutter for small documents (non-virtualized).
+function renderLineGutterSimple() {
+  if (!currentText) {
+    lineGutter.innerHTML = "";
+    return;
+  }
+  // Count lines per block.
+  let lineNum = 1;
+  let html = "";
+  for (let i = 0; i < syntaxBlocks.length; i++) {
+    const block = syntaxBlocks[i];
+    if (block.kind === "blank-line" || block.kind === "link-ref-def") {
+      html += `<div class="gutter-line"></div>`;
+      if (block.source) lineNum += block.source.split("\n").length - 1;
+      continue;
+    }
+    html += `<div class="gutter-line">${lineNum}</div>`;
+    if (block.source) lineNum += block.source.split("\n").length;
+  }
+  lineGutter.innerHTML = html;
+  lineGutter.scrollTop = blockEditor.scrollTop;
+}
+
+/// Fallback gutter — show block indices.
+function renderLineGutterFallback(start, end) {
+  const topHeight = cumulativeHeight(start);
+  let html = `<div style="height:${topHeight}px"></div>`;
+  for (let i = start; i <= end && i < syntaxBlocks.length; i++) {
+    const block = syntaxBlocks[i];
+    if (block.kind === "blank-line" || block.kind === "link-ref-def") {
+      html += `<div class="gutter-line"></div>`;
+    } else {
+      html += `<div class="gutter-line">${i + 1}</div>`;
+    }
+  }
+  lineGutter.innerHTML = html;
+  lineGutter.scrollTop = blockEditor.scrollTop;
 }
 
 /// Update visibleRange based on scroll position.
@@ -1087,7 +1194,12 @@ async function enterEditMode(blockIndex) {
   ta.selectionStart = ta.value.length;
   ta.selectionEnd = ta.value.length;
 
+  // Update cursor position display.
+  updateCursorPos(blockIndex, ta);
+
   ta.addEventListener("input", () => autoSizeTextarea(ta));
+  ta.addEventListener("keyup", () => updateCursorPos(blockIndex, ta));
+  ta.addEventListener("click", () => updateCursorPos(blockIndex, ta));
   ta.addEventListener("blur", () => {
     if (suppressBlur) { suppressBlur = false; return; }
     exitEditMode();
@@ -1651,6 +1763,18 @@ function updateUI(info) {
   updateDirtyState();
   blockCount.textContent = `${info.block_count} ${t("status.blocks")}`;
   cursorPos.textContent = `Ln 1, Col 1`;
+}
+
+/// Update the cursor position display (Ln X, Col Y) based on the
+/// textarea selection and the block's starting line number.
+function updateCursorPos(blockIndex, ta) {
+  let line = gutterLineNumbers[blockIndex] || (blockIndex + 1);
+  // Count newlines before cursor position within the textarea.
+  const beforeCursor = ta.value.substring(0, ta.selectionStart);
+  const linesInBlock = beforeCursor.split("\n");
+  line += linesInBlock.length - 1;
+  const col = linesInBlock[linesInBlock.length - 1].length + 1;
+  cursorPos.textContent = `Ln ${line}, Col ${col}`;
 }
 
 function updateDirtyState() {

@@ -282,7 +282,18 @@ body {
 
 /* Main area */
 #main-area { flex: 1; display: flex; overflow: hidden; min-height: 0; }
-#editor-container { flex: 1; overflow: hidden; position: relative; min-width: 200px; }
+#editor-container { flex: 1; overflow: hidden; position: relative; min-width: 200px; display: flex; }
+#line-gutter {
+  width: 48px; min-width: 48px; flex-shrink: 0;
+  overflow: hidden scroll; position: relative;
+  background: var(--bg-tab); border-right: 1px solid var(--border);
+  font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+  font-size: 13px; line-height: 1.7; color: var(--fg-muted);
+  text-align: right; user-select: none; padding: 24px 8px 24px 0;
+  scrollbar-width: none;
+}
+#line-gutter::-webkit-scrollbar { display: none; }
+#line-gutter .gutter-line { height: 1.7em; padding-right: 4px; }
 
 /* File tree sidebar */
 #file-tree-panel { width: 260px; min-width: 180px; max-width: 500px; background: var(--bg-tab); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }

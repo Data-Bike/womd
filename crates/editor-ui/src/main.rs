@@ -720,6 +720,80 @@ fn get_block_data(
     }))
 }
 
+/// Get the starting line number for a block by counting newlines before
+/// the block's start offset. Used for line-number gutter display.
+#[tauri::command]
+fn get_block_line_number(
+    state: tauri::State<'_, Mutex<AppState>>,
+    block_index: usize,
+) -> Result<u32, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab()?;
+    let blocks = &tab.buffer.syntax().blocks;
+    let b = match blocks.get(block_index) {
+        Some(b) => b,
+        None => return Ok(1),
+    };
+    let start = b.meta().span.start.0;
+    // Count newlines in [0, start) to get the line number.
+    let bytes = tab.buffer.serialize_range(0, start);
+    let line = bytes.iter().filter(|&&b| b == b'\n').count() as u32 + 1;
+    Ok(line)
+}
+
+/// Get line numbers for a range of blocks in one call (efficient for
+/// virtualized rendering — avoids N round-trips).
+/// Counts newlines in a single pass over [0, last_block_end) and maps
+/// each block's start offset to its line number.
+#[tauri::command]
+fn get_block_line_numbers(
+    state: tauri::State<'_, Mutex<AppState>>,
+    start_index: usize,
+    count: usize,
+) -> Result<Vec<u32>, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab()?;
+    let blocks = &tab.buffer.syntax().blocks;
+    let end_index = (start_index + count).min(blocks.len());
+    if start_index >= end_index {
+        return Ok(Vec::new());
+    }
+    // Get the end offset of the last block we need — we only need to scan
+    // newlines up to that point, not the entire document.
+    let last_end = blocks[end_index - 1].meta().span.end.0;
+    let bytes = tab.buffer.serialize_range(0, last_end);
+    // Build a sorted list of block start offsets.
+    let offsets: Vec<u64> = (start_index..end_index)
+        .map(|i| blocks[i].meta().span.start.0)
+        .collect();
+    // Single pass: count newlines and record line numbers at each offset.
+    let mut result = vec![1u32; end_index - start_index];
+    let mut line = 1u32;
+    let mut pos = 0u64;
+    let mut idx = 0;
+    for &b in bytes.iter() {
+        if idx < offsets.len() && pos >= offsets[idx] {
+            result[idx] = line;
+            idx += 1;
+            // Skip past any subsequent offsets that are also <= pos.
+            while idx < offsets.len() && pos >= offsets[idx] {
+                result[idx] = line;
+                idx += 1;
+            }
+        }
+        if b == b'\n' {
+            line += 1;
+        }
+        pos += 1;
+    }
+    // Handle any remaining offsets at the end of the scan.
+    while idx < offsets.len() {
+        result[idx] = line;
+        idx += 1;
+    }
+    Ok(result)
+}
+
 /// Get git status for the active document's repository.
 #[tauri::command]
 fn get_git_status(state: tauri::State<'_, Mutex<AppState>>) -> Result<GitStatusInfo, String> {
@@ -2143,6 +2217,8 @@ pub fn run() {
             get_syntax_tree,
             get_syntax_tree_meta,
             get_block_data,
+            get_block_line_number,
+            get_block_line_numbers,
             get_parsed_offset,
             parse_next_chunk,
             get_git_status,
