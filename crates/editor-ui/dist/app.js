@@ -32,15 +32,16 @@ let fileTreeClipboard = null; // { path, isDir, operation: "copy" | "cut" }
 
 // ── Virtualization state ────────────────────────────────────────────────────
 // For large documents, only visible blocks are rendered with full data.
-// blockMeta: lightweight metadata (kind, start, end) for all blocks.
-// blockCache: full block data (source + AST) for loaded blocks, keyed by index.
-// VISIBLE_BUFFER: extra blocks rendered above/below viewport for smooth scrolling.
+// We render a large window (renderWindow) so scrolling doesn't trigger
+// re-renders on every frame. Re-render only when scroll moves outside
+// the rendered window.
 const VIRTUALIZATION_THRESHOLD = 200; // blocks above this use virtualized rendering
-const VISIBLE_BUFFER = 10; // extra blocks above/below viewport
+const RENDER_WINDOW = 100; // blocks to render at once (visible + buffer)
 let blockMeta = [];       // lightweight metadata for all blocks
 let blockCache = new Map(); // index -> full SyntaxBlock (source + AST)
 let virtualizedMode = false;
-let visibleRange = { start: 0, end: 50 }; // currently rendered block range
+let visibleRange = { start: 0, end: 50 }; // currently visible blocks
+let renderedRange = { start: 0, end: 0 }; // currently rendered blocks (>= visibleRange)
 
 // ── Settings state ─────────────────────────────────────────────────────────
 const SETTINGS_KEY = "womd_settings";
@@ -81,6 +82,7 @@ function applyTheme() {
 const blockEditor = document.getElementById("block-editor");
 
 // Virtualized scroll handler — re-renders visible blocks on scroll for large documents.
+// Uses a larger render window to avoid frequent re-renders during scrolling.
 let scrollRenderPending = false;
 blockEditor.addEventListener("scroll", () => {
   if (!virtualizedMode || editingBlockIndex >= 0) return;
@@ -88,12 +90,10 @@ blockEditor.addEventListener("scroll", () => {
   scrollRenderPending = true;
   requestAnimationFrame(() => {
     scrollRenderPending = false;
-    // Check if visible range changed significantly.
-    const prevStart = visibleRange.start;
-    const prevEnd = visibleRange.end;
     updateVisibleRange();
-    if (visibleRange.start !== prevStart || visibleRange.end !== prevEnd) {
-      renderBlocks();
+    // Only re-render if visible range moved outside the rendered window.
+    if (visibleRange.start < renderedRange.start || visibleRange.end > renderedRange.end) {
+      renderVirtualizedBlocks();
     }
   });
 });
@@ -216,16 +216,21 @@ async function newDocument() {
 }
 
 async function openDocument(path) {
-  const info = await tauriInvoke("open_document", { path });
-  currentText = info.text || "";
-  activeTabId = info.tab_id;
-  updateUI(info);
-  await refreshTabs();
-  await refreshSyntax();
-  refreshGitAll();
-  // Sync diff tab if it's currently visible.
-  syncDiffTabIfVisible();
-  editorFocusFirst();
+  // Show loading indicator for large files.
+  blockEditor.innerHTML = `<div style="padding:24px;color:var(--fg-muted);text-align:center"><h2>Loading...</h2><p>Parsing document, please wait.</p></div>`;
+  try {
+    const info = await tauriInvoke("open_document", { path });
+    currentText = info.text || "";
+    activeTabId = info.tab_id;
+    updateUI(info);
+    await refreshTabs();
+    await refreshSyntax();
+    refreshGitAll();
+    syncDiffTabIfVisible();
+    editorFocusFirst();
+  } catch (e) {
+    blockEditor.innerHTML = `<div style="padding:24px;color:#f38ba8"><h2>Failed to open file</h2><p>${escapeHtml(String(e))}</p></div>`;
+  }
 }
 
 async function saveDocument(path) {
@@ -454,8 +459,21 @@ function renderBlocks() {
     blockEditor.classList.add("source-view");
     const pre = document.createElement("div");
     pre.className = "md-source-view";
-    pre.textContent = currentText;
-    blockEditor.appendChild(pre);
+    // For large documents, currentText is empty — load on demand.
+    if (!currentText && virtualizedMode) {
+      pre.textContent = "Loading source text...";
+      blockEditor.appendChild(pre);
+      // Load full text for source view (one-time, user explicitly switched).
+      tauriInvoke("get_document_text").then(text => {
+        currentText = text;
+        pre.textContent = text;
+      }).catch(e => {
+        pre.textContent = "Error loading text: " + String(e);
+      });
+    } else {
+      pre.textContent = currentText;
+      blockEditor.appendChild(pre);
+    }
     return;
   }
   blockEditor.classList.remove("source-view");
@@ -496,19 +514,31 @@ function renderAllBlocks() {
 }
 
 /// Render only visible blocks with spacers for virtualized scrolling (large documents).
-/// A scroll listener updates visibleRange and calls this on scroll.
+/// Renders a large window (RENDER_WINDOW blocks) so scrolling doesn't trigger
+/// re-renders on every frame. Re-render only when scroll moves outside the window.
 function renderVirtualizedBlocks() {
+  blockEditor.innerHTML = "";
   // Compute visible range from scroll position.
   updateVisibleRange();
+
+  // Expand to render window: center the visible range in a larger window.
+  const visibleCount = visibleRange.end - visibleRange.start + 1;
+  const extraAbove = Math.floor((RENDER_WINDOW - visibleCount) / 2);
+  const extraBelow = RENDER_WINDOW - visibleCount - extraAbove;
+  renderedRange = {
+    start: Math.max(0, visibleRange.start - extraAbove),
+    end: Math.min(syntaxBlocks.length - 1, visibleRange.end + extraBelow),
+  };
 
   // Top spacer — occupies the height of skipped blocks above.
   const topSpacer = document.createElement("div");
   topSpacer.className = "md-virtual-spacer";
-  topSpacer.style.height = estimateBlockHeight(visibleRange.start) + "px";
+  topSpacer.id = "md-virtual-top-spacer";
+  topSpacer.style.height = renderedRange.start * 60 + "px";
   blockEditor.appendChild(topSpacer);
 
-  // Render visible blocks (with buffer).
-  for (let i = visibleRange.start; i <= visibleRange.end && i < syntaxBlocks.length; i++) {
+  // Render blocks in the render window.
+  for (let i = renderedRange.start; i <= renderedRange.end && i < syntaxBlocks.length; i++) {
     const block = syntaxBlocks[i];
     if (block.kind === "blank-line") continue;
     if (block.kind === "link-ref-def") continue;
@@ -524,36 +554,24 @@ function renderVirtualizedBlocks() {
   // Bottom spacer — occupies the height of skipped blocks below.
   const bottomSpacer = document.createElement("div");
   bottomSpacer.className = "md-virtual-spacer";
-  const remaining = syntaxBlocks.length - visibleRange.end - 1;
-  bottomSpacer.style.height = estimateBlockHeightFrom(visibleRange.end + 1, remaining) + "px";
+  bottomSpacer.id = "md-virtual-bottom-spacer";
+  const remaining = syntaxBlocks.length - renderedRange.end - 1;
+  bottomSpacer.style.height = remaining * 60 + "px";
   blockEditor.appendChild(bottomSpacer);
 
   addTrailingBlock();
 }
 
-/// Estimate cumulative height of blocks [0, count) for spacer sizing.
-/// Uses a fixed estimate per block since we don't have exact heights without rendering.
-function estimateBlockHeight(count) {
-  // Average block height ~60px (paragraph with some content).
-  return count * 60;
-}
-
-/// Estimate height of `count` blocks starting from index `start`.
-function estimateBlockHeightFrom(start, count) {
-  return count * 60;
-}
-
 /// Update visibleRange based on blockEditor scroll position.
+/// blockEditor is the scroll container (overflow-y: auto in CSS).
 function updateVisibleRange() {
-  const container = blockEditor.parentElement || blockEditor;
-  const scrollTop = container.scrollTop || 0;
-  const viewportHeight = container.clientHeight || window.innerHeight || 600;
-  // Estimate which blocks are visible based on average height.
+  const scrollTop = blockEditor.scrollTop || 0;
+  const viewportHeight = blockEditor.clientHeight || 600;
   const avgHeight = 60;
-  const firstVisible = Math.max(0, Math.floor(scrollTop / avgHeight) - VISIBLE_BUFFER);
+  const firstVisible = Math.max(0, Math.floor(scrollTop / avgHeight) - 5);
   const lastVisible = Math.min(
     syntaxBlocks.length - 1,
-    Math.ceil((scrollTop + viewportHeight) / avgHeight) + VISIBLE_BUFFER
+    Math.ceil((scrollTop + viewportHeight) / avgHeight) + 5
   );
   visibleRange = { start: firstVisible, end: lastVisible };
 }
