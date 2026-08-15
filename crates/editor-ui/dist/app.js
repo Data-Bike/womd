@@ -290,16 +290,34 @@ async function refreshSyntax() {
     // For large documents, fetch only metadata; full block data loaded on demand.
     const meta = await tauriInvoke("get_syntax_tree_meta");
     blockMeta = meta;
+    const wasVirtualized = virtualizedMode;
     virtualizedMode = meta.length > VIRTUALIZATION_THRESHOLD;
     if (virtualizedMode) {
-      // Clear block cache — block data will be loaded for visible blocks.
-      // Don't clear blockHeights — preserving cached heights prevents scroll
-      // jumps when refreshSyntax is called after an edit (sendReplaceBlock).
-      // New/changed blocks will use the default estimate until measured.
-      blockCache.clear();
-      // Build a lightweight syntaxBlocks array with just metadata.
-      // source/node are loaded on demand for visible blocks.
-      syntaxBlocks = meta.map(m => ({ kind: m.kind, source: "", start: m.start, end: m.end, node: null }));
+      // Don't clear blockCache — preserve loaded block data.
+      // Don't clear blockHeights — preserve cached heights.
+      // Only rebuild syntaxBlocks if the block count changed significantly
+      // (e.g. initial load, document open). For edits (sendReplaceBlock),
+      // preserve existing entries and update metadata in-place.
+      if (syntaxBlocks.length === meta.length && wasVirtualized) {
+        // Same block count — update metadata in-place, preserve source/node.
+        for (let i = 0; i < meta.length; i++) {
+          syntaxBlocks[i].kind = meta[i].kind;
+          syntaxBlocks[i].start = meta[i].start;
+          syntaxBlocks[i].end = meta[i].end;
+        }
+      } else {
+        // Block count changed (initial load, new chunk parsed, etc.) —
+        // rebuild but preserve existing entries where possible.
+        const oldBlocks = syntaxBlocks;
+        syntaxBlocks = meta.map((m, i) => {
+          if (i < oldBlocks.length && oldBlocks[i].kind === m.kind &&
+              oldBlocks[i].start === m.start && oldBlocks[i].end === m.end) {
+            // Same block — keep loaded data.
+            return oldBlocks[i];
+          }
+          return { kind: m.kind, source: "", start: m.start, end: m.end, node: null };
+        });
+      }
       // Check if there are more chunks to parse (lazy loading).
       const [parsed, total] = await tauriInvoke("get_parsed_offset");
       parsedOffset = parsed;
