@@ -985,15 +985,15 @@ async function enterEditMode(blockIndex) {
   ta.addEventListener("wheel", (e) => {
     e.preventDefault();
     suppressBlur = false;
-    exitEditMode();
+    const restorePromise = exitEditMode();
     blockEditor.scrollTop += e.deltaY;
-    setTimeout(() => {
+    restorePromise.then(() => {
       if (editingBlockIndex < 0) {
         suppressRender = false;
         renderVirtualizedBlocks();
         maybeParseNextChunk();
       }
-    }, 0);
+    });
   }, { passive: false });
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); exitEditMode(); return; }
@@ -1009,19 +1009,20 @@ async function enterEditMode(blockIndex) {
                         : e.key === "Home" ? -blockEditor.scrollTop
                         : blockEditor.scrollHeight;
       // Force standalone exit — clear suppressBlur so exitEditMode resets
-      // suppressRender synchronously, allowing render in the setTimeout.
+      // suppressRender synchronously.
       suppressBlur = false;
-      exitEditMode();
+      const restorePromise = exitEditMode();
       blockEditor.scrollTop += scrollDelta;
-      // Explicitly render and check chunk loading — the scroll handler
-      // returns early after exitEditMode, so we must trigger rendering here.
-      setTimeout(() => {
+      // Wait for restoreBlockElement to finish (including sendReplaceBlock
+      // → refreshSyntax) before rendering. If we render before, refreshSyntax
+      // will fire later and call renderBlocks() → innerHTML='' → scroll reset.
+      restorePromise.then(() => {
         if (editingBlockIndex < 0) {
           suppressRender = false;
           renderVirtualizedBlocks();
           maybeParseNextChunk();
         }
-      }, 0);
+      });
       return;
     }
     // Shift+Enter = newline in block. Plain Enter for single-line blocks = save.
@@ -1045,7 +1046,7 @@ async function enterEditMode(blockIndex) {
 }
 
 function exitEditMode() {
-  if (editingBlockIndex < 0) return;
+  if (editingBlockIndex < 0) return Promise.resolve();
   const idx = editingBlockIndex;
   editingBlockIndex = -1;
   // If suppressRender is true, it was set by a mousedown handler for a
@@ -1060,19 +1061,22 @@ function exitEditMode() {
   if (suppressRender && !suppressBlur) {
     suppressRender = false;
   }
+  let restorePromise = Promise.resolve();
   const blockEl = blockEditor.querySelector(`[data-block-index="${idx}"]`);
   if (blockEl) {
     const ta = blockEl.querySelector(".md-block-textarea");
     if (ta) {
       const newSource = ta.value;
       // Restore the block element in-place instead of full re-render.
-      restoreBlockElement(idx, blockEl, newSource);
+      // Return the promise so callers can await completion before rendering.
+      restorePromise = restoreBlockElement(idx, blockEl, newSource);
     }
     blockEditor.focus({ preventScroll: true });
   }
   // If suppressRender is still true (transition), don't reset — enterEditMode will.
-  if (suppressRender) return;
+  if (suppressRender) return restorePromise;
   suppressRender = false;
+  return restorePromise;
 }
 
 /// Restore a single block element from textarea back to rendered HTML.
@@ -1100,29 +1104,30 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     return;
   }
   // Source changed — send to backend, then update in-place.
+  // Keep suppressRender=true during sendReplaceBlock → refreshSyntax to
+  // prevent refreshSyntax from calling renderBlocks() (which would do
+  // innerHTML='' and reset scroll). We'll update the block element manually.
   blockEl.classList.remove("editing");
   blockEl.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
+  const wasSuppressRender = suppressRender;
+  suppressRender = true;
   try {
     await sendReplaceBlock(idx, newSource);
     // sendReplaceBlock → refreshSyntax rebuilds syntaxBlocks with empty
     // source/node (virtualized mode). Must reload block data before rendering.
-    if (suppressRender) {
-      // Reload block data — refreshSyntax cleared it.
-      try {
-        const block = await tauriInvoke("get_block_data", { blockIndex: idx });
-        if (block) {
-          blockCache.set(idx, block);
-          syntaxBlocks[idx] = block;
-        }
-      } catch (e) { /* fallback to empty */ }
-      const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
-      if (el) {
-        el.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
-        attachBlockListeners(el, idx);
+    // Reload block data — refreshSyntax cleared it.
+    try {
+      const block = await tauriInvoke("get_block_data", { blockIndex: idx });
+      if (block) {
+        blockCache.set(idx, block);
+        syntaxBlocks[idx] = block;
       }
+    } catch (e) { /* fallback to empty */ }
+    const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
+    if (el) {
+      el.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
+      attachBlockListeners(el, idx);
     }
-    // If suppressRender is false, refreshSyntax → renderBlocks already
-    // re-rendered everything — no manual update needed.
   } catch (e) {
     // Restore original on error — reload block data first.
     try {
@@ -1135,6 +1140,10 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
   }
+  // Restore suppressRender to its previous value — if it was false before
+  // (standalone exit), keep it false so the caller can render. If it was
+  // true (transition), keep it true.
+  suppressRender = wasSuppressRender;
 }
 
 async function commitEdit(newSource) {
