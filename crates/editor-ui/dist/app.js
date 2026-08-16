@@ -93,17 +93,31 @@ const blockEditor = document.getElementById("block-editor");
 // Virtualized scroll handler — re-renders visible blocks on scroll for large documents.
 // Uses a larger render window to avoid frequent re-renders during scrolling.
 let scrollRenderPending = false;
-blockEditor.addEventListener("scroll", async () => {
+// Set to true before changing blockEditor.scrollTop programmatically. The scroll
+// handler will consume the flag and only sync the gutter, not exit edit mode or
+// re-render, preventing the scroll-position restore inside enter/exit edit and
+// renderVirtualizedBlocks from causing a re-entrant edit-exit cycle.
+let ignoreNextScroll = false;
+function setScrollTopNoEvent(el, value) {
+  if (el.scrollTop === value) return;
+  ignoreNextScroll = true;
+  el.scrollTop = value;
+}
+
+blockEditor.addEventListener("scroll", () => {
   // Sync line gutter scroll position.
   lineGutter.scrollTop = blockEditor.scrollTop;
-  if (!virtualizedMode) return;
-  // If editing a block, exit edit mode first and wait — restoreBlockElement is
-  // async and needs to finish before we destroy and recreate all elements via
-  // renderVirtualizedBlocks. The next scroll event will handle rendering.
-  if (editingBlockIndex >= 0) {
-    try { await exitEditMode(); } catch (e) { console.error("scroll exit:", e); }
+  if (ignoreNextScroll) {
+    ignoreNextScroll = false;
     return;
   }
+  if (!virtualizedMode) return;
+  // If editing a block, let the browser scroll freely; don't exit edit mode and
+  // don't re-render while the user is still editing. Destroying/re-creating the
+  // DOM during a scroll causes the erratic jumps and first-line teleportation
+  // reported when switching blocks. The user can finish scrolling and then click
+  // another block or press Escape to exit and re-render.
+  if (editingBlockIndex >= 0) return;
   if (suppressRender) return;
   if (scrollRenderPending) return;
   scrollRenderPending = true;
@@ -704,7 +718,7 @@ function renderVirtualizedBlocks() {
       loading.style.cssText = "padding:24px;text-align:center;color:var(--fg-muted);font-size:14px";
       blockEditor.appendChild(loading);
     }
-    blockEditor.scrollTop = savedScrollTop;
+    setScrollTopNoEvent(blockEditor, savedScrollTop);
     lineGutter.scrollTop = blockEditor.scrollTop;
     return;
   }
@@ -789,7 +803,8 @@ function renderVirtualizedBlocks() {
   const totalParsedHeight = cumulativeHeight(syntaxBlocks.length);
   const clientHeight = blockEditor.clientHeight || 600;
   const maxScrollTop = Math.max(0, totalParsedHeight - clientHeight + 100);
-  blockEditor.scrollTop = Math.max(0, Math.min(savedScrollTop, maxScrollTop));
+  const targetScrollTop = Math.max(0, Math.min(savedScrollTop, maxScrollTop));
+  setScrollTopNoEvent(blockEditor, targetScrollTop);
   lineGutter.scrollTop = blockEditor.scrollTop;
 
   // Measure real block heights after DOM is updated (next frame) to
@@ -1336,7 +1351,7 @@ async function enterEditMode(blockIndex) {
   // some WebView implementations ignore preventScroll and jump to the element.
   const preFocusScrollTop = blockEditor.scrollTop;
   ta.focus({ preventScroll: true });
-  blockEditor.scrollTop = preFocusScrollTop;
+  setScrollTopNoEvent(blockEditor, preFocusScrollTop);
   lineGutter.scrollTop = preFocusScrollTop;
   // Place cursor at end.
   ta.selectionStart = ta.value.length;
@@ -1510,7 +1525,7 @@ function exitEditMode() {
     // Some WebViews ignore preventScroll; capture and restore scrollTop.
     const preFocusScrollTop = blockEditor.scrollTop;
     blockEditor.focus({ preventScroll: true });
-    blockEditor.scrollTop = preFocusScrollTop;
+    setScrollTopNoEvent(blockEditor, preFocusScrollTop);
     lineGutter.scrollTop = preFocusScrollTop;
   }
   // If blockEl wasn't found, nothing to restore; clear the guard.
@@ -1539,7 +1554,7 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     blockEl.classList.remove("editing");
     const savedScroll1 = blockEditor.scrollTop;
     blockEl.innerHTML = `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
-    blockEditor.scrollTop = savedScroll1;
+    setScrollTopNoEvent(blockEditor, savedScroll1);
     const wasSuppressRender = suppressRender;
     suppressRender = true;
     // ALWAYS send to backend — don't skip even if source appears unchanged.
@@ -1560,7 +1575,7 @@ async function restoreBlockElement(idx, blockEl, newSource) {
       const savedScroll2 = blockEditor.scrollTop;
       el.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
       attachBlockListeners(el, idx);
-      blockEditor.scrollTop = savedScroll2;
+      setScrollTopNoEvent(blockEditor, savedScroll2);
     }
     // Restore suppressRender to its previous value.
     suppressRender = wasSuppressRender;
@@ -1577,12 +1592,14 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     const savedScroll3 = blockEditor.scrollTop;
     blockEl.innerHTML = renderBlockHtml(syntaxBlocks[idx]);
     attachBlockListeners(blockEl, idx);
-    blockEditor.scrollTop = savedScroll3;
+    setScrollTopNoEvent(blockEditor, savedScroll3);
   } finally {
     // Clear the exit guard so exitEditMode can run again.
     exitingBlockIndex = -1;
     // Clear the in-flight promise once the restore is done.
     blockRestorePromise = Promise.resolve();
+    // Refresh line numbers for the restored block.
+    updateLineGutter();
     // Cache the block's new height so renderVirtualizedBlocks uses it.
     requestAnimationFrame(() => {
       const el = blockEditor.querySelector(`[data-block-index="${idx}"]`);
