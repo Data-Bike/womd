@@ -190,6 +190,18 @@ async function loadDocument() {
   const isDocChange = props.doc.id !== lastDocId;
   lastDocId = props.doc.id;
   const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
+  const savedClient = viewport.value ? viewport.value.clientHeight : clientHeight.value;
+  // Anchor by the block currently in the middle of the viewport.
+  let anchorIndex = -1;
+  let anchorOffset = 0;
+  if (!isDocChange && blockLayout.value.length) {
+    const mid = savedScroll + savedClient / 2;
+    const found = blockLayout.value.find(b => b.top <= mid && b.top + b.height > mid);
+    if (found) {
+      anchorIndex = found.index;
+      anchorOffset = mid - found.top;
+    }
+  }
   layoutReady.value = false;
   editingBlockIndex.value = -1;
   editingBlockHeight.value = 0;
@@ -212,7 +224,12 @@ async function loadDocument() {
     await nextTick();
     measureHeights();
     await nextTick();
-    setScrollTop(isDocChange ? 0 : savedScroll);
+    let target = isDocChange ? 0 : savedScroll;
+    if (!isDocChange && anchorIndex >= 0 && blockLayout.value[anchorIndex]) {
+      const b = blockLayout.value[anchorIndex];
+      target = Math.max(0, b.top + anchorOffset - savedClient / 2);
+    }
+    setScrollTop(target);
   } catch (e) {
     console.error('loadDocument:', e);
   }
