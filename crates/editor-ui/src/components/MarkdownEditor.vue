@@ -15,7 +15,9 @@
       id="block-editor"
       @scroll.passive="onScroll"
     >
+      <div v-if="!layoutReady" class="md-block-placeholder" style="padding: 24px; text-align: center">Loading blocks…</div>
       <div
+        v-show="layoutReady"
         class="scroll-sizer"
         :style="{ height: `${totalHeight}px` }"
       >
@@ -79,6 +81,7 @@ const scrollTop = ref(0);
 const clientHeight = ref(600);
 let ignoreScroll = 0;
 let loadingVisible = false;
+let lastDocId = null;
 
 const editingBlockIndex = ref(-1);
 const editingBlockHeight = ref(0);
@@ -97,6 +100,7 @@ const RENDER_BUFFER = 300; // px above/below
 
 const blockLayout = ref([]);
 const totalHeight = ref(0);
+const layoutReady = ref(false);
 
 let textareaEl = null;
 
@@ -183,6 +187,10 @@ async function loadDocument() {
     emit('blockCount', 0);
     return;
   }
+  const isDocChange = props.doc.id !== lastDocId;
+  lastDocId = props.doc.id;
+  const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
+  layoutReady.value = false;
   editingBlockIndex.value = -1;
   editingBlockHeight.value = 0;
   blockData.value = new Map();
@@ -196,9 +204,10 @@ async function loadDocument() {
     blocks.value = meta.map((m, i) => ({ index: i, ...m }));
     blockHeights.value = new Array(blocks.value.length).fill(0);
     recomputeLayout();
-    scrollTop.value = 0;
-    if (viewport.value) viewport.value.scrollTop = 0;
-    if (gutter.value) gutter.value.scrollTop = 0;
+    const scroll = isDocChange ? 0 : savedScroll;
+    scrollTop.value = scroll;
+    if (viewport.value) viewport.value.scrollTop = scroll;
+    if (gutter.value) gutter.value.scrollTop = scroll;
     await updateVisibleAndLoad();
     // Ensure block heights settle after the initial paint.
     setTimeout(() => { measureHeights(); onScroll(); }, 50);
@@ -283,6 +292,7 @@ function measureHeights() {
     }
   }
   if (firstChanged < Infinity) recomputeLayout(firstChanged);
+  layoutReady.value = true;
 }
 
 async function maybeParseNextChunk() {

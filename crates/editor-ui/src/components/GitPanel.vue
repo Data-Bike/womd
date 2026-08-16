@@ -533,6 +533,7 @@ async function pushRemote(remote) {
 }
 
 watch(() => [props.visible, props.activeFile], refreshAll, { immediate: true });
+watch(activeTab, (tab) => { if (tab === 'diff') loadDiff(); });
 
 onMounted(refreshAll);
 </script>
