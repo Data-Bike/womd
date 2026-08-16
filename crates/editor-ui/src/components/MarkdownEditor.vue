@@ -82,6 +82,7 @@ const clientHeight = ref(600);
 let ignoreScroll = 0;
 let loadingVisible = false;
 let lastDocId = null;
+let anchorAfterEdit = -1;
 
 const editingBlockIndex = ref(-1);
 const editingBlockHeight = ref(0);
@@ -137,6 +138,42 @@ function recomputeLayout(startIdx = 0) {
   const pad = hasMoreToParse.value ? clientHeight.value * 2 : 0;
   totalHeight.value = top + pad;
   emit('blockCount', blocks.value.length);
+}
+
+// Merge new block metadata while preserving cached data/heights for unchanged blocks.
+// Returns the first index whose meta or cached data changed.
+function syncBlockState(newMeta) {
+  const oldData = blockData.value;
+  const oldHeights = blockHeights.value;
+  const oldBlocks = blocks.value;
+  const keyToData = new Map();
+  for (let i = 0; i < oldBlocks.length; i++) {
+    const b = oldBlocks[i];
+    const key = `${b.kind}:${b.start}:${b.end}`;
+    if (oldData.has(i) && !keyToData.has(key)) {
+      keyToData.set(key, { data: oldData.get(i), height: oldHeights[i] });
+    }
+  }
+  const newBlocks = newMeta.map((m, i) => ({ index: i, ...m }));
+  const newData = new Map();
+  const newHeights = new Array(newBlocks.length).fill(0);
+  let firstChanged = Infinity;
+  for (let i = 0; i < newBlocks.length; i++) {
+    const b = newBlocks[i];
+    const key = `${b.kind}:${b.start}:${b.end}`;
+    const kept = keyToData.get(key);
+    if (kept) {
+      newData.set(i, kept.data);
+      newHeights[i] = kept.height;
+    } else {
+      firstChanged = Math.min(firstChanged, i);
+    }
+  }
+  blocks.value = newBlocks;
+  blockData.value = newData;
+  blockHeights.value = newHeights;
+  recomputeLayout(firstChanged < Infinity ? firstChanged : 0);
+  return firstChanged;
 }
 
 function getBlockHeight(i) {
@@ -252,6 +289,18 @@ function setScrollTop(value) {
   ignoreScroll++;
   viewport.value.scrollTop = value;
   scrollTop.value = value;
+}
+
+function restoreScroll(savedScroll) {
+  if (!viewport.value) return;
+  const ch = viewport.value.clientHeight || clientHeight.value;
+  let target = savedScroll;
+  if (anchorAfterEdit >= 0 && blockLayout.value[anchorAfterEdit]) {
+    const b = blockLayout.value[anchorAfterEdit];
+    target = Math.max(0, b.top - ch / 4);
+    anchorAfterEdit = -1;
+  }
+  setScrollTop(target);
 }
 
 let scrollRaf = 0;
@@ -413,15 +462,8 @@ async function exitEdit(force) {
     try {
       await invoke('replace_block', { blockIndex: index, newSource: editSource.value });
       const meta = await invoke('get_syntax_tree_meta');
-      blocks.value = meta.map((m, i) => {
-        const oldMeta = blocks.value[i];
-        if (oldMeta && oldMeta.kind === m.kind && oldMeta.start === m.start && oldMeta.end === m.end) {
-          return { ...oldMeta, ...m };
-        }
-        return { index: i, ...m };
-      });
-      blockHeights.value = new Array(blocks.value.length).fill(0);
-      recomputeLayout();
+      anchorAfterEdit = index;
+      syncBlockState(meta);
       const data = await invoke('get_block_data', { blockIndex: index });
       if (data) blockData.value.set(index, data);
       if (changed) emit('dirty', true);
@@ -437,8 +479,12 @@ async function exitEdit(force) {
   editOriginal.value = '';
   textareaEl = null;
   nextTick(() => {
-    measureHeights();
-    setScrollTop(savedScroll);
+    updateVisibleAndLoad().then(() => {
+      nextTick(() => requestAnimationFrame(() => {
+        measureHeights();
+        restoreScroll(savedScroll);
+      }));
+    });
   });
 }
 
@@ -530,9 +576,19 @@ async function getBlockSource(index) {
 
 async function replaceBlockSource(index, newSource) {
   try {
+    const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
     await invoke('replace_block', { blockIndex: index, newSource });
     emit('dirty', true);
-    await loadDocument();
+    const meta = await invoke('get_syntax_tree_meta');
+    anchorAfterEdit = index;
+    syncBlockState(meta);
+    const data = await invoke('get_block_data', { blockIndex: index });
+    if (data) blockData.value.set(index, data);
+    await updateVisibleAndLoad();
+    nextTick(() => requestAnimationFrame(() => {
+      measureHeights();
+      restoreScroll(savedScroll);
+    }));
   } catch (e) {
     console.error('replaceBlockSource:', e);
   }
