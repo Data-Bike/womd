@@ -174,7 +174,7 @@ async function loadBlockData(index) {
   if (loadingBlockIndex.value === index || editingBlockIndex.value === index) return;
   if (blockData.value.has(index)) return;
   try {
-    const data = await invoke('get_block_data', { block_index: index });
+    const data = await invoke('get_block_data', { blockIndex: index });
     if (data) {
       blockData.value.set(index, data);
       blockHeights.value[index] = 0; // re-measure
@@ -265,7 +265,7 @@ async function enterEdit(index) {
   if (!data) {
     loadingBlockIndex.value = index;
     try {
-      data = await invoke('get_block_data', { block_index: index });
+      data = await invoke('get_block_data', { blockIndex: index });
       if (data) blockData.value.set(index, data);
     } catch (e) {
       console.error('enterEdit get_block_data:', e);
@@ -292,7 +292,7 @@ async function exitEdit(force) {
 
   if (changed || force) {
     try {
-      await invoke('replace_block', { block_index: index, new_source: editSource.value });
+      await invoke('replace_block', { blockIndex: index, newSource: editSource.value });
       // Refresh block list and reload this block.
       const meta = await invoke('get_syntax_tree_meta');
       blocks.value = meta.map((m, i) => {
@@ -304,7 +304,7 @@ async function exitEdit(force) {
       });
       blockHeights.value = new Array(blocks.value.length).fill(0);
       recomputeLayout();
-      const data = await invoke('get_block_data', { block_index: index });
+      const data = await invoke('get_block_data', { blockIndex: index });
       if (data) blockData.value.set(index, data);
       if (changed) emit('dirty', true);
     } catch (e) {
