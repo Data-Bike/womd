@@ -1,5 +1,6 @@
 // WoMD editor — block-based WYSIWYG with click-to-edit source.
 // Rendered Markdown by default; click a block to edit its raw source.
+// Build: 8cfc9fa
 
 // ── Tauri API ───────────────────────────────────────────────────────────────
 function tauriInvoke(cmd, args) {
