@@ -21,11 +21,11 @@
         >
           <template v-if="editingBlockIndex === b.index">
             <textarea
-              ref="textarea"
+              :ref="(el) => { if (el) textarea.value = el; }"
               v-model="editSource"
               class="md-block-textarea"
               spellcheck="false"
-              @input="autoSize"
+              @input="autoSize($event.target)"
               @blur="exitEdit(false)"
               @keydown="onKeydown"
             />
@@ -62,8 +62,10 @@ const chunkParsing = ref(false);
 
 const scrollTop = ref(0);
 const clientHeight = ref(600);
+let ignoreScroll = 0;
 
 const editingBlockIndex = ref(-1);
+const editingBlockHeight = ref(0);
 const editSource = ref('');
 const editOriginal = ref('');
 const loadingBlockIndex = ref(-1);
@@ -100,6 +102,9 @@ function recomputeLayout() {
 }
 
 function getBlockHeight(i) {
+  if (editingBlockIndex.value === i && editingBlockHeight.value > 0) {
+    return editingBlockHeight.value;
+  }
   const h = blockHeights.value[i];
   if (h > 0) return h;
   const b = blocks.value[i];
@@ -144,11 +149,20 @@ async function loadDocument() {
 watch(() => props.doc?.id, loadDocument, { immediate: true });
 
 function onScroll() {
+  if (ignoreScroll > 0) { ignoreScroll--; return; }
   if (suppressScroll.value || !viewport.value) return;
   scrollTop.value = viewport.value.scrollTop;
   if (gutter.value) gutter.value.scrollTop = scrollTop.value;
   updateVisibleAndLoad();
   maybeParseNextChunk();
+}
+
+function setScrollTop(value) {
+  if (!viewport.value) return;
+  if (viewport.value.scrollTop === value) return;
+  ignoreScroll++;
+  viewport.value.scrollTop = value;
+  scrollTop.value = value;
 }
 
 let scrollRaf = 0;
@@ -275,12 +289,20 @@ async function enterEdit(index) {
   }
   if (!data) return;
 
+  const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
   editingBlockIndex.value = index;
   editSource.value = data.source || '';
   editOriginal.value = editSource.value;
   nextTick(() => {
-    autoSize();
-    textarea.value?.focus({ preventScroll: true });
+    let el = textarea.value;
+    if (!el && viewport.value) el = viewport.value.querySelector('textarea');
+    if (el) {
+      autoSize(el);
+      el.focus({ preventScroll: true });
+    }
+    // Replacing the rendered block with a textarea changes the block height and
+    // can shift scrollTop. Restore the scroll position from before the edit.
+    setScrollTop(savedScroll);
   });
 }
 
@@ -312,10 +334,16 @@ async function exitEdit(force) {
     }
   }
 
+  const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
   editingBlockIndex.value = -1;
+  editingBlockHeight.value = 0;
   editSource.value = '';
   editOriginal.value = '';
-  nextTick(measureHeights);
+  nextTick(() => {
+    measureHeights();
+    // Restoring the rendered block can change the layout; keep the user's scroll.
+    setScrollTop(savedScroll);
+  });
 }
 
 function onKeydown(e) {
@@ -331,11 +359,19 @@ function onKeydown(e) {
   }
 }
 
-function autoSize() {
-  if (!textarea.value) return;
-  const el = textarea.value;
+function autoSize(el) {
+  if (!el) el = textarea.value;
+  if (!el && viewport.value) el = viewport.value.querySelector('textarea');
+  if (!el) return;
   el.style.height = 'auto';
   el.style.height = `${el.scrollHeight}px`;
+  if (editingBlockIndex.value >= 0) {
+    const oldHeight = editingBlockHeight.value;
+    editingBlockHeight.value = el.scrollHeight;
+    if (editingBlockHeight.value !== oldHeight) {
+      recomputeLayout();
+    }
+  }
 }
 
 onMounted(() => {
