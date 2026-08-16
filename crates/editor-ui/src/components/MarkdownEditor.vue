@@ -470,6 +470,80 @@ function getActiveTextarea() {
   return viewport.value?.querySelector('textarea.md-block-textarea') || null;
 }
 
+function findBlockFromSelection() {
+  const sel = window.getSelection();
+  if (!sel?.rangeCount) return null;
+  let node = sel.anchorNode;
+  while (node && node !== viewport.value) {
+    if (node.nodeType === 1 && node.classList?.contains('md-block')) {
+      const idx = node.dataset?.blockIndex;
+      if (idx != null) return { el: node, index: parseInt(idx, 10) };
+    }
+    node = node.parentNode;
+  }
+  return null;
+}
+
+async function getBlockSource(index) {
+  let data = blockData.value.get(index);
+  if (!data) {
+    try {
+      data = await invoke('get_block_data', { blockIndex: index });
+      if (data) blockData.value.set(index, data);
+    } catch (e) {
+      console.error('getBlockSource:', e);
+    }
+  }
+  return data?.source || '';
+}
+
+async function replaceBlockSource(index, newSource) {
+  try {
+    await invoke('replace_block', { blockIndex: index, newSource });
+    emit('dirty', true);
+    await loadDocument();
+  } catch (e) {
+    console.error('replaceBlockSource:', e);
+  }
+}
+
+// Find a plain-text string in Markdown source, returning {start, end} byte offsets.
+function findPlainTextInSource(source, plainText) {
+  const markers = ['**', '__', '*', '_', '~~', '`'];
+  let i = 0;
+  let plain = '';
+  const sourcePos = [];
+  while (i < source.length) {
+    let matched = false;
+    for (const m of markers) {
+      if (source.substring(i, i + m.length) === m) {
+        i += m.length;
+        matched = true;
+        break;
+      }
+    }
+    if (matched) continue;
+    if (source[i] === '[' || source[i] === ']' || source[i] === '(' || source[i] === ')') {
+      if (source[i] === ']' && i + 1 < source.length && source[i + 1] === '(') {
+        i++;
+        if (source[i] === '(') i++;
+        while (i < source.length && source[i] !== ')') i++;
+        if (i < source.length) i++;
+        continue;
+      }
+      if (source[i] === '[' || source[i] === '!') { i++; continue; }
+      i++;
+      continue;
+    }
+    sourcePos.push(i);
+    plain += source[i];
+    i++;
+  }
+  const idx = plain.indexOf(plainText);
+  if (idx < 0) return null;
+  return { start: sourcePos[idx], end: sourcePos[idx + plainText.length - 1] + 1 };
+}
+
 function toggleWrap(ta, prefix, suffix) {
   if (!ta) return;
   const start = ta.selectionStart;
@@ -610,48 +684,103 @@ async function insertCodeBlock() {
   }
 }
 
-function applyInlineFormat(prefix, suffix) {
-  if (editingBlockIndex.value < 0) {
-    console.warn('No active block to format');
+async function applyInlineFormat(prefix, suffix) {
+  const ta = getActiveTextarea();
+  if (ta) {
+    toggleWrap(ta, prefix, suffix || prefix);
     return;
   }
-  const ta = getActiveTextarea();
-  if (!ta) return;
-  toggleWrap(ta, prefix, suffix || prefix);
-}
-
-function applyLineFormat(prefix) {
-  if (editingBlockIndex.value < 0) {
-    console.warn('No active block to format');
+  const sel = window.getSelection();
+  if (!sel?.rangeCount || sel.isCollapsed) return;
+  const selectedText = sel.toString().trim();
+  if (!selectedText) return;
+  const found = findBlockFromSelection();
+  if (!found) return;
+  const source = await getBlockSource(found.index);
+  if (!source) return;
+  const result = findPlainTextInSource(source, selectedText);
+  if (!result) {
+    await enterEdit(found.index);
     return;
   }
-  const ta = getActiveTextarea();
-  if (!ta) return;
-  toggleLinePrefix(ta, prefix);
+  const suf = suffix || prefix;
+  const before = source.substring(Math.max(0, result.start - prefix.length), result.start);
+  const after = source.substring(result.end, result.end + suf.length);
+  let newSource;
+  if (before === prefix && after === suf) {
+    newSource = source.substring(0, result.start - prefix.length) +
+      source.substring(result.start, result.end) +
+      source.substring(result.end + suf.length);
+  } else {
+    newSource = source.substring(0, result.start) +
+      prefix + source.substring(result.start, result.end) + suf +
+      source.substring(result.end);
+  }
+  await replaceBlockSource(found.index, newSource);
 }
 
-function applyHeading(level) {
-  if (editingBlockIndex.value < 0) {
-    console.warn('No active block to format');
+async function applyLineFormat(prefix) {
+  const ta = getActiveTextarea();
+  if (ta) {
+    toggleLinePrefix(ta, prefix);
     return;
   }
-  const ta = getActiveTextarea();
-  if (!ta) return;
-  toggleHeadingInTextarea(ta, level);
+  const found = findBlockFromSelection();
+  if (!found) return;
+  const source = await getBlockSource(found.index);
+  if (!source) return;
+  const lines = source.split('\n');
+  const allPrefixed = lines.every(line => line.startsWith(prefix));
+  const newSource = allPrefixed
+    ? lines.map(line => line.slice(prefix.length)).join('\n')
+    : lines.map(line => (line ? prefix + line : '')).join('\n');
+  await replaceBlockSource(found.index, newSource);
 }
 
-function applyLink() {
-  if (editingBlockIndex.value < 0) {
-    console.warn('No active block to format');
+async function applyHeading(level) {
+  const ta = getActiveTextarea();
+  if (ta) {
+    toggleHeadingInTextarea(ta, level);
     return;
   }
-  const ta = getActiveTextarea();
-  if (!ta) return;
-  insertLinkInTextarea(ta);
+  const found = findBlockFromSelection();
+  if (!found) return;
+  const source = await getBlockSource(found.index);
+  if (!source) return;
+  const stripped = source
+    .replace(/^#{1,6}\s+/, '')
+    .replace(/^={2,}\s*$\n?/m, '')
+    .replace(/^-{2,}\s*$\n?/m, '');
+  const prefix = level > 0 ? '#'.repeat(level) + ' ' : '';
+  await replaceBlockSource(found.index, prefix + stripped);
 }
 
-function toggleTask() {
-  applyLineFormat('- [ ] ');
+async function applyLink() {
+  const ta = getActiveTextarea();
+  if (ta) {
+    insertLinkInTextarea(ta);
+    return;
+  }
+  const sel = window.getSelection();
+  if (!sel?.rangeCount || sel.isCollapsed) return;
+  const selectedText = sel.toString().trim();
+  if (!selectedText) return;
+  const url = prompt('URL:', 'https://');
+  if (!url) return;
+  const found = findBlockFromSelection();
+  if (!found) return;
+  const source = await getBlockSource(found.index);
+  if (!source) return;
+  const result = findPlainTextInSource(source, selectedText);
+  if (!result) return;
+  const newSource = source.substring(0, result.start) +
+    `[${source.substring(result.start, result.end)}](${url})` +
+    source.substring(result.end);
+  await replaceBlockSource(found.index, newSource);
+}
+
+async function toggleTask() {
+  await applyLineFormat('- [ ] ');
 }
 
 function focusFirst() {

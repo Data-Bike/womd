@@ -255,17 +255,17 @@ async function closeTab(tabId) {
   }
 }
 
-function applyHeading(level) {
-  editorRef.value?.applyHeading?.(level);
+async function applyHeading(level) {
+  await editorRef.value?.applyHeading?.(level);
 }
-function applyInlineFormat(prefix, suffix) {
-  editorRef.value?.applyInlineFormat?.(prefix, suffix || prefix);
+async function applyInlineFormat(prefix, suffix) {
+  await editorRef.value?.applyInlineFormat?.(prefix, suffix || prefix);
 }
-function applyLineFormat(prefix) {
-  editorRef.value?.applyLineFormat?.(prefix);
+async function applyLineFormat(prefix) {
+  await editorRef.value?.applyLineFormat?.(prefix);
 }
-function applyLink() {
-  editorRef.value?.applyLink?.();
+async function applyLink() {
+  await editorRef.value?.applyLink?.();
 }
 function insertHr() {
   editorRef.value?.insertThematicBreak?.();
