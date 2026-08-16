@@ -211,6 +211,7 @@ async function loadDocument() {
     await new Promise(r => requestAnimationFrame(r));
     await nextTick();
     measureHeights();
+    await nextTick();
     setScrollTop(isDocChange ? 0 : savedScroll);
   } catch (e) {
     console.error('loadDocument:', e);
