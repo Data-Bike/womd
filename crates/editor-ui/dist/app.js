@@ -1,6 +1,6 @@
 // WoMD editor — block-based WYSIWYG with click-to-edit source.
 // Rendered Markdown by default; click a block to edit its raw source.
-// Build: 8cfc9fa
+// Build: perblock
 
 // ── Tauri API ───────────────────────────────────────────────────────────────
 function tauriInvoke(cmd, args) {
@@ -660,11 +660,23 @@ function renderAllBlocks() {
 /// Instead we add only a small "load more" pad below the parsed content; the
 /// scrollbar grows as more chunks are parsed, which is the standard lazy-load
 /// behavior and keeps the user at the bottom of actually loaded content.
-/// Get the cached height for a block, or the running average estimate.
+/// Get the cached height for a block, or a per-block span-based estimate.
+/// The old running average was the root cause of first-line teleportation:
+/// if only small blocks at the top had been measured, the average was tiny,
+/// so tall unparsed code blocks at the bottom got a tiny estimated height and
+/// cumulativeHeight(syntaxBlocks.length) became far too small. When the user
+/// scrolled into the bottom pad, scrollTop exceeded this underestimated total,
+/// updateVisibleRange clamped firstVisible to 0, and renderVirtualizedBlocks
+/// drew the first blocks while scrollTop was clamped to 0 — teleport to top.
+/// Using the block's own byte span with an approximate chars/line and line
+/// height gives a much safer lower bound for tall blocks and short blocks.
 function getBlockHeight(i) {
   if (blockHeights[i] > 0) return blockHeights[i];
-  if (measuredBlockCount > 0) return Math.round(measuredBlockHeightsSum / measuredBlockCount);
-  return AVG_BLOCK_HEIGHT;
+  const block = syntaxBlocks[i];
+  if (!block) return AVG_BLOCK_HEIGHT;
+  const span = Math.max(0, (block.end || 0) - (block.start || 0));
+  // Approximate: 45 chars per visual line, 20 px per line, minimum 60 px.
+  return Math.max(AVG_BLOCK_HEIGHT, Math.round((span / 45) * 20));
 }
 
 /// Measure and cache the real heights of rendered blocks after they are in the DOM.
