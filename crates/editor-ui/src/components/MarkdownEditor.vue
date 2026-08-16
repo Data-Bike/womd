@@ -21,7 +21,7 @@
         >
           <template v-if="editingBlockIndex === b.index">
             <textarea
-              :ref="(el) => { if (el) textarea.value = el; }"
+              :ref="(el) => { if (el) editTextarea.value = el; }"
               v-model="editSource"
               class="md-block-textarea"
               spellcheck="false"
@@ -50,7 +50,7 @@ const emit = defineEmits(['dirty']);
 
 const viewport = ref(null);
 const gutter = ref(null);
-const textarea = ref(null);
+const editTextarea = ref(null);
 
 const blocks = ref([]); // meta: { index, kind, start, end }
 const blockData = ref(new Map()); // index -> { source, node, ... }
@@ -294,10 +294,10 @@ async function enterEdit(index) {
   editSource.value = data.source || '';
   editOriginal.value = editSource.value;
   nextTick(() => {
-    let el = textarea.value;
-    if ((!el || !el.isConnected) && viewport.value) el = viewport.value.querySelector('textarea');
+    let el = editTextarea.value;
+    if ((!el || !el.isConnected) && viewport.value) el = viewport.value.querySelector('textarea.md-block-textarea');
     if (el && el.isConnected) {
-      textarea.value = el;
+      editTextarea.value = el;
       autoSize(el);
       el.focus({ preventScroll: true });
     }
@@ -361,9 +361,9 @@ function onKeydown(e) {
 }
 
 function autoSize(el) {
-  if (!el) el = textarea.value;
+  if (!el) el = editTextarea.value;
   if (!el || !el.isConnected) {
-    if (viewport.value) el = viewport.value.querySelector('textarea');
+    if (viewport.value) el = viewport.value.querySelector('textarea.md-block-textarea');
   }
   if (!el || !el.isConnected) return;
   el.style.height = 'auto';
