@@ -104,7 +104,7 @@ function setScrollTopNoEvent(el, value) {
   el.scrollTop = value;
 }
 
-blockEditor.addEventListener("scroll", () => {
+blockEditor.addEventListener("scroll", async () => {
   // Sync line gutter scroll position.
   lineGutter.scrollTop = blockEditor.scrollTop;
   if (ignoreNextScroll) {
@@ -112,12 +112,32 @@ blockEditor.addEventListener("scroll", () => {
     return;
   }
   if (!virtualizedMode) return;
-  // If editing a block, let the browser scroll freely; don't exit edit mode and
-  // don't re-render while the user is still editing. Destroying/re-creating the
-  // DOM during a scroll causes the erratic jumps and first-line teleportation
-  // reported when switching blocks. The user can finish scrolling and then click
-  // another block or press Escape to exit and re-render.
-  if (editingBlockIndex >= 0) return;
+  // If editing a block, exit edit mode and then re-render. While the user is
+  // actively scrolling, restoreBlockElement's internal scrollTop sets are
+  // wrapped with setScrollTopNoEvent so they don't trigger re-entrant scroll
+  // events. renderVirtualizedBlocks then draws the correct window for the new
+  // position and measures block heights, which prevents the first-line teleport
+  // caused by stale cumulativeHeight estimates.
+  if (editingBlockIndex >= 0) {
+    try { await exitEditMode(); } catch (e) { console.error("scroll exit:", e); }
+    if (suppressRender) return;
+    if (scrollRenderPending) return;
+    scrollRenderPending = true;
+    requestAnimationFrame(() => {
+      scrollRenderPending = false;
+      if (suppressRender) return;
+      const prevStart = renderedRange.start;
+      const prevEnd = renderedRange.end;
+      updateVisibleRange();
+      const parsedHeight = cumulativeHeight(syntaxBlocks.length);
+      const scrolledBeyondParsed = blockEditor.scrollTop > parsedHeight * 0.9;
+      if (visibleRange.start < prevStart || visibleRange.end > prevEnd || scrolledBeyondParsed) {
+        renderVirtualizedBlocks();
+      }
+      maybeParseNextChunk();
+    });
+    return;
+  }
   if (suppressRender) return;
   if (scrollRenderPending) return;
   scrollRenderPending = true;
