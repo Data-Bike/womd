@@ -336,7 +336,8 @@ function startGitResize(e) {
   const startX = e.clientX;
   const startWidth = gitWidth.value;
   function onMove(ev) {
-    gitWidth.value = Math.max(250, Math.min(800, startWidth + ev.clientX - startX));
+    // Git panel is on the right; dragging the divider left makes it wider.
+    gitWidth.value = Math.max(250, Math.min(800, startWidth + startX - ev.clientX));
   }
   function onUp() {
     window.removeEventListener('mousemove', onMove);

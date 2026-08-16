@@ -143,9 +143,15 @@
             <option value="commit">Working tree vs commit</option>
             <option value="commits">Between two commits</option>
           </select>
-          <input v-if="diffMode === 'commit'" v-model="diffCommit" placeholder="Commit SHA" />
-          <input v-if="diffMode === 'commits'" v-model="diffCommitA" placeholder="From SHA" />
-          <input v-if="diffMode === 'commits'" v-model="diffCommitB" placeholder="To SHA" />
+          <select v-if="diffMode === 'commit'" v-model="diffCommit">
+            <option v-for="c in log" :key="c.sha" :value="c.sha">{{ c.sha.substring(0,8) }} — {{ c.message }}</option>
+          </select>
+          <select v-if="diffMode === 'commits'" v-model="diffCommitA">
+            <option v-for="c in log" :key="'a-'+c.sha" :value="c.sha">{{ c.sha.substring(0,8) }} — {{ c.message }}</option>
+          </select>
+          <select v-if="diffMode === 'commits'" v-model="diffCommitB">
+            <option v-for="c in log" :key="'b-'+c.sha" :value="c.sha">{{ c.sha.substring(0,8) }} — {{ c.message }}</option>
+          </select>
           <button class="git-action-btn" @click="loadDiff">Load diff</button>
         </div>
         <div

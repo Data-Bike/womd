@@ -158,7 +158,7 @@ const visibleBlocks = computed(() => {
 });
 
 async function loadSourceView() {
-  if (props.currentViewMode !== 'source') return;
+  if (currentViewMode.value !== 'source') return;
   sourceLoading.value = true;
   try {
     sourceText.value = await invoke('get_document_text');
@@ -171,7 +171,7 @@ async function loadSourceView() {
 }
 
 async function loadDocument() {
-  if (props.currentViewMode === 'source') {
+  if (currentViewMode.value === 'source') {
     await loadSourceView();
     return;
   }
@@ -183,6 +183,10 @@ async function loadDocument() {
     emit('blockCount', 0);
     return;
   }
+  editingBlockIndex.value = -1;
+  editingBlockHeight.value = 0;
+  blockData.value = new Map();
+  blockHeights.value = [];
   try {
     const meta = await invoke('get_syntax_tree_meta');
     const [off, total] = await invoke('get_parsed_offset');
@@ -201,7 +205,7 @@ async function loadDocument() {
   }
 }
 
-watch(() => [props.doc?.id, props.currentViewMode], loadDocument, { immediate: true });
+watch(() => [props.doc?.id, currentViewMode.value], loadDocument, { immediate: true });
 
 function onScroll() {
   if (ignoreScroll > 0) { ignoreScroll--; return; }
@@ -462,7 +466,8 @@ function updateCursorFromTextarea() {
 
 function getActiveTextarea() {
   if (editingBlockIndex.value < 0) return null;
-  return textareaEl;
+  if (textareaEl && textareaEl.isConnected) return textareaEl;
+  return viewport.value?.querySelector('textarea.md-block-textarea') || null;
 }
 
 function toggleWrap(ta, prefix, suffix) {
