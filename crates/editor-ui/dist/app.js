@@ -1,6 +1,6 @@
 // WoMD editor — block-based WYSIWYG with click-to-edit source.
 // Rendered Markdown by default; click a block to edit its raw source.
-// Build: perblock
+// Build: safe-edit
 
 // ── Tauri API ───────────────────────────────────────────────────────────────
 function tauriInvoke(cmd, args) {
@@ -23,6 +23,11 @@ let openTabs = [];
 let gitPanelVisible = false;
 let gitData = { status: null, branches: [], diff: [], log: [] };
 let editingBlockIndex = -1;
+// Index of a block whose data is being loaded before we commit to editing it.
+let enteringBlockIndex = -1;
+// Source text that was in the textarea when edit started. Used to skip no-op
+// saves and avoid overwriting fresh backend content with stale cached source.
+let editOriginalSource = null;
 let suppressRender = false;
 let suppressBlur = false;  // prevent exitEditMode when clicking toolbar buttons
 let isTearOffWindow = false; // true for torn-off windows — show only their own tab
@@ -1313,6 +1318,11 @@ function joinPath(dir, name) {
 async function enterEditMode(blockIndex) {
   // Already editing this exact block — nothing to do (preserve selection/cursor).
   if (editingBlockIndex === blockIndex) return;
+  // If another block is being entered (data loading), cancel it. This prevents
+  // a stale load from creating a textarea after the user clicked elsewhere.
+  if (enteringBlockIndex >= 0) {
+    enteringBlockIndex = -1;
+  }
   // If already editing another block, exit it first and wait.
   // Awaiting ensures the old block is restored before we destroy it.
   if (editingBlockIndex >= 0) {
@@ -1331,11 +1341,12 @@ async function enterEditMode(blockIndex) {
     return;
   }
 
-  // Set editingBlockIndex BEFORE any await — during the async get_block_data
-  // call, scroll events or other handlers might fire. If editingBlockIndex
-  // is still -1, the scroll handler would call renderVirtualizedBlocks()
-  // which does innerHTML='' and resets scroll.
-  editingBlockIndex = blockIndex;
+  // Mark that we are loading data for this block, but do NOT set
+  // editingBlockIndex yet. If the user scrolls, clicks another block, or
+  // otherwise interrupts during the async load, exitEditMode will see
+  // editingBlockIndex === -1 and will not try to save an empty/unloaded
+  // textarea. This prevents file corruption.
+  enteringBlockIndex = blockIndex;
   suppressRender = true;
 
   // In virtualized mode, ensure block data is loaded before editing.
@@ -1351,22 +1362,32 @@ async function enterEditMode(blockIndex) {
     }
   }
 
-  // If another edit was initiated during the async load, abort.
-  if (editingBlockIndex >= 0 && editingBlockIndex !== blockIndex) {
-    suppressRender = false;
-    suppressBlur = false;
+  // If the user interrupted (scrolled, clicked another block, etc.) while we
+  // were loading, do not enter edit mode and do not create a textarea.
+  if (enteringBlockIndex !== blockIndex) {
+    if (editingBlockIndex < 0) {
+      suppressRender = false;
+      suppressBlur = false;
+    }
     return;
   }
 
   const blockEl = blockEditor.querySelector(`[data-block-index="${blockIndex}"]`);
   if (!blockEl) {
+    enteringBlockIndex = -1;
     editingBlockIndex = -1;
     suppressBlur = false;
     suppressRender = false;
     return;
   }
 
+  // Now we are actually editing. Record the original source so exitEditMode
+  // can skip the backend send when the user hasn't changed anything.
+  editingBlockIndex = blockIndex;
+  enteringBlockIndex = -1;
   const source = syntaxBlocks[blockIndex].source || "";
+  editOriginalSource = source;
+
   blockEl.classList.add("editing");
   blockEl.innerHTML = "";
 
@@ -1574,11 +1595,10 @@ function exitEditMode() {
 /// Restore a single block element from textarea back to rendered HTML.
 /// Avoids full renderBlocks() which would destroy all elements and reset scroll.
 ///
-/// SAFETY: This function ALWAYS sends newSource to the backend, even if it
-/// appears unchanged. The "source unchanged" optimization is skipped because
-/// syntaxBlocks[idx].source may be stale (empty in virtualized mode, or
-/// outdated after a concurrent refreshSyntax). Always sending guarantees
-/// the user's text is preserved.
+/// SAFETY: Only send to backend when the user actually changed the source. If
+/// newSource equals the source that was in the textarea when edit started,
+/// we skip the replace. This prevents scroll/click actions (which exit edit
+/// mode) from rewriting the file with stale cached source and corrupting it.
 async function restoreBlockElement(idx, blockEl, newSource) {
   try {
     // Keep suppressRender=true during sendReplaceBlock → refreshSyntax to
@@ -1590,12 +1610,20 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     setScrollTopNoEvent(blockEditor, savedScroll1);
     const wasSuppressRender = suppressRender;
     suppressRender = true;
-    // ALWAYS send to backend — don't skip even if source appears unchanged.
-    // The comparison newSource === oldSource is unreliable because
-    // syntaxBlocks[idx].source may be stale/empty in virtualized mode.
-    await sendReplaceBlock(idx, newSource);
+
+    // If the user hasn't actually changed the source, do not write to the
+    // backend. Writing stale cached source over fresh backend content is the
+    // corruption bug reported by the user. We still reload the block to show
+    // the most up-to-date source in the DOM.
+    const userChanged = (editOriginalSource === null) || (newSource !== editOriginalSource);
+    if (userChanged) {
+      await sendReplaceBlock(idx, newSource);
+    }
+
     // sendReplaceBlock → refreshSyntax rebuilds syntaxBlocks. Must reload
     // block data before rendering — refreshSyntax may have changed indices.
+    // If we skipped the send, we still fetch fresh data so the rendered block
+    // isn't stale.
     try {
       const block = await tauriInvoke("get_block_data", { blockIndex: idx });
       if (block) {
@@ -1627,7 +1655,8 @@ async function restoreBlockElement(idx, blockEl, newSource) {
     attachBlockListeners(blockEl, idx);
     setScrollTopNoEvent(blockEditor, savedScroll3);
   } finally {
-    // Clear the exit guard so exitEditMode can run again.
+    // Clear edit state and the exit guard so exitEditMode can run again.
+    editOriginalSource = null;
     exitingBlockIndex = -1;
     // Clear the in-flight promise once the restore is done.
     blockRestorePromise = Promise.resolve();
