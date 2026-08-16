@@ -204,13 +204,14 @@ async function loadDocument() {
     blocks.value = meta.map((m, i) => ({ index: i, ...m }));
     blockHeights.value = new Array(blocks.value.length).fill(0);
     recomputeLayout();
-    const scroll = isDocChange ? 0 : savedScroll;
-    scrollTop.value = scroll;
-    if (viewport.value) viewport.value.scrollTop = scroll;
-    if (gutter.value) gutter.value.scrollTop = scroll;
+    scrollTop.value = isDocChange ? 0 : savedScroll;
     await updateVisibleAndLoad();
-    // Ensure block heights settle after the initial paint.
-    setTimeout(() => { measureHeights(); onScroll(); }, 50);
+    // Wait for the first real height measurement before restoring scroll
+    // so the browser doesn't clamp to an underestimated totalHeight.
+    await new Promise(r => requestAnimationFrame(r));
+    await nextTick();
+    measureHeights();
+    setScrollTop(isDocChange ? 0 : savedScroll);
   } catch (e) {
     console.error('loadDocument:', e);
   }

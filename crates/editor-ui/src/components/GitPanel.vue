@@ -456,6 +456,9 @@ async function loadDiffForPath(rawPath) {
 async function loadDiff() {
   try {
     diff.value = [];
+    if (!repoRoot.value) {
+      try { repoRoot.value = (await invoke('git_repo_root')) || ''; } catch {}
+    }
     if (currentFileOnly.value) {
       if (!props.activeFile) { alert('No active file'); return; }
       const d = await loadDiffForPath(props.activeFile);
