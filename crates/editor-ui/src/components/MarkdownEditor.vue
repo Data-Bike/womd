@@ -205,7 +205,7 @@ async function loadDocument() {
   }
 }
 
-watch(() => [props.doc?.id, currentViewMode.value], loadDocument, { immediate: true });
+watch(() => [props.doc?.id, currentViewMode.value], loadDocument);
 
 function onScroll() {
   if (ignoreScroll > 0) { ignoreScroll--; return; }
@@ -249,7 +249,7 @@ async function updateVisibleAndLoad() {
         }
       }
     }
-    nextTick(measureHeights);
+    nextTick(() => requestAnimationFrame(measureHeights));
   } finally {
     loadingVisible = false;
   }
@@ -793,6 +793,7 @@ onMounted(() => {
     clientHeight.value = viewport.value.clientHeight;
     scrollTop.value = viewport.value.scrollTop;
   }
+  loadDocument();
 });
 
 onUnmounted(() => {

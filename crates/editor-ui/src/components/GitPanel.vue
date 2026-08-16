@@ -154,14 +154,12 @@
           </select>
           <button class="git-action-btn" @click="loadDiff">Load diff</button>
         </div>
-        <div
-          v-for="(file, fi) in diff"
-          :key="fi"
-          class="diff-file-header"
-        >
-          {{ file.path }}
-        </div>
-        <div v-for="(file, fi) in diff" :key="'body' + fi">
+        <label class="git-diff-option">
+          <input v-model="currentFileOnly" type="checkbox" />
+          Current file only
+        </label>
+        <div v-for="(file, fi) in diff" :key="fi" class="git-diff-file">
+          <div class="diff-file-header">{{ file.path }}</div>
           <div v-for="(hunk, hi) in file.hunks" :key="hi" class="diff-hunk">
             <div class="diff-hunk-header">@@ -{{ hunk.old_start }} +{{ hunk.new_start }} @@</div>
             <div
@@ -299,6 +297,8 @@ const diffMode = ref('working');
 const diffCommit = ref('');
 const diffCommitA = ref('');
 const diffCommitB = ref('');
+const currentFileOnly = ref(true);
+const repoRoot = ref('');
 
 const hasAnyChanges = computed(() => {
   if (!status.value) return false;
@@ -332,6 +332,7 @@ function lineNo(line) {
 async function refreshAll() {
   if (!props.visible || !props.activeFile) return;
   try {
+    repoRoot.value = (await invoke('git_repo_root')) || '';
     status.value = await invoke('get_git_status');
     branches.value = await invoke('git_branches');
     log.value = await invoke('git_log');
@@ -347,7 +348,12 @@ async function refreshAll() {
 
 async function showFileDiff(file) {
   try {
-    const d = await invoke('git_diff_file', { filePath: file.path });
+    const path = toRepoRelative(file.path);
+    let d = await invoke('git_diff_file', { filePath: path });
+    if (!d?.hunks?.length) {
+      const content = await invoke('git_read_file_at_revision', { filePath: path, revision: '' });
+      if (content != null) d = syntheticUntrackedDiff(path, content);
+    }
     selectedFileDiff.value = d;
     activeTab.value = 'changes';
   } catch (e) {
@@ -405,17 +411,75 @@ async function showCommitDiff(sha) {
   catch (e) { console.error('showCommitDiff:', e); }
 }
 
-async function loadDiff() {
+function toRepoRelative(absPath) {
+  if (!repoRoot.value || !absPath) return absPath;
+  const root = repoRoot.value.replace(/\\/g, '/').replace(/\/$/, '');
+  let p = absPath.replace(/\\/g, '/');
+  if (p.toLowerCase().startsWith(root.toLowerCase() + '/')) {
+    return p.substring(root.length + 1);
+  }
+  return absPath;
+}
+
+function syntheticUntrackedDiff(path, text) {
+  const lines = (text || '').split('\n');
+  const ls = [];
+  for (let i = 0; i < lines.length; i++) {
+    ls.push({ kind: 'insert', old_no: null, new_no: i + 1, text: lines[i] });
+  }
+  return { path, old_path: null, hunks: [{ old_start: 0, new_start: 1, lines: ls }] };
+}
+
+async function loadDiffForPath(rawPath) {
+  const path = toRepoRelative(rawPath);
   try {
     if (diffMode.value === 'working') {
-      diff.value = await invoke('git_diff');
+      const d = await invoke('git_diff_file', { filePath: path });
+      if (d?.hunks?.length) return d;
+      // Untracked or new file: show full content as added.
+      const content = await invoke('git_read_file_at_revision', { filePath: path, revision: '' });
+      if (content != null) return syntheticUntrackedDiff(path, content);
+      return null;
+    } else if (diffMode.value === 'commit') {
+      if (!diffCommit.value.trim()) return null;
+      return await invoke('git_diff_file_vs_commit', { filePath: path, commit: diffCommit.value });
+    } else if (diffMode.value === 'commits') {
+      if (!diffCommitA.value.trim() || !diffCommitB.value.trim()) return null;
+      return await invoke('git_diff_file_commits', { filePath: path, commitA: diffCommitA.value, commitB: diffCommitB.value });
+    }
+  } catch (e) {
+    console.error('loadDiffForPath:', path, e);
+  }
+  return null;
+}
+
+async function loadDiff() {
+  try {
+    diff.value = [];
+    if (currentFileOnly.value) {
+      if (!props.activeFile) { alert('No active file'); return; }
+      const d = await loadDiffForPath(props.activeFile);
+      if (d) diff.value = [d];
+      return;
+    }
+
+    let files = [];
+    if (diffMode.value === 'working') {
+      files = await invoke('git_diff');
     } else if (diffMode.value === 'commit') {
       if (!diffCommit.value.trim()) { alert('Enter a commit SHA'); return; }
-      diff.value = await invoke('git_diff_vs_commit', { commit: diffCommit.value });
+      files = await invoke('git_diff_vs_commit', { commit: diffCommit.value });
     } else if (diffMode.value === 'commits') {
       if (!diffCommitA.value.trim() || !diffCommitB.value.trim()) { alert('Enter both commits'); return; }
-      diff.value = await invoke('git_diff_commits', { commitA: diffCommitA.value, commitB: diffCommitB.value });
+      files = await invoke('git_diff_commits', { commitA: diffCommitA.value, commitB: diffCommitB.value });
     }
+
+    const details = [];
+    for (const f of files || []) {
+      const d = await loadDiffForPath(f.path);
+      if (d) details.push(d);
+    }
+    diff.value = details;
   } catch (e) { console.error('loadDiff:', e); }
 }
 
