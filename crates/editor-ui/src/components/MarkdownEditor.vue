@@ -295,8 +295,9 @@ async function enterEdit(index) {
   editOriginal.value = editSource.value;
   nextTick(() => {
     let el = textarea.value;
-    if (!el && viewport.value) el = viewport.value.querySelector('textarea');
-    if (el) {
+    if ((!el || !el.isConnected) && viewport.value) el = viewport.value.querySelector('textarea');
+    if (el && el.isConnected) {
+      textarea.value = el;
       autoSize(el);
       el.focus({ preventScroll: true });
     }
@@ -361,8 +362,10 @@ function onKeydown(e) {
 
 function autoSize(el) {
   if (!el) el = textarea.value;
-  if (!el && viewport.value) el = viewport.value.querySelector('textarea');
-  if (!el) return;
+  if (!el || !el.isConnected) {
+    if (viewport.value) el = viewport.value.querySelector('textarea');
+  }
+  if (!el || !el.isConnected) return;
   el.style.height = 'auto';
   el.style.height = `${el.scrollHeight}px`;
   if (editingBlockIndex.value >= 0) {
