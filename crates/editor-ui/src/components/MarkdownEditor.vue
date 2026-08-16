@@ -61,6 +61,7 @@ const chunkParsing = ref(false);
 const scrollTop = ref(0);
 const clientHeight = ref(600);
 let ignoreScroll = 0;
+let loadingVisible = false;
 
 const editingBlockIndex = ref(-1);
 const editingBlockHeight = ref(0);
@@ -79,21 +80,32 @@ const RENDER_BUFFER = 300; // px above/below
 const blockLayout = ref([]);
 const totalHeight = ref(0);
 
-function recomputeLayout() {
-  const list = [];
+function recomputeLayout(startIdx = 0) {
+  const list = blockLayout.value.slice();
   let top = 0;
-  for (let i = 0; i < blocks.value.length; i++) {
+  if (startIdx > 0 && list[startIdx - 1]) {
+    top = list[startIdx - 1].top + list[startIdx - 1].height;
+  }
+  for (let i = startIdx; i < blocks.value.length; i++) {
     const b = blocks.value[i];
     const h = getBlockHeight(i);
-    list.push({
-      index: i,
-      meta: b,
-      data: blockData.value.get(i) || b,
-      top,
-      height: h,
-    });
+    if (list[i]) {
+      list[i].top = top;
+      list[i].height = h;
+      list[i].data = blockData.value.get(i) || b;
+    } else {
+      list.push({
+        index: i,
+        meta: b,
+        data: blockData.value.get(i) || b,
+        top,
+        height: h,
+      });
+    }
     top += h;
   }
+  // Trim if blocks reduced.
+  list.length = blocks.value.length;
   blockLayout.value = list;
   const pad = hasMoreToParse.value ? clientHeight.value * 2 : 0;
   totalHeight.value = top + pad;
@@ -138,7 +150,7 @@ async function loadDocument() {
     recomputeLayout();
     scrollTop.value = 0;
     // Load visible block data.
-    updateVisibleAndLoad();
+    await updateVisibleAndLoad();
   } catch (e) {
     console.error('loadDocument:', e);
   }
@@ -172,45 +184,54 @@ function scheduleScroll() {
   });
 }
 
-function updateVisibleAndLoad() {
-  // Ensure data is loaded for all visible blocks and measure heights.
-  nextTick(measureHeights);
-  for (const b of visibleBlocks.value) {
-    if (!blockData.value.has(b.index)) {
-      loadBlockData(b.index);
+async function updateVisibleAndLoad() {
+  if (loadingVisible) return;
+  loadingVisible = true;
+  try {
+    const toLoad = visibleBlocks.value
+      .filter(b => !blockData.value.has(b.index) && loadingBlockIndex.value !== b.index && editingBlockIndex.value !== b.index)
+      .map(b => b.index);
+    if (toLoad.length) {
+      const results = await Promise.all(toLoad.map(i => loadBlockData(i)));
+      for (const data of results) {
+        if (data) {
+          blockData.value.set(data.index, data);
+          blockHeights.value[data.index] = 0; // re-measure
+        }
+      }
     }
+    nextTick(measureHeights);
+  } finally {
+    loadingVisible = false;
   }
 }
 
 async function loadBlockData(index) {
-  if (loadingBlockIndex.value === index || editingBlockIndex.value === index) return;
-  if (blockData.value.has(index)) return;
+  if (loadingBlockIndex.value === index || editingBlockIndex.value === index) return null;
+  if (blockData.value.has(index)) return null;
   try {
     const data = await invoke('get_block_data', { blockIndex: index });
-    if (data) {
-      blockData.value.set(index, data);
-      blockHeights.value[index] = 0; // re-measure
-      nextTick(measureHeights);
-    }
+    if (data) return { ...data, index };
   } catch (e) {
     console.error('loadBlockData:', e);
   }
+  return null;
 }
 
 function measureHeights() {
   if (!viewport.value) return;
   const els = viewport.value.querySelectorAll('[data-block-index]');
-  let changed = false;
+  let firstChanged = Infinity;
   for (const el of els) {
     const idx = Number(el.dataset.blockIndex);
     if (editingBlockIndex.value === idx) continue;
     const h = el.offsetHeight;
     if (h > 0 && h !== blockHeights.value[idx]) {
       blockHeights.value[idx] = h;
-      changed = true;
+      firstChanged = Math.min(firstChanged, idx);
     }
   }
-  if (changed) recomputeLayout();
+  if (firstChanged < Infinity) recomputeLayout(firstChanged);
 }
 
 async function maybeParseNextChunk() {
