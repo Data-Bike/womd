@@ -200,6 +200,8 @@ async function loadDocument() {
     if (viewport.value) viewport.value.scrollTop = 0;
     if (gutter.value) gutter.value.scrollTop = 0;
     await updateVisibleAndLoad();
+    // Ensure block heights settle after the initial paint.
+    setTimeout(() => { measureHeights(); onScroll(); }, 50);
   } catch (e) {
     console.error('loadDocument:', e);
   }
@@ -788,16 +790,27 @@ function focusFirst() {
   viewport.value.focus();
 }
 
+let resizeObserver = null;
+
 onMounted(() => {
   if (viewport.value) {
     clientHeight.value = viewport.value.clientHeight;
     scrollTop.value = viewport.value.scrollTop;
+    resizeObserver = new ResizeObserver((entries) => {
+      const h = entries[0]?.contentRect?.height || viewport.value?.clientHeight || 0;
+      if (h > 0 && h !== clientHeight.value) {
+        clientHeight.value = h;
+        updateVisibleAndLoad();
+      }
+    });
+    resizeObserver.observe(viewport.value);
   }
   loadDocument();
 });
 
 onUnmounted(() => {
   if (scrollRaf) cancelAnimationFrame(scrollRaf);
+  if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
 });
 
 function save() {
