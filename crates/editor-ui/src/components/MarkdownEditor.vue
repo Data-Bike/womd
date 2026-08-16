@@ -146,12 +146,22 @@ function syncBlockState(newMeta) {
   const oldData = blockData.value;
   const oldHeights = blockHeights.value;
   const oldBlocks = blocks.value;
+  let delta = 0;
+  if (anchorAfterEdit >= 0 && oldBlocks[anchorAfterEdit] && newMeta[anchorAfterEdit]) {
+    delta = (newMeta[anchorAfterEdit].end || 0) - (oldBlocks[anchorAfterEdit].end || 0);
+  }
   const keyToData = new Map();
+  const shiftedKeyToData = new Map();
   for (let i = 0; i < oldBlocks.length; i++) {
+    if (!oldData.has(i)) continue;
     const b = oldBlocks[i];
+    const data = oldData.get(i);
+    const height = oldHeights[i];
     const key = `${b.kind}:${b.start}:${b.end}`;
-    if (oldData.has(i) && !keyToData.has(key)) {
-      keyToData.set(key, { data: oldData.get(i), height: oldHeights[i] });
+    if (!keyToData.has(key)) keyToData.set(key, { data, height });
+    if (anchorAfterEdit >= 0 && i > anchorAfterEdit) {
+      const shiftedKey = `${b.kind}:${b.start + delta}:${b.end + delta}`;
+      if (!shiftedKeyToData.has(shiftedKey)) shiftedKeyToData.set(shiftedKey, { data, height });
     }
   }
   const newBlocks = newMeta.map((m, i) => ({ index: i, ...m }));
@@ -160,8 +170,10 @@ function syncBlockState(newMeta) {
   let firstChanged = Infinity;
   for (let i = 0; i < newBlocks.length; i++) {
     const b = newBlocks[i];
+    if (i === anchorAfterEdit) { firstChanged = Math.min(firstChanged, i); continue; }
     const key = `${b.kind}:${b.start}:${b.end}`;
-    const kept = keyToData.get(key);
+    const shiftedKey = `${b.kind}:${b.start}:${b.end}`;
+    const kept = (anchorAfterEdit >= 0 && i > anchorAfterEdit ? shiftedKeyToData.get(shiftedKey) : null) || keyToData.get(key);
     if (kept) {
       newData.set(i, kept.data);
       newHeights[i] = kept.height;
