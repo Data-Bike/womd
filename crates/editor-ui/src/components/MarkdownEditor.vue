@@ -1,9 +1,9 @@
 <template>
-  <div class="editor-wrapper">
-    <div ref="gutter" class="line-gutter"></div>
+  <div id="editor-container">
+    <div ref="gutter" id="line-gutter"></div>
     <div
       ref="viewport"
-      class="block-editor"
+      id="block-editor"
       @scroll.passive="onScroll"
     >
       <div

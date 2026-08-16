@@ -353,6 +353,8 @@ body {
   font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
   font-size: 16px; line-height: 1.7; color: var(--fg);
 }
+#block-editor .scroll-sizer { position: relative; }
+#block-editor .md-block { position: absolute; left: 0; right: 0; }
 
 .md-block {
   padding: 3px 8px; margin: 0 0 2px 0; border-radius: 4px;

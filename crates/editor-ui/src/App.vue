@@ -34,7 +34,7 @@ async function openFile() {
   const path = 'C:/Users/gorod/RustroverProjects/womd/test_large.md';
   try {
     const info = await invoke('open_document', { path });
-    doc.value = { id: info.id, name: path.split(/[\\/]/).pop(), path };
+    doc.value = { id: info.tab_id, name: info.file_name, path };
     fileName.value = doc.value.name;
     isDirty.value = false;
   } catch (e) {
