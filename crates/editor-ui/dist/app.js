@@ -318,15 +318,20 @@ async function refreshSyntax() {
         }
       } else {
         // Block count changed (initial load, new chunk parsed, etc.) —
-        // rebuild but preserve existing entries where possible.
-        // Cached line numbers and per-index heights may map to wrong blocks.
+        // rebuild but preserve existing entries and cached heights where possible.
+        // Only throw away the height for a specific index if the block identity
+        // changed (different kind or span); otherwise cumulativeHeight stays
+        // accurate for already-rendered regions and updateVisibleRange doesn't
+        // map the saved scrollTop to the wrong block.
         gutterLineNumbers = {};
-        blockHeights = [];
         const oldBlocks = syntaxBlocks;
+        const oldHeights = blockHeights;
+        blockHeights = [];
         syntaxBlocks = meta.map((m, i) => {
           if (i < oldBlocks.length && oldBlocks[i].kind === m.kind &&
               oldBlocks[i].start === m.start && oldBlocks[i].end === m.end) {
-            // Same block — keep loaded data.
+            // Same block — keep loaded data and its measured height.
+            blockHeights[i] = oldHeights[i] || 0;
             return oldBlocks[i];
           }
           return { kind: m.kind, source: "", start: m.start, end: m.end, node: null };
@@ -981,16 +986,19 @@ async function maybeParseNextChunk() {
     // and replace it with new blocks, so block indices at the end shift.
     // The append-only `syntaxBlocks.concat(newBlocks.slice(oldLen))` is wrong
     // because it keeps the removed stale block and appends the wrong slice.
-    // Rebuild by matching kind+span, preserving any existing loaded data.
+    // Rebuild by matching kind+span, preserving any existing loaded data and
+    // cached block heights so visible-range estimates stay accurate.
     gutterLineNumbers = {};
-    blockHeights = [];
     const oldBlocks = syntaxBlocks;
+    const oldHeights = blockHeights;
+    blockHeights = [];
     syntaxBlocks = meta.map((m, i) => {
       if (i < oldBlocks.length &&
           oldBlocks[i].kind === m.kind &&
           oldBlocks[i].start === m.start &&
           oldBlocks[i].end === m.end) {
-        // Same block (same span and kind) — keep loaded source/node.
+        // Same block (same span and kind) — keep loaded source/node and height.
+        blockHeights[i] = oldHeights[i] || 0;
         return oldBlocks[i];
       }
       return { kind: m.kind, source: "", start: m.start, end: m.end, node: null };
