@@ -2,23 +2,25 @@
   <div id="tab-bar">
     <div id="tab-list">
       <div
-        v-for="(tab, i) in tabs"
+        v-for="tab in tabs"
         :key="tab.id"
         class="tab"
-        :class="{ active: i === active }"
-        @click="$emit('switch', i)"
+        :class="{ active: activeTabId === tab.id }"
+        @click="$emit('switch', tab.id)"
       >
-        {{ tab.name }}{{ tab.dirty ? ' •' : '' }}
+        <span class="tab-name">{{ tab.name }}</span>
+        <span v-if="tab.dirty" class="tab-dirty"></span>
+        <span class="tab-close" @click.stop="$emit('close', tab.id)">×</span>
       </div>
     </div>
-    <button id="tab-new" @click="$emit('new')" title="New tab">+</button>
+    <button id="tab-new" title="New tab" @click="$emit('new')">+</button>
   </div>
 </template>
 
 <script setup>
 defineProps({
   tabs: Array,
-  active: Number,
+  activeTabId: [Number, String],
 });
-defineEmits(['new', 'switch']);
+defineEmits(['new', 'switch', 'close']);
 </script>

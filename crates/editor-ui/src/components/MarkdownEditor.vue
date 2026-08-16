@@ -2,6 +2,15 @@
   <div id="editor-container">
     <div ref="gutter" id="line-gutter"></div>
     <div
+      v-if="currentViewMode === 'source'"
+      id="block-editor"
+      class="source-view"
+    >
+      <div v-if="sourceLoading" class="md-block-placeholder">Loading source...</div>
+      <pre v-else class="md-source-view">{{ sourceText || '(empty)' }}</pre>
+    </div>
+    <div
+      v-else
       ref="viewport"
       id="block-editor"
       @scroll.passive="onScroll"
@@ -15,6 +24,7 @@
           :key="b.index"
           class="md-block"
           :data-block-index="b.index"
+          :class="{ editing: editingBlockIndex === b.index }"
           :style="{ position: 'absolute', top: `${b.top}px`, left: 0, right: 0 }"
           @mousedown="onBlockMouseDown(b.index, $event)"
           @click="onBlockClick(b.index, $event)"
@@ -22,11 +32,14 @@
           <template v-if="editingBlockIndex === b.index">
             <textarea
               v-model="editSource"
+              :ref="setTextareaRef"
               class="md-block-textarea"
               spellcheck="false"
-              @input="autoSize($event.target)"
+              @input="onTextareaInput"
               @blur="exitEdit(false)"
               @keydown="onKeydown"
+              @keyup="updateCursorFromTextarea"
+              @click="updateCursorFromTextarea"
             />
           </template>
           <div v-else v-html="renderBlockHtml(b.data)"></div>
@@ -43,9 +56,13 @@ import { renderBlockHtml } from '../render.js';
 
 const props = defineProps({
   doc: Object, // { id: string, name: string, path: string | null }
+  viewMode: { type: String, default: 'rendered' }, // 'rendered' | 'source'
 });
 
-const emit = defineEmits(['dirty']);
+const emit = defineEmits(['dirty', 'cursor', 'blockCount']);
+
+const currentViewMode = ref(props.viewMode);
+watch(() => props.viewMode, (v) => { currentViewMode.value = v; });
 
 const viewport = ref(null);
 const gutter = ref(null);
@@ -70,15 +87,22 @@ const editOriginal = ref('');
 const loadingBlockIndex = ref(-1);
 const suppressScroll = ref(false);
 
+const sourceText = ref('');
+const sourceLoading = ref(false);
+
 const LINE_HEIGHT = 20;
 const MIN_BLOCK_HEIGHT = 60;
 const AVG_CHARS_PER_LINE = 45;
 const RENDER_BUFFER = 300; // px above/below
 
-// Cache block layout in a single O(N) pass. Do not use a computed that calls
-// an O(N) cumulative function per block — that is O(N^2) and hangs on 25k blocks.
 const blockLayout = ref([]);
 const totalHeight = ref(0);
+
+let textareaEl = null;
+
+function setTextareaRef(el) {
+  if (el) textareaEl = el;
+}
 
 function recomputeLayout(startIdx = 0) {
   const list = blockLayout.value.slice();
@@ -104,11 +128,11 @@ function recomputeLayout(startIdx = 0) {
     }
     top += h;
   }
-  // Trim if blocks reduced.
   list.length = blocks.value.length;
   blockLayout.value = list;
   const pad = hasMoreToParse.value ? clientHeight.value * 2 : 0;
   totalHeight.value = top + pad;
+  emit('blockCount', blocks.value.length);
 }
 
 function getBlockHeight(i) {
@@ -133,10 +157,30 @@ const visibleBlocks = computed(() => {
   });
 });
 
+async function loadSourceView() {
+  if (props.currentViewMode !== 'source') return;
+  sourceLoading.value = true;
+  try {
+    sourceText.value = await invoke('get_document_text');
+  } catch (e) {
+    console.error('loadSourceView:', e);
+    sourceText.value = '';
+  } finally {
+    sourceLoading.value = false;
+  }
+}
+
 async function loadDocument() {
+  if (props.currentViewMode === 'source') {
+    await loadSourceView();
+    return;
+  }
   if (!props.doc?.id) {
     blocks.value = [];
     blockData.value = new Map();
+    blockLayout.value = [];
+    totalHeight.value = 0;
+    emit('blockCount', 0);
     return;
   }
   try {
@@ -149,14 +193,15 @@ async function loadDocument() {
     blockHeights.value = new Array(blocks.value.length).fill(0);
     recomputeLayout();
     scrollTop.value = 0;
-    // Load visible block data.
+    if (viewport.value) viewport.value.scrollTop = 0;
+    if (gutter.value) gutter.value.scrollTop = 0;
     await updateVisibleAndLoad();
   } catch (e) {
     console.error('loadDocument:', e);
   }
 }
 
-watch(() => props.doc?.id, loadDocument, { immediate: true });
+watch(() => [props.doc?.id, props.currentViewMode], loadDocument, { immediate: true });
 
 function onScroll() {
   if (ignoreScroll > 0) { ignoreScroll--; return; }
@@ -196,7 +241,7 @@ async function updateVisibleAndLoad() {
       for (const data of results) {
         if (data) {
           blockData.value.set(data.index, data);
-          blockHeights.value[data.index] = 0; // re-measure
+          blockHeights.value[data.index] = 0;
         }
       }
     }
@@ -289,11 +334,9 @@ async function enterEdit(index) {
   if (editingBlockIndex.value >= 0) {
     await exitEdit(true);
   }
-  // Cancel any stale load.
   loadingBlockIndex.value = -1;
   if (index < 0 || index >= blocks.value.length) return;
 
-  // Load data if missing.
   let data = blockData.value.get(index);
   if (!data) {
     loadingBlockIndex.value = index;
@@ -303,7 +346,7 @@ async function enterEdit(index) {
     } catch (e) {
       console.error('enterEdit get_block_data:', e);
     }
-    if (loadingBlockIndex.value !== index) return; // interrupted
+    if (loadingBlockIndex.value !== index) return;
     loadingBlockIndex.value = -1;
   }
   if (!data) return;
@@ -313,13 +356,14 @@ async function enterEdit(index) {
   editSource.value = data.source || '';
   editOriginal.value = editSource.value;
   nextTick(() => {
-    const el = viewport.value?.querySelector('textarea.md-block-textarea');
+    const el = textareaEl;
     if (el) {
       autoSize(el);
       el.focus({ preventScroll: true });
+      el.selectionStart = el.value.length;
+      el.selectionEnd = el.value.length;
+      updateCursorFromTextarea();
     }
-    // Replacing the rendered block with a textarea changes the block height and
-    // can shift scrollTop. Restore the scroll position from before the edit.
     setScrollTop(savedScroll);
   });
 }
@@ -333,7 +377,6 @@ async function exitEdit(force) {
   if (changed || force) {
     try {
       await invoke('replace_block', { blockIndex: index, newSource: editSource.value });
-      // Refresh block list and reload this block.
       const meta = await invoke('get_syntax_tree_meta');
       blocks.value = meta.map((m, i) => {
         const oldMeta = blocks.value[i];
@@ -357,9 +400,9 @@ async function exitEdit(force) {
   editingBlockHeight.value = 0;
   editSource.value = '';
   editOriginal.value = '';
+  textareaEl = null;
   nextTick(() => {
     measureHeights();
-    // Restoring the rendered block can change the layout; keep the user's scroll.
     setScrollTop(savedScroll);
   });
 }
@@ -377,9 +420,15 @@ function onKeydown(e) {
   }
 }
 
+function onTextareaInput(e) {
+  const el = e.target || textareaEl;
+  autoSize(el);
+  updateCursorFromTextarea();
+}
+
 function autoSize(el) {
   if (!el || !el.isConnected) {
-    el = viewport.value?.querySelector('textarea.md-block-textarea');
+    el = textareaEl;
   }
   if (!el || !el.isConnected) return;
   el.style.height = 'auto';
@@ -393,6 +442,218 @@ function autoSize(el) {
   }
 }
 
+function posToLineCol(text, offset) {
+  const lines = text.substring(0, offset).split('\n');
+  const line = lines.length;
+  const col = lines[lines.length - 1].length + 1;
+  return { line, col };
+}
+
+function updateCursorFromTextarea() {
+  const el = textareaEl;
+  if (!el) return;
+  const pos = posToLineCol(editSource.value, el.selectionStart);
+  emit('cursor', pos);
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+function getActiveTextarea() {
+  if (editingBlockIndex.value < 0) return null;
+  return textareaEl;
+}
+
+function toggleWrap(ta, prefix, suffix) {
+  if (!ta) return;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const value = ta.value;
+  const selected = value.substring(start, end) || '';
+  const before = value.substring(0, start);
+  const after = value.substring(end);
+  const hasPrefix = before.endsWith(prefix);
+  const hasSuffix = after.startsWith(suffix);
+  if (selected && hasPrefix && hasSuffix) {
+    // unwrap
+    ta.value = before.slice(0, -prefix.length) + selected + after.slice(suffix.length);
+    ta.selectionStart = start - prefix.length;
+    ta.selectionEnd = end - prefix.length;
+  } else if (selected) {
+    // wrap
+    ta.value = before + prefix + selected + suffix + after;
+    ta.selectionStart = start + prefix.length;
+    ta.selectionEnd = end + prefix.length;
+  } else {
+    // nothing selected, insert wrappers and place cursor between
+    ta.value = before + prefix + suffix + after;
+    ta.selectionStart = start + prefix.length;
+    ta.selectionEnd = start + prefix.length;
+  }
+  editSource.value = ta.value;
+  nextTick(() => autoSize(ta));
+  updateCursorFromTextarea();
+}
+
+function toggleLinePrefix(ta, prefix) {
+  if (!ta) return;
+  const value = ta.value;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const before = value.substring(0, start);
+  const after = value.substring(end);
+  const sel = value.substring(start, end);
+  const lines = sel.split('\n');
+  const allPrefixed = lines.every(line => line.startsWith(prefix));
+  let newSel;
+  if (allPrefixed) {
+    newSel = lines.map(line => line.slice(prefix.length)).join('\n');
+  } else {
+    newSel = lines.map(line => (line ? prefix + line : '')).join('\n');
+  }
+  const newBefore = before;
+  const newAfter = after;
+  ta.value = newBefore + newSel + newAfter;
+  ta.selectionStart = start;
+  ta.selectionEnd = start + newSel.length;
+  editSource.value = ta.value;
+  nextTick(() => autoSize(ta));
+  updateCursorFromTextarea();
+}
+
+function toggleHeadingInTextarea(ta, level) {
+  if (!ta) return;
+  const value = ta.value;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const before = value.substring(0, start);
+  const after = value.substring(end);
+  const sel = value.substring(start, end);
+  let firstLineBreak = sel.indexOf('\n');
+  if (firstLineBreak < 0) firstLineBreak = sel.length;
+  const firstLine = sel.substring(0, firstLineBreak);
+  const rest = sel.substring(firstLineBreak);
+  const match = firstLine.match(/^(#{1,6})\s+(.*)$/);
+  let newFirstLine;
+  if (level === 0) {
+    newFirstLine = match ? match[2] : firstLine;
+  } else {
+    newFirstLine = `${'#'.repeat(level)} ${match ? match[2] : firstLine}`;
+  }
+  const newSel = newFirstLine + rest;
+  ta.value = before + newSel + after;
+  ta.selectionStart = start;
+  ta.selectionEnd = start + newSel.length;
+  editSource.value = ta.value;
+  nextTick(() => autoSize(ta));
+  updateCursorFromTextarea();
+}
+
+function insertLinkInTextarea(ta) {
+  if (!ta) return;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const value = ta.value;
+  const selected = value.substring(start, end).trim() || 'text';
+  const url = prompt('URL:', 'https://');
+  if (!url) return;
+  const replacement = `[${selected}](${url})`;
+  ta.value = value.substring(0, start) + replacement + value.substring(end);
+  ta.selectionStart = start + replacement.length;
+  ta.selectionEnd = start + replacement.length;
+  editSource.value = ta.value;
+  nextTick(() => autoSize(ta));
+  updateCursorFromTextarea();
+}
+
+async function insertThematicBreak() {
+  const ta = getActiveTextarea();
+  if (ta) {
+    const start = ta.selectionStart;
+    const value = ta.value;
+    const line = value.lastIndexOf('\n', start) + 1;
+    ta.value = value.substring(0, line) + '---\n' + value.substring(line);
+    editSource.value = ta.value;
+    nextTick(() => autoSize(ta));
+    updateCursorFromTextarea();
+  } else {
+    // Insert as a new block at the end of the current document if not editing.
+    const value = '---\n';
+    await invoke('insert_text', { position: totalLen.value || 0, text: value });
+    await loadDocument();
+    emit('dirty', true);
+  }
+}
+
+async function insertCodeBlock() {
+  const ta = getActiveTextarea();
+  if (ta) {
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const value = ta.value;
+    const selected = value.substring(start, end);
+    const replacement = '```\n' + selected + '\n```\n';
+    ta.value = value.substring(0, start) + replacement + value.substring(end);
+    editSource.value = ta.value;
+    nextTick(() => autoSize(ta));
+    updateCursorFromTextarea();
+  } else {
+    await invoke('insert_text', { position: totalLen.value || 0, text: '```\n\n```\n' });
+    await loadDocument();
+    emit('dirty', true);
+  }
+}
+
+function applyInlineFormat(prefix, suffix) {
+  if (editingBlockIndex.value < 0) {
+    console.warn('No active block to format');
+    return;
+  }
+  const ta = getActiveTextarea();
+  if (!ta) return;
+  toggleWrap(ta, prefix, suffix || prefix);
+}
+
+function applyLineFormat(prefix) {
+  if (editingBlockIndex.value < 0) {
+    console.warn('No active block to format');
+    return;
+  }
+  const ta = getActiveTextarea();
+  if (!ta) return;
+  toggleLinePrefix(ta, prefix);
+}
+
+function applyHeading(level) {
+  if (editingBlockIndex.value < 0) {
+    console.warn('No active block to format');
+    return;
+  }
+  const ta = getActiveTextarea();
+  if (!ta) return;
+  toggleHeadingInTextarea(ta, level);
+}
+
+function applyLink() {
+  if (editingBlockIndex.value < 0) {
+    console.warn('No active block to format');
+    return;
+  }
+  const ta = getActiveTextarea();
+  if (!ta) return;
+  insertLinkInTextarea(ta);
+}
+
+function toggleTask() {
+  applyLineFormat('- [ ] ');
+}
+
+function focusFirst() {
+  if (!viewport.value) return;
+  viewport.value.focus();
+}
+
 onMounted(() => {
   if (viewport.value) {
     clientHeight.value = viewport.value.clientHeight;
@@ -402,5 +663,33 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (scrollRaf) cancelAnimationFrame(scrollRaf);
+});
+
+function save() {
+  return exitEdit(false);
+}
+
+function setViewMode(mode) {
+  currentViewMode.value = mode;
+}
+
+const isSourceView = computed(() => currentViewMode.value === 'source');
+
+defineExpose({
+  applyInlineFormat,
+  applyLineFormat,
+  applyHeading,
+  applyLink,
+  toggleTask,
+  insertThematicBreak,
+  insertCodeBlock,
+  getActiveTextarea,
+  editingBlockIndex,
+  blocks,
+  focusFirst,
+  loadDocument,
+  save,
+  setViewMode,
+  isSourceView,
 });
 </script>
