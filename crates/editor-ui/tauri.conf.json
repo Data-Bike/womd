@@ -5,8 +5,9 @@
   "identifier": "com.womd.editor",
   "build": {
     "frontendDist": "./dist",
-    "beforeDevCommand": "",
-    "beforeBuildCommand": ""
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "withGlobalTauri": true,
