@@ -291,6 +291,9 @@ body {
   font-size: 13px; line-height: 1.7; color: var(--fg-muted);
   text-align: right; user-select: none; padding: 24px 8px 24px 0;
   scrollbar-width: none;
+  /* The gutter's scroll position is driven programmatically from the block
+     editor; block wheel/touch input here so it can never drift out of sync. */
+  pointer-events: none;
 }
 #line-gutter::-webkit-scrollbar { display: none; }
 #line-gutter .gutter-line { min-height: 1.7em; padding-right: 4px; box-sizing: border-box; }

@@ -1,6 +1,15 @@
 <template>
   <div id="editor-container">
-    <div ref="gutter" id="line-gutter"></div>
+    <div ref="gutter" id="line-gutter">
+      <div class="gutter-sizer" :style="{ height: `${totalHeight}px`, position: 'relative' }">
+        <div
+          v-for="row in visibleBlocks"
+          :key="'g' + row.index"
+          class="gutter-line"
+          :style="{ position: 'absolute', top: `${row.top}px`, height: `${row.height}px`, left: 0, right: 0 }"
+        >{{ showsLineNumber(row.kind) ? row.startLine : '' }}</div>
+      </div>
+    </div>
     <div
       v-if="currentViewMode === 'source'"
       id="block-editor"
@@ -13,6 +22,7 @@
       v-else
       ref="viewport"
       id="block-editor"
+      tabindex="0"
       @scroll.passive="onScroll"
     >
       <div v-if="!layoutReady" class="md-block-placeholder" style="padding: 24px; text-align: center">Loading blocks…</div>
@@ -26,12 +36,12 @@
           :key="b.index"
           class="md-block"
           :data-block-index="b.index"
-          :class="{ editing: editingBlockIndex === b.index }"
+          :class="{ editing: editingIndex === b.index }"
           :style="{ position: 'absolute', top: `${b.top}px`, left: 0, right: 0 }"
           @mousedown="onBlockMouseDown(b.index, $event)"
           @click="onBlockClick(b.index, $event)"
         >
-          <template v-if="editingBlockIndex === b.index">
+          <template v-if="editingIndex === b.index">
             <textarea
               v-model="editSource"
               :ref="setTextareaRef"
@@ -56,6 +66,25 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { renderBlockHtml } from '../render.js';
 
+// ---------------------------------------------------------------------------
+// Overview
+// ---------------------------------------------------------------------------
+// This component virtualizes a Markdown document as a list of "blocks"
+// (paragraphs, headings, lists, ...). For performance on very large
+// documents, the bulk of the per-block bookkeeping (metadata, measured
+// heights, cumulative offsets, and cached rendered data) is kept in plain
+// module-scoped variables instead of Vue refs/reactive objects. Vue's
+// reactivity system has real per-object overhead; tracking thousands of
+// block entries individually would make every mutation and every render
+// pass slower as the document grows. Instead, a handful of small reactive
+// "trigger" refs (scrollTop, clientHeight, layoutVersion, dataVersion)
+// drive two cheap computed properties (visibleRange, visibleBlocks) that
+// use binary search over a cumulative-offset array to find the visible
+// slice in O(log n + visible count) time, regardless of document size.
+// Only that small visible slice ever becomes part of Vue's reactive
+// render tree (via the keyed v-for), so DOM diffing cost also stays
+// bounded.
+
 const props = defineProps({
   doc: Object, // { id: string, name: string, path: string | null }
   viewMode: { type: String, default: 'rendered' }, // 'rendered' | 'source'
@@ -69,9 +98,31 @@ watch(() => props.viewMode, (v) => { currentViewMode.value = v; });
 const viewport = ref(null);
 const gutter = ref(null);
 
-const blocks = ref([]); // meta: { index, kind, start, end }
-const blockData = ref(new Map()); // index -> { source, node, ... }
-const blockHeights = ref([]); // px, measured
+// ---------------------------------------------------------------------------
+// Non-reactive layout state (see overview above).
+// ---------------------------------------------------------------------------
+let meta = [];          // [{ kind, start, end }] — one entry per parsed block
+let startLines = [];    // 1-based document line number for each block's start
+let heights = [];       // measured pixel heights; 0 = not yet measured
+let offsets = [];       // offsets[i] = top of block i; offsets[n] = content height (no padding)
+let cache = new Map();  // index -> { source, node, ... } full block data
+let cacheKeys = [];     // insertion order of `cache`, for bounded eviction
+const loadingSet = new Set(); // indices currently being fetched from the backend
+
+const MAX_CACHE_ENTRIES = 2000;
+const LINE_HEIGHT = 22;
+const MIN_BLOCK_HEIGHT = 28;
+const AVG_CHARS_PER_LINE = 45;
+const RENDER_BUFFER = 800; // px of overscan above/below the viewport
+
+let lastDocId = null;
+let anchorAfterEdit = -1;
+let ignoreScroll = 0;
+let loadingVisible = false;
+let textareaEl = null;
+let resizeObserver = null;
+let visibleUpdateRaf = 0;
+
 const parsedOffset = ref(0);
 const totalLen = ref(0);
 const hasMoreToParse = ref(false);
@@ -79,136 +130,212 @@ const chunkParsing = ref(false);
 
 const scrollTop = ref(0);
 const clientHeight = ref(600);
-let ignoreScroll = 0;
-let loadingVisible = false;
-let lastDocId = null;
-let anchorAfterEdit = -1;
+const layoutVersion = ref(0); // bumped whenever offsets/heights structurally change
+const dataVersion = ref(0);   // bumped whenever cached block data changes
+const totalHeight = ref(0);
+const layoutReady = ref(false);
 
-const editingBlockIndex = ref(-1);
-const editingBlockHeight = ref(0);
+const editingIndex = ref(-1);
+const editingHeight = ref(0);
 const editSource = ref('');
 const editOriginal = ref('');
-const loadingBlockIndex = ref(-1);
 const suppressScroll = ref(false);
 
 const sourceText = ref('');
 const sourceLoading = ref(false);
 
-const LINE_HEIGHT = 20;
-const MIN_BLOCK_HEIGHT = 60;
-const AVG_CHARS_PER_LINE = 45;
-const RENDER_BUFFER = 300; // px above/below
-
-const blockLayout = ref([]);
-const totalHeight = ref(0);
-const layoutReady = ref(false);
-
-let textareaEl = null;
-
 function setTextareaRef(el) {
   if (el) textareaEl = el;
 }
 
-function recomputeLayout(startIdx = 0) {
-  const list = blockLayout.value.slice();
-  let top = 0;
-  if (startIdx > 0 && list[startIdx - 1]) {
-    top = list[startIdx - 1].top + list[startIdx - 1].height;
-  }
-  for (let i = startIdx; i < blocks.value.length; i++) {
-    const b = blocks.value[i];
-    const h = getBlockHeight(i);
-    if (list[i]) {
-      list[i].top = top;
-      list[i].height = h;
-      list[i].data = blockData.value.get(i) || b;
-    } else {
-      list.push({
-        index: i,
-        meta: b,
-        data: blockData.value.get(i) || b,
-        top,
-        height: h,
-      });
-    }
-    top += h;
-  }
-  list.length = blocks.value.length;
-  blockLayout.value = list;
-  const pad = hasMoreToParse.value ? clientHeight.value * 2 : 0;
-  totalHeight.value = top + pad;
-  emit('blockCount', blocks.value.length);
+function showsLineNumber(kind) {
+  return kind !== 'blank-line' && kind !== 'link-ref-def';
 }
 
-// Merge new block metadata while preserving cached data/heights for unchanged blocks.
-// Returns the first index whose meta or cached data changed.
-function syncBlockState(newMeta) {
-  const oldData = blockData.value;
-  const oldHeights = blockHeights.value;
-  const oldBlocks = blocks.value;
-  let delta = 0;
-  if (anchorAfterEdit >= 0 && oldBlocks[anchorAfterEdit] && newMeta[anchorAfterEdit]) {
-    delta = (newMeta[anchorAfterEdit].end || 0) - (oldBlocks[anchorAfterEdit].end || 0);
+// ---------------------------------------------------------------------------
+// Layout engine: cumulative offsets + binary search
+// ---------------------------------------------------------------------------
+
+function estimateHeight(i) {
+  if (editingIndex.value === i && editingHeight.value > 0) return editingHeight.value;
+  const h = heights[i];
+  if (h > 0) return h;
+  const m = meta[i];
+  if (!m) return MIN_BLOCK_HEIGHT;
+  let lines;
+  const nextStart = startLines[i + 1];
+  if (nextStart != null && startLines[i] != null) {
+    lines = Math.max(1, nextStart - startLines[i]);
+  } else {
+    const span = Math.max(0, (m.end || 0) - (m.start || 0));
+    lines = Math.max(1, Math.round(span / AVG_CHARS_PER_LINE));
   }
-  const keyToData = new Map();
-  const shiftedKeyToData = new Map();
-  for (let i = 0; i < oldBlocks.length; i++) {
-    if (!oldData.has(i)) continue;
-    const b = oldBlocks[i];
-    const data = oldData.get(i);
-    const height = oldHeights[i];
-    const key = `${b.kind}:${b.start}:${b.end}`;
-    if (!keyToData.has(key)) keyToData.set(key, { data, height });
-    if (anchorAfterEdit >= 0 && i > anchorAfterEdit) {
-      const shiftedKey = `${b.kind}:${b.start + delta}:${b.end + delta}`;
-      if (!shiftedKeyToData.has(shiftedKey)) shiftedKeyToData.set(shiftedKey, { data, height });
+  return Math.max(MIN_BLOCK_HEIGHT, lines * LINE_HEIGHT + 6);
+}
+
+// Rebuild cumulative offsets starting at `fromIndex` (everything before is
+// assumed unchanged). O(n - fromIndex); called only when heights/meta
+// actually change, never on every scroll frame.
+function rebuildOffsets(fromIndex = 0) {
+  let top = fromIndex > 0 && offsets[fromIndex] != null ? offsets[fromIndex] : 0;
+  for (let i = fromIndex; i < meta.length; i++) {
+    offsets[i] = top;
+    top += estimateHeight(i);
+  }
+  offsets[meta.length] = top;
+  offsets.length = meta.length + 1;
+  const pad = hasMoreToParse.value ? clientHeight.value * 2 : 0;
+  totalHeight.value = top + pad;
+  layoutVersion.value++;
+  emit('blockCount', meta.length);
+}
+
+// Largest index i such that offsets[i] <= y (i.e. the block containing y).
+function findIndexAtOffset(y) {
+  if (meta.length === 0) return 0;
+  let lo = 0, hi = meta.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (offsets[mid] <= y) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+const visibleRange = computed(() => {
+  layoutVersion.value; // track
+  if (meta.length === 0) return { start: 0, end: -1 };
+  const lo = Math.max(0, scrollTop.value - RENDER_BUFFER);
+  const hi = Math.min(offsets[meta.length] || 0, scrollTop.value + clientHeight.value + RENDER_BUFFER);
+  const start = findIndexAtOffset(lo);
+  const end = Math.min(meta.length - 1, findIndexAtOffset(hi));
+  return { start, end: Math.max(start, end) };
+});
+
+const visibleBlocks = computed(() => {
+  dataVersion.value; // track
+  const { start, end } = visibleRange.value;
+  const arr = [];
+  for (let i = start; i <= end; i++) {
+    const m = meta[i];
+    if (!m) continue;
+    arr.push({
+      index: i,
+      top: offsets[i],
+      height: (offsets[i + 1] ?? offsets[i]) - offsets[i],
+      kind: m.kind,
+      start: m.start,
+      end: m.end,
+      startLine: startLines[i] || (i + 1),
+      data: cache.get(i) || m,
+    });
+  }
+  return arr;
+});
+
+// Read-only view of block metadata, exposed for backward compatibility.
+const blocks = computed(() => meta.map((m, i) => ({ index: i, ...m })));
+
+// ---------------------------------------------------------------------------
+// Block data cache (bounded — avoids unbounded memory growth after lots of
+// scrolling through a very large document).
+// ---------------------------------------------------------------------------
+
+function cacheSet(index, data) {
+  if (!cache.has(index)) cacheKeys.push(index);
+  cache.set(index, data);
+  if (cache.size > MAX_CACHE_ENTRIES) evictCache();
+}
+
+function evictCache() {
+  const target = Math.floor(MAX_CACHE_ENTRIES * 0.8);
+  if (cache.size <= target) return;
+  const { start, end } = visibleRange.value;
+  const keep = [];
+  let iterations = cacheKeys.length;
+  while (cacheKeys.length && cache.size > target && iterations-- > 0) {
+    const k = cacheKeys.shift();
+    if (!cache.has(k)) continue;
+    if (k >= start && k <= end) { keep.push(k); continue; }
+    cache.delete(k);
+  }
+  cacheKeys.push(...keep);
+}
+
+// ---------------------------------------------------------------------------
+// Structural sync: merge new block metadata (after load / chunk-parse /
+// edit) while preserving cached data & measured heights for blocks whose
+// identity (kind + byte span) is unchanged, or whose span merely shifted by
+// a known delta because an earlier block in the document grew/shrank.
+// ---------------------------------------------------------------------------
+
+function keyOf(kind, start, end) {
+  return `${kind}:${start}:${end}`;
+}
+
+function syncBlockState(newMetaRaw, newStartLines) {
+  const oldMeta = meta;
+  const oldHeights = heights;
+  const oldCache = cache;
+
+  let delta = 0;
+  if (anchorAfterEdit >= 0 && oldMeta[anchorAfterEdit] && newMetaRaw[anchorAfterEdit]) {
+    delta = (newMetaRaw[anchorAfterEdit].end || 0) - (oldMeta[anchorAfterEdit].end || 0);
+  }
+
+  const directMap = new Map();
+  const shiftedMap = new Map();
+  for (let i = 0; i < oldMeta.length; i++) {
+    const b = oldMeta[i];
+    const h = oldHeights[i];
+    const d = oldCache.get(i);
+    if (!(h > 0) && !d) continue;
+    const key = keyOf(b.kind, b.start, b.end);
+    if (!directMap.has(key)) directMap.set(key, { h, d });
+    if (anchorAfterEdit >= 0 && i > anchorAfterEdit && delta !== 0) {
+      const shiftedKey = keyOf(b.kind, b.start + delta, b.end + delta);
+      if (!shiftedMap.has(shiftedKey)) shiftedMap.set(shiftedKey, { h, d });
     }
   }
-  const newBlocks = newMeta.map((m, i) => ({ index: i, ...m }));
-  const newData = new Map();
-  const newHeights = new Array(newBlocks.length).fill(0);
+
+  const newMeta = newMetaRaw.map(m => ({ kind: m.kind, start: m.start, end: m.end }));
+  const newHeights = new Array(newMeta.length).fill(0);
+  const newCache = new Map();
   let firstChanged = Infinity;
-  for (let i = 0; i < newBlocks.length; i++) {
-    const b = newBlocks[i];
+  for (let i = 0; i < newMeta.length; i++) {
     if (i === anchorAfterEdit) { firstChanged = Math.min(firstChanged, i); continue; }
-    const key = `${b.kind}:${b.start}:${b.end}`;
-    const shiftedKey = `${b.kind}:${b.start}:${b.end}`;
-    const kept = (anchorAfterEdit >= 0 && i > anchorAfterEdit ? shiftedKeyToData.get(shiftedKey) : null) || keyToData.get(key);
+    const key = keyOf(newMeta[i].kind, newMeta[i].start, newMeta[i].end);
+    const kept = (anchorAfterEdit >= 0 && i > anchorAfterEdit ? shiftedMap.get(key) : null) || directMap.get(key);
     if (kept) {
-      newData.set(i, kept.data);
-      newHeights[i] = kept.height;
+      newHeights[i] = kept.h || 0;
+      if (kept.d) newCache.set(i, kept.d);
     } else {
       firstChanged = Math.min(firstChanged, i);
     }
   }
-  blocks.value = newBlocks;
-  blockData.value = newData;
-  blockHeights.value = newHeights;
-  recomputeLayout(firstChanged < Infinity ? firstChanged : 0);
-  return firstChanged;
+
+  meta = newMeta;
+  heights = newHeights;
+  cache = newCache;
+  cacheKeys = Array.from(newCache.keys());
+  if (newStartLines) startLines = newStartLines;
+  anchorAfterEdit = -1;
+  rebuildOffsets(firstChanged < Infinity ? firstChanged : 0);
+  dataVersion.value++;
 }
 
-function getBlockHeight(i) {
-  if (editingBlockIndex.value === i && editingBlockHeight.value > 0) {
-    return editingBlockHeight.value;
+async function fetchLineNumbers(count) {
+  if (!count) return [];
+  try {
+    return await invoke('get_block_line_numbers', { startIndex: 0, count });
+  } catch (e) {
+    console.error('get_block_line_numbers:', e);
+    return [];
   }
-  const h = blockHeights.value[i];
-  if (h > 0) return h;
-  const b = blocks.value[i];
-  if (!b) return MIN_BLOCK_HEIGHT;
-  const span = Math.max(0, (b.end || 0) - (b.start || 0));
-  return Math.max(MIN_BLOCK_HEIGHT, Math.round((span / AVG_CHARS_PER_LINE) * LINE_HEIGHT));
 }
 
-const visibleBlocks = computed(() => {
-  const st = scrollTop.value - RENDER_BUFFER;
-  const en = scrollTop.value + clientHeight.value + RENDER_BUFFER;
-  return blockLayout.value.filter(b => {
-    const top = b.top;
-    const bottom = top + b.height;
-    return bottom >= st && top <= en;
-  });
-});
+// ---------------------------------------------------------------------------
+// Document loading
+// ---------------------------------------------------------------------------
 
 async function loadSourceView() {
   if (currentViewMode.value !== 'source') return;
@@ -229,10 +356,10 @@ async function loadDocument() {
     return;
   }
   if (!props.doc?.id) {
-    blocks.value = [];
-    blockData.value = new Map();
-    blockLayout.value = [];
+    meta = []; heights = []; offsets = [0]; cache = new Map(); cacheKeys = []; startLines = [];
     totalHeight.value = 0;
+    layoutVersion.value++;
+    dataVersion.value++;
     emit('blockCount', 0);
     return;
   }
@@ -240,43 +367,41 @@ async function loadDocument() {
   lastDocId = props.doc.id;
   const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
   const savedClient = viewport.value ? viewport.value.clientHeight : clientHeight.value;
-  // Anchor by the block currently in the middle of the viewport.
+  // Anchor by the block currently in the middle of the viewport so we can
+  // restore approximately the same visual position after re-layout.
   let anchorIndex = -1;
   let anchorOffset = 0;
-  if (!isDocChange && blockLayout.value.length) {
+  if (!isDocChange && meta.length) {
     const mid = savedScroll + savedClient / 2;
-    const found = blockLayout.value.find(b => b.top <= mid && b.top + b.height > mid);
-    if (found) {
-      anchorIndex = found.index;
-      anchorOffset = mid - found.top;
-    }
+    anchorIndex = findIndexAtOffset(mid);
+    anchorOffset = mid - (offsets[anchorIndex] || 0);
   }
   layoutReady.value = false;
-  editingBlockIndex.value = -1;
-  editingBlockHeight.value = 0;
-  blockData.value = new Map();
-  blockHeights.value = [];
+  editingIndex.value = -1;
+  editingHeight.value = 0;
+  cache = new Map();
+  cacheKeys = [];
   try {
-    const meta = await invoke('get_syntax_tree_meta');
+    const rawMeta = await invoke('get_syntax_tree_meta');
     const [off, total] = await invoke('get_parsed_offset');
     parsedOffset.value = off;
     totalLen.value = total;
     hasMoreToParse.value = off < total;
-    blocks.value = meta.map((m, i) => ({ index: i, ...m }));
-    blockHeights.value = new Array(blocks.value.length).fill(0);
-    recomputeLayout();
+    meta = rawMeta.map(m => ({ kind: m.kind, start: m.start, end: m.end }));
+    heights = new Array(meta.length).fill(0);
+    startLines = await fetchLineNumbers(meta.length);
+    rebuildOffsets(0);
     scrollTop.value = isDocChange ? 0 : savedScroll;
     await updateVisibleAndLoad();
-    // Wait for the first real height measurement before restoring scroll
-    // so the browser doesn't clamp to an underestimated totalHeight.
+    // Wait for the first real height measurement before restoring scroll so
+    // the browser doesn't clamp to an underestimated totalHeight.
     await new Promise(r => requestAnimationFrame(r));
     await nextTick();
     measureHeights();
     await nextTick();
     let target = isDocChange ? 0 : savedScroll;
-    if (!isDocChange && anchorIndex >= 0 && blockLayout.value[anchorIndex]) {
-      const b = blockLayout.value[anchorIndex];
-      target = Math.max(0, b.top + anchorOffset - savedClient / 2);
+    if (!isDocChange && anchorIndex >= 0 && anchorIndex < meta.length) {
+      target = Math.max(0, offsets[anchorIndex] + anchorOffset - savedClient / 2);
     }
     setScrollTop(target);
   } catch (e) {
@@ -286,59 +411,73 @@ async function loadDocument() {
 
 watch(() => [props.doc?.id, currentViewMode.value], loadDocument);
 
+// ---------------------------------------------------------------------------
+// Scrolling — rendering of already-cached blocks is instant (driven by the
+// cheap `scrollTop` ref + binary search); fetching newly-visible block data
+// and lazy chunk-parsing are coalesced to at most once per animation frame
+// so fast/flung scrolling never queues up redundant work.
+// ---------------------------------------------------------------------------
+
 function onScroll() {
   if (ignoreScroll > 0) { ignoreScroll--; return; }
   if (suppressScroll.value || !viewport.value) return;
   scrollTop.value = viewport.value.scrollTop;
   if (gutter.value) gutter.value.scrollTop = scrollTop.value;
-  updateVisibleAndLoad();
-  maybeParseNextChunk();
+  scheduleVisibleUpdate();
+}
+
+function scheduleVisibleUpdate() {
+  if (visibleUpdateRaf) return;
+  visibleUpdateRaf = requestAnimationFrame(() => {
+    visibleUpdateRaf = 0;
+    updateVisibleAndLoad();
+    maybeParseNextChunk();
+  });
 }
 
 function setScrollTop(value) {
   if (!viewport.value) return;
-  if (viewport.value.scrollTop === value) return;
+  const clamped = Math.max(0, value);
+  if (viewport.value.scrollTop === clamped) return;
   ignoreScroll++;
-  viewport.value.scrollTop = value;
-  scrollTop.value = value;
+  viewport.value.scrollTop = clamped;
+  scrollTop.value = clamped;
+  if (gutter.value) gutter.value.scrollTop = clamped;
 }
 
 function restoreScroll(savedScroll) {
   if (!viewport.value) return;
   const ch = viewport.value.clientHeight || clientHeight.value;
   let target = savedScroll;
-  if (anchorAfterEdit >= 0 && blockLayout.value[anchorAfterEdit]) {
-    const b = blockLayout.value[anchorAfterEdit];
-    target = Math.max(0, b.top - ch / 4);
-    anchorAfterEdit = -1;
+  if (anchorAfterEdit >= 0 && offsets[anchorAfterEdit] != null) {
+    target = Math.max(0, offsets[anchorAfterEdit] - ch / 4);
   }
+  anchorAfterEdit = -1;
   setScrollTop(target);
-}
-
-let scrollRaf = 0;
-function scheduleScroll() {
-  if (scrollRaf) return;
-  scrollRaf = requestAnimationFrame(() => {
-    scrollRaf = 0;
-    onScroll();
-  });
 }
 
 async function updateVisibleAndLoad() {
   if (loadingVisible) return;
   loadingVisible = true;
   try {
-    const toLoad = visibleBlocks.value
-      .filter(b => !blockData.value.has(b.index) && loadingBlockIndex.value !== b.index && editingBlockIndex.value !== b.index)
-      .map(b => b.index);
+    const { start, end } = visibleRange.value;
+    const toLoad = [];
+    for (let i = start; i <= end; i++) {
+      if (i === editingIndex.value) continue;
+      if (cache.has(i) || loadingSet.has(i)) continue;
+      toLoad.push(i);
+    }
     if (toLoad.length) {
-      const results = await Promise.all(toLoad.map(i => loadBlockData(i)));
-      for (const data of results) {
-        if (data) {
-          blockData.value.set(data.index, data);
-          blockHeights.value[data.index] = 0;
+      toLoad.forEach(i => loadingSet.add(i));
+      try {
+        const results = await Promise.all(toLoad.map(loadBlockData));
+        for (const data of results) {
+          if (data) cacheSet(data.index, data);
         }
+      } finally {
+        toLoad.forEach(i => loadingSet.delete(i));
       }
+      dataVersion.value++;
     }
     nextTick(() => requestAnimationFrame(measureHeights));
   } finally {
@@ -347,8 +486,6 @@ async function updateVisibleAndLoad() {
 }
 
 async function loadBlockData(index) {
-  if (loadingBlockIndex.value === index || editingBlockIndex.value === index) return null;
-  if (blockData.value.has(index)) return null;
   try {
     const data = await invoke('get_block_data', { blockIndex: index });
     if (data) return { ...data, index };
@@ -364,14 +501,14 @@ function measureHeights() {
   let firstChanged = Infinity;
   for (const el of els) {
     const idx = Number(el.dataset.blockIndex);
-    if (editingBlockIndex.value === idx) continue;
+    if (editingIndex.value === idx) continue;
     const h = el.offsetHeight;
-    if (h > 0 && h !== blockHeights.value[idx]) {
-      blockHeights.value[idx] = h;
+    if (h > 0 && h !== heights[idx]) {
+      heights[idx] = h;
       firstChanged = Math.min(firstChanged, idx);
     }
   }
-  if (firstChanged < Infinity) recomputeLayout(firstChanged);
+  if (firstChanged < Infinity) rebuildOffsets(firstChanged);
   layoutReady.value = true;
 }
 
@@ -381,30 +518,24 @@ async function maybeParseNextChunk() {
   if (scrollTop.value < parsedEnd) return;
   chunkParsing.value = true;
   try {
-    const [newOffset, total, newBlockCount] = await invoke('parse_next_chunk');
+    const [newOffset, total] = await invoke('parse_next_chunk');
     parsedOffset.value = newOffset;
     totalLen.value = total;
     hasMoreToParse.value = newOffset < total;
-    const meta = await invoke('get_syntax_tree_meta');
-    const oldBlocks = blocks.value;
-    const oldHeights = blockHeights.value;
-    const newBlocks = meta.map((m, i) => {
-      const old = i < oldBlocks.length ? oldBlocks[i] : null;
-      if (old && old.kind === m.kind && old.start === m.start && old.end === m.end) {
-        return { ...old, ...m };
-      }
-      return { index: i, ...m };
-    });
-    blocks.value = newBlocks;
-    blockHeights.value = newBlocks.map((b, i) => oldHeights[i] || 0);
-    recomputeLayout();
-    updateVisibleAndLoad();
+    const rawMeta = await invoke('get_syntax_tree_meta');
+    const newStartLines = await fetchLineNumbers(rawMeta.length);
+    syncBlockState(rawMeta, newStartLines);
+    await updateVisibleAndLoad();
   } catch (e) {
     console.error('parse_next_chunk:', e);
   } finally {
     chunkParsing.value = false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Click-to-edit
+// ---------------------------------------------------------------------------
 
 let mouseDownX = 0;
 let mouseDownY = 0;
@@ -418,7 +549,7 @@ function onBlockClick(index, e) {
   if (e.target.closest('a')) return;
   const dx = Math.abs(e.clientX - mouseDownX);
   const dy = Math.abs(e.clientY - mouseDownY);
-  if (dx > 3 || dy > 3) return;
+  if (dx > 3 || dy > 3) return; // was a drag-selection, not a click
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return;
   e.stopPropagation();
@@ -426,29 +557,26 @@ function onBlockClick(index, e) {
 }
 
 async function enterEdit(index) {
-  if (editingBlockIndex.value === index) return;
-  if (editingBlockIndex.value >= 0) {
+  if (editingIndex.value === index) return;
+  if (editingIndex.value >= 0) {
     await exitEdit(true);
   }
-  loadingBlockIndex.value = -1;
-  if (index < 0 || index >= blocks.value.length) return;
+  if (index < 0 || index >= meta.length) return;
 
-  let data = blockData.value.get(index);
+  let data = cache.get(index);
   if (!data) {
-    loadingBlockIndex.value = index;
+    loadingSet.add(index);
     try {
-      data = await invoke('get_block_data', { blockIndex: index });
-      if (data) blockData.value.set(index, data);
-    } catch (e) {
-      console.error('enterEdit get_block_data:', e);
+      data = await loadBlockData(index);
+      if (data) cacheSet(index, data);
+    } finally {
+      loadingSet.delete(index);
     }
-    if (loadingBlockIndex.value !== index) return;
-    loadingBlockIndex.value = -1;
   }
   if (!data) return;
 
   const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
-  editingBlockIndex.value = index;
+  editingIndex.value = index;
   editSource.value = data.source || '';
   editOriginal.value = editSource.value;
   nextTick(() => {
@@ -465,19 +593,21 @@ async function enterEdit(index) {
 }
 
 async function exitEdit(force) {
-  if (editingBlockIndex.value < 0) return;
-  const index = editingBlockIndex.value;
+  if (editingIndex.value < 0) return;
+  const index = editingIndex.value;
   const old = editOriginal.value;
   const changed = editSource.value !== old;
 
   if (changed || force) {
     try {
       await invoke('replace_block', { blockIndex: index, newSource: editSource.value });
-      const meta = await invoke('get_syntax_tree_meta');
+      const rawMeta = await invoke('get_syntax_tree_meta');
+      const newStartLines = await fetchLineNumbers(rawMeta.length);
       anchorAfterEdit = index;
-      syncBlockState(meta);
+      syncBlockState(rawMeta, newStartLines);
       const data = await invoke('get_block_data', { blockIndex: index });
-      if (data) blockData.value.set(index, data);
+      if (data) cacheSet(index, data);
+      dataVersion.value++;
       if (changed) emit('dirty', true);
     } catch (e) {
       console.error('exitEdit replace:', e);
@@ -485,8 +615,8 @@ async function exitEdit(force) {
   }
 
   const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
-  editingBlockIndex.value = -1;
-  editingBlockHeight.value = 0;
+  editingIndex.value = -1;
+  editingHeight.value = 0;
   editSource.value = '';
   editOriginal.value = '';
   textareaEl = null;
@@ -526,11 +656,11 @@ function autoSize(el) {
   if (!el || !el.isConnected) return;
   el.style.height = 'auto';
   el.style.height = `${el.scrollHeight}px`;
-  if (editingBlockIndex.value >= 0) {
-    const oldHeight = editingBlockHeight.value;
-    editingBlockHeight.value = el.scrollHeight;
-    if (editingBlockHeight.value !== oldHeight) {
-      recomputeLayout();
+  if (editingIndex.value >= 0) {
+    const oldHeight = editingHeight.value;
+    editingHeight.value = el.scrollHeight;
+    if (editingHeight.value !== oldHeight) {
+      rebuildOffsets(editingIndex.value);
     }
   }
 }
@@ -542,11 +672,15 @@ function posToLineCol(text, offset) {
   return { line, col };
 }
 
+// Reports the ABSOLUTE document line/column (not just the position within
+// the block's local source) so the status bar always matches reality.
 function updateCursorFromTextarea() {
   const el = textareaEl;
   if (!el) return;
+  const idx = editingIndex.value;
+  const base = idx >= 0 ? (startLines[idx] || (idx + 1)) : 1;
   const pos = posToLineCol(editSource.value, el.selectionStart);
-  emit('cursor', pos);
+  emit('cursor', { line: base - 1 + pos.line, col: pos.col });
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +688,7 @@ function updateCursorFromTextarea() {
 // ---------------------------------------------------------------------------
 
 function getActiveTextarea() {
-  if (editingBlockIndex.value < 0) return null;
+  if (editingIndex.value < 0) return null;
   if (textareaEl && textareaEl.isConnected) return textareaEl;
   return viewport.value?.querySelector('textarea.md-block-textarea') || null;
 }
@@ -574,14 +708,10 @@ function findBlockFromSelection() {
 }
 
 async function getBlockSource(index) {
-  let data = blockData.value.get(index);
+  let data = cache.get(index);
   if (!data) {
-    try {
-      data = await invoke('get_block_data', { blockIndex: index });
-      if (data) blockData.value.set(index, data);
-    } catch (e) {
-      console.error('getBlockSource:', e);
-    }
+    data = await loadBlockData(index);
+    if (data) cacheSet(index, data);
   }
   return data?.source || '';
 }
@@ -591,11 +721,13 @@ async function replaceBlockSource(index, newSource) {
     const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
     await invoke('replace_block', { blockIndex: index, newSource });
     emit('dirty', true);
-    const meta = await invoke('get_syntax_tree_meta');
+    const rawMeta = await invoke('get_syntax_tree_meta');
+    const newStartLines = await fetchLineNumbers(rawMeta.length);
     anchorAfterEdit = index;
-    syncBlockState(meta);
+    syncBlockState(rawMeta, newStartLines);
     const data = await invoke('get_block_data', { blockIndex: index });
-    if (data) blockData.value.set(index, data);
+    if (data) cacheSet(index, data);
+    dataVersion.value++;
     await updateVisibleAndLoad();
     nextTick(() => requestAnimationFrame(() => {
       measureHeights();
@@ -654,17 +786,14 @@ function toggleWrap(ta, prefix, suffix) {
   const hasPrefix = before.endsWith(prefix);
   const hasSuffix = after.startsWith(suffix);
   if (selected && hasPrefix && hasSuffix) {
-    // unwrap
     ta.value = before.slice(0, -prefix.length) + selected + after.slice(suffix.length);
     ta.selectionStart = start - prefix.length;
     ta.selectionEnd = end - prefix.length;
   } else if (selected) {
-    // wrap
     ta.value = before + prefix + selected + suffix + after;
     ta.selectionStart = start + prefix.length;
     ta.selectionEnd = end + prefix.length;
   } else {
-    // nothing selected, insert wrappers and place cursor between
     ta.value = before + prefix + suffix + after;
     ta.selectionStart = start + prefix.length;
     ta.selectionEnd = start + prefix.length;
@@ -684,15 +813,10 @@ function toggleLinePrefix(ta, prefix) {
   const sel = value.substring(start, end);
   const lines = sel.split('\n');
   const allPrefixed = lines.every(line => line.startsWith(prefix));
-  let newSel;
-  if (allPrefixed) {
-    newSel = lines.map(line => line.slice(prefix.length)).join('\n');
-  } else {
-    newSel = lines.map(line => (line ? prefix + line : '')).join('\n');
-  }
-  const newBefore = before;
-  const newAfter = after;
-  ta.value = newBefore + newSel + newAfter;
+  const newSel = allPrefixed
+    ? lines.map(line => line.slice(prefix.length)).join('\n')
+    : lines.map(line => (line ? prefix + line : '')).join('\n');
+  ta.value = before + newSel + after;
   ta.selectionStart = start;
   ta.selectionEnd = start + newSel.length;
   editSource.value = ta.value;
@@ -756,9 +880,7 @@ async function insertThematicBreak() {
     nextTick(() => autoSize(ta));
     updateCursorFromTextarea();
   } else {
-    // Insert as a new block at the end of the current document if not editing.
-    const value = '---\n';
-    await invoke('insert_text', { position: totalLen.value || 0, text: value });
+    await invoke('insert_text', { position: totalLen.value || 0, text: '---\n' });
     await loadDocument();
     emit('dirty', true);
   }
@@ -887,8 +1009,6 @@ function focusFirst() {
   viewport.value.focus();
 }
 
-let resizeObserver = null;
-
 onMounted(() => {
   if (viewport.value) {
     clientHeight.value = viewport.value.clientHeight;
@@ -897,7 +1017,7 @@ onMounted(() => {
       const h = entries[0]?.contentRect?.height || viewport.value?.clientHeight || 0;
       if (h > 0 && h !== clientHeight.value) {
         clientHeight.value = h;
-        updateVisibleAndLoad();
+        scheduleVisibleUpdate();
       }
     });
     resizeObserver.observe(viewport.value);
@@ -906,7 +1026,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  if (scrollRaf) cancelAnimationFrame(scrollRaf);
+  if (visibleUpdateRaf) cancelAnimationFrame(visibleUpdateRaf);
   if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
 });
 
@@ -929,7 +1049,7 @@ defineExpose({
   insertThematicBreak,
   insertCodeBlock,
   getActiveTextarea,
-  editingBlockIndex,
+  editingBlockIndex: editingIndex,
   blocks,
   focusFirst,
   loadDocument,
