@@ -228,6 +228,17 @@ fn serialize_inline(il: &Inline, s: &mut String) {
             s.push_str(t);
             s.push_str(&fence);
         }
+        Inline::MathSpan(_, t, display) => {
+            if *display {
+                s.push_str("\\[");
+                s.push_str(t);
+                s.push_str("\\]");
+            } else {
+                s.push_str("\\(");
+                s.push_str(t);
+                s.push_str("\\)");
+            }
+        }
         Inline::Link(l) => match l.style {
             LinkStyle::Inline => {
                 s.push('[');

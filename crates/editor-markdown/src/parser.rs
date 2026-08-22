@@ -875,6 +875,26 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
     while i < region.len() {
         let b = region[i];
 
+        // LaTeX math: \( ... \) and \[ ... \].
+        if b == b'\\' && i + 1 < region.len() {
+            let open_br = region[i + 1];
+            if open_br == b'(' || open_br == b'[' {
+                let close_br = if open_br == b'(' { b')' } else { b']' };
+                if let Some(close) = find_math_close(&region[i + 2..], close_br) {
+                    flush_text(&mut out, text_start, i);
+                    let math_start = i + 2;
+                    let math_end = i + 2 + close;
+                    let span = SourceSpan::new(abs(i), abs(math_end + 2));
+                    let math = String::from_utf8_lossy(&region[math_start..math_end]).to_string();
+                    let display = open_br == b'[';
+                    out.push(Inline::MathSpan(NodeMeta { span, dirty: false }, math, display));
+                    i = math_end + 2;
+                    text_start = i;
+                    continue;
+                }
+            }
+        }
+
         // Escape.
         if b == b'\\' && i + 1 < region.len() && is_ascii_punct(region[i + 1]) {
             flush_text(&mut out, text_start, i);
@@ -1030,6 +1050,18 @@ fn find_str(region: &[u8], needle: &[u8]) -> Option<usize> {
     region.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Find the first un-escaped `\)` or `\]` closing a LaTeX math span.
+fn find_math_close(region: &[u8], close_br: u8) -> Option<usize> {
+    let mut i = 0usize;
+    while i + 1 < region.len() {
+        if region[i] == b'\\' && region[i + 1] == close_br {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 struct Parsed {
     node: Inline,
     end: usize,
@@ -1087,8 +1119,8 @@ fn rebase_inline(il: Inline, span: SourceSpan) -> Inline {
     let m = il.meta();
     let _ = m;
     match &mut il {
-        Inline::Text(m, _) | Inline::CodeSpan(m, _, _) | Inline::Autolink(m, _)
-        | Inline::HardBreak(m) | Inline::RawHtml(m) | Inline::UnknownInline(m) => {
+        Inline::Text(m, _) | Inline::CodeSpan(m, _, _) | Inline::MathSpan(m, _, _)
+        | Inline::Autolink(m, _) | Inline::HardBreak(m) | Inline::RawHtml(m) | Inline::UnknownInline(m) => {
             m.span = span;
         }
         Inline::Emphasis(m, children, _) | Inline::Strong(m, children, _)
@@ -1233,6 +1265,7 @@ fn collect_text(inlines: &[Inline]) -> String {
                 s.push_str(&collect_text(c));
             }
             Inline::CodeSpan(_, t, _) => s.push_str(t),
+            Inline::MathSpan(_, t, _) => s.push_str(t),
             Inline::Link(l) => s.push_str(&collect_text(&l.inlines)),
             _ => {}
         }

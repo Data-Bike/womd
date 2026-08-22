@@ -310,6 +310,8 @@ pub enum Inline {
     Strikethrough(NodeMeta, Vec<Inline>),
     /// Inline code span (§8.1). Preserves delimiter length.
     CodeSpan(NodeMeta, String, u8),
+    /// LaTeX math: \( ... \) for inline, \[ ... \] for display.
+    MathSpan(NodeMeta, String, bool),
     /// Link (§11).
     Link(Link),
     /// Image (§13).
@@ -327,8 +329,8 @@ pub enum Inline {
 impl Inline {
     pub fn meta(&self) -> NodeMeta {
         match self {
-            Self::Text(m, _) | Self::CodeSpan(m, _, _) | Self::Autolink(m, _)
-            | Self::HardBreak(m) | Self::RawHtml(m) | Self::UnknownInline(m) => *m,
+            Self::Text(m, _) | Self::CodeSpan(m, _, _) | Self::MathSpan(m, _, _)
+            | Self::Autolink(m, _) | Self::HardBreak(m) | Self::RawHtml(m) | Self::UnknownInline(m) => *m,
             Self::Emphasis(m, _, _) | Self::Strong(m, _, _) | Self::Strikethrough(m, _) => *m,
             Self::Link(l) => l.meta,
             Self::Image(i) => i.meta,

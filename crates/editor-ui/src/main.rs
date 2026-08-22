@@ -182,6 +182,7 @@ enum AstNode {
     CodeSpan { text: String },
     Link { children: Vec<AstNode>, destination: String, title: Option<String> },
     Image { alt: String, destination: String, title: Option<String> },
+    Math { content: String, display: bool },
     Autolink { url: String },
     HardBreak,
     RawHtml { content: String },
@@ -2013,6 +2014,7 @@ fn inline_to_ast_relative(inline: &editor_markdown::Inline, text: &str, base: u6
             children: children.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
         },
         Inline::CodeSpan(_, s, _) => AstNode::CodeSpan { text: s.clone() },
+        Inline::MathSpan(_, s, d) => AstNode::Math { content: s.clone(), display: *d },
         Inline::Link(l) => AstNode::Link {
             children: l.inlines.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
             destination: l.destination.clone(),
@@ -2128,6 +2130,7 @@ fn inline_to_ast(inline: &editor_markdown::Inline, text: &str) -> AstNode {
             children: children.iter().map(|i| inline_to_ast(i, text)).collect(),
         },
         Inline::CodeSpan(_, s, _) => AstNode::CodeSpan { text: s.clone() },
+        Inline::MathSpan(_, s, d) => AstNode::Math { content: s.clone(), display: *d },
         Inline::Link(l) => AstNode::Link {
             children: l.inlines.iter().map(|i| inline_to_ast(i, text)).collect(),
             destination: l.destination.clone(),

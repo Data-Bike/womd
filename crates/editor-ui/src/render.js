@@ -1,5 +1,7 @@
 // AST-based Markdown rendering, ported from the legacy vanilla frontend.
 
+import katex from 'katex';
+
 export function escapeHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -20,12 +22,30 @@ export function renderBlockHtml(block) {
   return `<div class="md-block-placeholder" style="padding:8px;color:var(--fg-muted)">…</div>`;
 }
 
+function renderMath(content, display) {
+  try {
+    return katex.renderToString(content, { displayMode: display, throwOnError: false });
+  } catch (e) {
+    return `<span class="math-error" title="${escapeHtml(String(e))}">${escapeHtml(content)}</span>`;
+  }
+}
+
 export function renderAstNode(node) {
   if (!node) return "";
   switch (node.type) {
     case "Heading":
       return `<h${node.level}>${renderAstChildren(node.children)}</h${node.level}>`;
     case "Paragraph":
+      // A single display-math paragraph is rendered as a block-level formula,
+      // not wrapped in a <p>, to keep KaTeX's display output valid.
+      if (
+        node.children &&
+        node.children.length === 1 &&
+        node.children[0].type === "Math" &&
+        node.children[0].display
+      ) {
+        return renderAstNode(node.children[0]);
+      }
       return `<p>${renderAstChildren(node.children)}</p>`;
     case "ThematicBreak":
       return "<hr/>";
@@ -43,6 +63,8 @@ export function renderAstNode(node) {
       return `<div style="display:none"></div>`;
     case "BlankLine":
       return "";
+    case "Math":
+      return renderMath(node.content, node.display);
     case "Text":
       return escapeHtml(node.text);
     case "Emphasis":
