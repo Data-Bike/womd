@@ -590,4 +590,37 @@ mod tests {
         let out = serialize(&doc, src);
         assert_eq!(out, src, "round-trip mismatch after chunked merge");
     }
+
+    #[test]
+    fn roundtrip_inline_math() {
+        let src = b"This is \\(ROA_{it}\\) inline.\n";
+        let out = roundtrip(src, MarkdownProfile::Gfm);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn roundtrip_display_math() {
+        let src = b"\\[\nROA_{it}=\\beta_1 Leverage_{it}+\\varepsilon_{it}.\n\\]\n";
+        let out = roundtrip(src, MarkdownProfile::Gfm);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn math_underscores_not_emphasis() {
+        let src = b"This is \\(ROA_{it}\\) inline.\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let para = &doc.blocks[0];
+        if let Block::Paragraph(Paragraph { inlines, .. }) = para {
+            let mut found_math = false;
+            for il in inlines {
+                if let Inline::MathSpan(_, content, false) = il {
+                    assert_eq!(content, "ROA_{it}");
+                    found_math = true;
+                }
+            }
+            assert!(found_math, "expected inline math span");
+        } else {
+            panic!("expected a paragraph");
+        }
+    }
 }
