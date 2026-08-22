@@ -1,7 +1,18 @@
 <template>
   <div id="editor-container">
     <div ref="gutter" id="line-gutter">
-      <div class="gutter-sizer" :style="{ height: `${totalHeight}px`, position: 'relative' }">
+      <template v-if="currentViewMode === 'source'">
+        <div
+          v-for="n in sourceLineCount"
+          :key="'s' + n"
+          class="gutter-line source-gutter-line"
+        >{{ n }}</div>
+      </template>
+      <div
+        v-else
+        class="gutter-sizer"
+        :style="{ height: `${totalHeight}px`, position: 'relative' }"
+      >
         <div
           v-for="row in visibleBlocks"
           :key="'g' + row.index"
@@ -16,24 +27,16 @@
       class="source-view"
     >
       <div v-if="sourceLoading" class="md-block-placeholder">Loading source...</div>
-      <div v-else class="source-view-wrap">
-        <div ref="sourceGutter" class="source-gutter">
-          <div
-            v-for="n in sourceLineCount"
-            :key="n"
-            class="source-gutter-line"
-          >{{ n }}</div>
-        </div>
-        <textarea
-          ref="sourceTextarea"
-          v-model="sourceText"
-          class="md-source-view"
-          spellcheck="false"
-          @input="onSourceInput"
-          @scroll="syncSourceScroll"
-          @keydown="onSourceKeydown"
-        />
-      </div>
+      <textarea
+        v-else
+        ref="sourceTextarea"
+        v-model="sourceText"
+        class="md-source-view"
+        spellcheck="false"
+        @input="onSourceInput"
+        @scroll="syncSourceScrollToGutter"
+        @keydown="onSourceKeydown"
+      />
     </div>
     <div
       v-else
@@ -161,13 +164,12 @@ const suppressScroll = ref(false);
 const sourceText = ref('');
 const sourceLoading = ref(false);
 const sourceTextarea = ref(null);
-const sourceGutter = ref(null);
 
 const sourceLineCount = computed(() => Math.max(1, sourceText.value.split(/\r?\n/).length));
 
-function syncSourceScroll() {
-  if (sourceGutter.value && sourceTextarea.value) {
-    sourceGutter.value.scrollTop = sourceTextarea.value.scrollTop;
+function syncSourceScrollToGutter() {
+  if (gutter.value && sourceTextarea.value) {
+    gutter.value.scrollTop = sourceTextarea.value.scrollTop;
   }
 }
 
@@ -354,6 +356,11 @@ function syncBlockState(newMetaRaw, newStartLines) {
   const newMeta = newMetaRaw.map(m => ({ kind: m.kind, start: m.start, end: m.end }));
   const newHeights = new Array(newMeta.length).fill(0);
   const newCache = new Map();
+  // Use the previous measured height of the edited block as a starting
+  // estimate so the following blocks don't jump/shift while it re-renders.
+  if (anchorAfterEdit >= 0 && anchorAfterEdit < oldHeights.length) {
+    newHeights[anchorAfterEdit] = oldHeights[anchorAfterEdit] || 0;
+  }
   let firstChanged = Infinity;
   for (let i = 0; i < newMeta.length; i++) {
     if (i === anchorAfterEdit) { firstChanged = Math.min(firstChanged, i); continue; }

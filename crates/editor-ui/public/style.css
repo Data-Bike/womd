@@ -566,11 +566,9 @@ body {
 #btn-view-toggle.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
 
 /* ═══ Markdown source view ═══ */
-#block-editor.source-view { font-family: "Cascadia Code", "Fira Code", "Consolas", monospace; font-size: 13px; line-height: 1.6; padding: 0; overflow: hidden; }
-.source-view-wrap { display: flex; width: 100%; height: 100%; overflow: hidden; }
-.source-gutter { flex: 0 0 48px; background: var(--surface-0, #1e1e2e); border-right: 1px solid var(--surface-1, #313244); overflow: hidden; text-align: right; padding: 8px 8px 8px 0; color: var(--fg-muted, #a6adc8); user-select: none; }
-.source-gutter-line { height: 1.6em; line-height: 1.6; }
-#block-editor.source-view .md-source-view { flex: 1; height: 100%; resize: none; border: none; outline: none; background: var(--bg, #1e1e2e); color: var(--syn-plain); padding: 8px; white-space: pre; overflow: auto; line-height: 1.6; font: inherit; }
+#block-editor.source-view { font-family: "Cascadia Code", "Fira Code", "Consolas", monospace; font-size: 13px; line-height: 1.7; padding: 0; overflow: hidden; }
+#line-gutter .source-gutter-line { height: 1.7em; line-height: 1.7; }
+#block-editor.source-view .md-source-view { width: 100%; height: 100%; box-sizing: border-box; resize: none; border: none; outline: none; background: var(--bg, #1e1e2e); color: var(--syn-plain); padding: 24px 32px; white-space: pre; overflow: auto; line-height: 1.7; font: inherit; }
 #block-editor.source-view .md-block { cursor: text; }
 #block-editor.source-view .empty-block { display: none; }
 
