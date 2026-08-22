@@ -222,8 +222,8 @@ function estimateHeight(i) {
     lines = Math.max(1, Math.round(span / AVG_CHARS_PER_LINE));
   }
   let factor = 1.0;
-  if (m.kind.includes('table')) factor = 2.0;
-  else if (m.kind.includes('list')) factor = 1.5;
+  if (m.kind.includes('table')) factor = 4.0;
+  else if (m.kind.includes('list')) factor = 2.5;
   else if (m.kind.startsWith('heading-')) factor = 1.4;
   lines = Math.max(1, Math.round(lines * factor));
   return Math.max(MIN_BLOCK_HEIGHT, lines * LINE_HEIGHT + 6);
@@ -465,6 +465,9 @@ async function loadDocument() {
       target = Math.max(0, offsets[anchorIndex] + anchorOffset - savedClient / 2);
     }
     setScrollTop(target);
+    // Some block heights (especially tables) settle after fonts/paint,
+    // so re-measure once more after a short delay.
+    setTimeout(() => requestAnimationFrame(measureHeights), 300);
   } catch (e) {
     console.error('loadDocument:', e);
   }
@@ -687,6 +690,9 @@ async function exitEdit(force) {
         measureHeights();
         restoreScroll(savedScroll);
       }));
+      // Re-measure after a short delay for tables/figures whose layout
+      // settles after initial paint.
+      setTimeout(() => requestAnimationFrame(measureHeights), 200);
     });
   });
 }
