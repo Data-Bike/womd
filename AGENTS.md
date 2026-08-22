@@ -7,6 +7,9 @@
   Requires `cargo-tauri` (`cargo install tauri-cli --version "^2"`).
 - `cargo run` — runs the `womd` binary which exercises the editor core and verifies
   the source-preservation invariants end-to-end.
+- `npm test` (from `crates/editor-ui/`) — runs the Vitest suite for pure frontend
+  logic (currently `src/lib/textEditing.js`, the shared block/source-view formatting
+  helpers). `npm run build` still must pass too.
 - Workspace uses `resolver = "3"`, edition 2024, Rust 1.95+.
 - `unsafe_code = "deny"` across the workspace (§74, §85). Exception: `editor-storage`
   uses `warn` + crate-root `deny` + `allow` only in `src/mmap.rs` (mmap requires unsafe,

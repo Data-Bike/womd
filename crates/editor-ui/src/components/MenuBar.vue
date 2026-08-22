@@ -32,7 +32,7 @@ import { ref } from 'vue';
 
 const emit = defineEmits([
   'new', 'open', 'save', 'save-as', 'close-window',
-  'undo', 'redo', 'cut', 'copy', 'paste', 'select-all', 'find', 'find-replace',
+  'undo', 'redo', 'cut', 'copy', 'paste', 'select-all', 'find', 'find-next', 'find-replace',
   'view-rendered', 'view-source', 'toggle-tree', 'toggle-git',
   'heading', 'bold', 'italic', 'strikethrough', 'code', 'link',
   'unordered-list', 'ordered-list', 'task-list', 'quote', 'hr', 'code-block', 'table', 'image',
@@ -65,7 +65,8 @@ const menus = [
       { label: 'Select All', action: () => emit('select-all'), shortcut: 'Ctrl+A' },
       null,
       { label: 'Find...', action: () => emit('find'), shortcut: 'Ctrl+F' },
-      { label: 'Find and Replace...', action: () => emit('find-replace'), shortcut: 'Ctrl+H', disabled: true },
+      { label: 'Find Next', action: () => emit('find-next'), shortcut: 'F3' },
+      { label: 'Find and Replace...', action: () => emit('find-replace'), shortcut: 'Ctrl+H' },
     ]
   },
   {
@@ -100,8 +101,8 @@ const menus = [
       { label: 'Quote', action: () => emit('quote') },
       { label: 'Thematic Break', action: () => emit('hr') },
       { label: 'Code Block', action: () => emit('code-block') },
-      { label: 'Table', action: () => emit('table'), disabled: true },
-      { label: 'Image', action: () => emit('image'), disabled: true },
+      { label: 'Table', action: () => emit('table') },
+      { label: 'Image', action: () => emit('image') },
     ]
   },
   {

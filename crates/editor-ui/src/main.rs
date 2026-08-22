@@ -582,6 +582,14 @@ fn redo(state: tauri::State<'_, Mutex<AppState>>) -> Result<EditResult, String> 
     Ok(edit_result_from_tab(tab))
 }
 
+/// Resolve which path a save should target: an explicit path (e.g. from a
+/// "Save As" dialog) takes precedence over the tab's existing file path.
+/// Pulled out as a pure function so the decision logic is unit-testable
+/// without a `tauri::State`/running app (see `tests::resolve_save_path_*`).
+fn resolve_save_path(explicit: Option<PathBuf>, tab_path: Option<&PathBuf>) -> Option<PathBuf> {
+    explicit.or_else(|| tab_path.cloned())
+}
+
 /// Save the active document to disk.
 #[tauri::command]
 fn save_document(
@@ -591,8 +599,10 @@ fn save_document(
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
     let bytes = tab.buffer.serialize();
-    let save_path = path.map(PathBuf::from).or_else(|| tab.file_path.clone());
-    let save_path = save_path.ok_or("no file path to save to")?;
+    let save_path = resolve_save_path(path.map(PathBuf::from), tab.file_path.as_ref());
+    let save_path = save_path.ok_or(
+        "no file path to save to — the frontend must prompt for one (untitled document)",
+    )?;
     editor_storage::atomic_save(&save_path, &bytes).map_err(|e| e.to_string())?;
     tab.buffer.mark_saved();
     tab.file_path = Some(save_path);
@@ -2697,6 +2707,73 @@ mod tests {
         move_file(src.to_string_lossy().to_string(), dest.to_string_lossy().to_string()).unwrap();
         assert!(!src.exists());
         assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit path (e.g. from a Save As dialog) always wins over the
+    /// tab's existing path.
+    #[test]
+    fn resolve_save_path_prefers_explicit_over_tab_path() {
+        let explicit = Some(PathBuf::from("C:\\new\\explicit.md"));
+        let tab_path = PathBuf::from("C:\\old\\tab.md");
+        assert_eq!(
+            resolve_save_path(explicit.clone(), Some(&tab_path)),
+            explicit
+        );
+    }
+
+    /// With no explicit path, fall back to the tab's existing file path.
+    #[test]
+    fn resolve_save_path_falls_back_to_tab_path() {
+        let tab_path = PathBuf::from("C:\\docs\\existing.md");
+        assert_eq!(
+            resolve_save_path(None, Some(&tab_path)),
+            Some(tab_path)
+        );
+    }
+
+    /// An untitled tab (no explicit path, no tab path) has nowhere to save —
+    /// `save_document` must surface this as an error rather than panicking
+    /// or silently writing nowhere. This is the exact scenario that used to
+    /// fail silently before the frontend was fixed to prompt a Save As
+    /// dialog for untitled documents (see App.vue::saveFile).
+    #[test]
+    fn resolve_save_path_none_when_untitled_and_no_explicit_path() {
+        assert_eq!(resolve_save_path(None, None), None);
+    }
+
+    /// End-to-end: saving a tab with a resolved path should write the exact
+    /// serialized buffer bytes to disk (source-preservation, Invariant 1).
+    #[test]
+    fn save_document_writes_resolved_path_to_disk() {
+        let dir = std::env::temp_dir().join("womd_test_save_document");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let dest = dir.join("out.md");
+
+        let tab = DocumentTab {
+            id: 1,
+            buffer: DocumentBuffer::open(
+                b"# Saved\n".to_vec(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("untitled.md"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: None,
+        };
+
+        let save_path = resolve_save_path(Some(dest.clone()), tab.file_path.as_ref())
+            .expect("explicit path must resolve");
+        let bytes = tab.buffer.serialize();
+        editor_storage::atomic_save(&save_path, &bytes).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"# Saved\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

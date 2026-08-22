@@ -4,7 +4,7 @@
       @new="newDoc"
       @open="openFileDialog"
       @save="saveFile"
-      @save-as="saveFile"
+      @save-as="saveFileAs"
       @close-window="closeWindow"
       @about="about"
       @undo="undo"
@@ -14,6 +14,7 @@
       @paste="paste"
       @select-all="selectAll"
       @find="findText"
+      @find-next="findNext"
       @find-replace="findReplace"
       @view-rendered="viewMode = 'rendered'"
       @view-source="viewMode = 'source'"
@@ -31,6 +32,8 @@
       @quote="() => applyLineFormat('> ')"
       @hr="insertHr"
       @code-block="insertCodeBlock"
+      @table="insertTable"
+      @image="insertImage"
       @settings="settingsOpen = true"
     />
     <ContextMenu
@@ -56,6 +59,8 @@
       @quote="() => applyLineFormat('> ')"
       @hr="insertHr"
       @code-block="insertCodeBlock"
+      @table="insertTable"
+      @image="insertImage"
       @view-rendered="viewMode = 'rendered'"
       @view-source="viewMode = 'source'"
       @toggle-tree="toggleTree"
@@ -152,7 +157,8 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
+import { open, save as saveDialog } from '@tauri-apps/plugin-dialog';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import MarkdownEditor from './components/MarkdownEditor.vue';
 import ToolBar from './components/ToolBar.vue';
 import StatusBar from './components/StatusBar.vue';
@@ -269,18 +275,53 @@ async function openFile(path) {
   }
 }
 
+// Prompt for a destination path via the native save dialog.
+async function pickSavePath() {
+  const suggested = activeFilePath.value || activeFileName.value || 'untitled.md';
+  return await saveDialog({
+    defaultPath: suggested,
+    filters: [{ name: 'Markdown', extensions: ['md', 'markdown', 'txt'] }],
+  });
+}
+
 async function saveFile() {
   if (!activeDoc.value) return;
   try {
     if (editorRef.value?.save) {
       await editorRef.value.save();
     }
-    await invoke('save_document', { path: activeFilePath.value || null });
+    let path = activeFilePath.value || null;
+    if (!path) {
+      // Untitled document: there is nowhere to save yet, so behave like
+      // "Save As" instead of silently failing.
+      path = await pickSavePath();
+      if (!path) return; // user cancelled the dialog
+    }
+    await invoke('save_document', { path });
     const t = activeTab.value;
     if (t) t.dirty = false;
     await refreshTabs();
   } catch (e) {
     console.error('saveFile:', e);
+    alert('Failed to save: ' + e);
+  }
+}
+
+async function saveFileAs() {
+  if (!activeDoc.value) return;
+  try {
+    const path = await pickSavePath();
+    if (!path) return;
+    if (editorRef.value?.save) {
+      await editorRef.value.save();
+    }
+    await invoke('save_document', { path });
+    const t = activeTab.value;
+    if (t) t.dirty = false;
+    await refreshTabs();
+  } catch (e) {
+    console.error('saveFileAs:', e);
+    alert('Failed to save: ' + e);
   }
 }
 
@@ -340,6 +381,12 @@ function insertHr() {
 function insertCodeBlock() {
   editorRef.value?.insertCodeBlock?.();
 }
+function insertTable() {
+  editorRef.value?.insertTable?.();
+}
+function insertImage() {
+  editorRef.value?.insertImage?.();
+}
 function toggleTask() {
   editorRef.value?.toggleTask?.();
 }
@@ -359,14 +406,132 @@ function onAppContextMenu(e) {
   ctxShow.value = true;
 }
 
+// Cut/copy work fine via execCommand in the WebView2/WKWebView engines Tauri
+// uses (they only require an existing selection, no special permission).
+// `execCommand('paste')`, however, is blocked by the browser engine for
+// security reasons and silently does nothing — so paste goes through the
+// async Clipboard API instead, inserting the text at the caret of whichever
+// textarea is currently focused (block-edit or source-view).
 function cut() { document.execCommand('cut'); }
 function copy() { document.execCommand('copy'); }
-function paste() { document.execCommand('paste'); }
-function selectAll() { document.execCommand('selectAll'); }
-function findText() { window.find?.('', false, false, true, false, true, false); }
-function findReplace() { alert('Find and Replace is not yet implemented.'); }
-function closeWindow() { window.close?.(); }
+
+async function paste() {
+  const el = document.activeElement;
+  if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        const start = el.selectionStart ?? el.value.length;
+        const end = el.selectionEnd ?? el.value.length;
+        el.setRangeText(text, start, end, 'end');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+    } catch (e) {
+      console.error('clipboard paste:', e);
+    }
+  }
+  // Fall back to the (often-blocked) execCommand as a last resort.
+  document.execCommand('paste');
+}
+
+function selectAll() {
+  const el = document.activeElement;
+  if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+    el.select();
+    return;
+  }
+  document.execCommand('selectAll');
+}
+
+// Find / Find Next operate on the active editable textarea (the source view,
+// or the block currently being edited). If there is nothing editable focused
+// — e.g. the user is looking at the rendered view — switch to source view
+// first so there is always something to search.
+const lastFindQuery = ref('');
+
+async function ensureEditableForFind() {
+  if (editorRef.value?.getActiveTextarea?.() || editorRef.value?.isSourceView) return;
+  viewMode.value = 'source';
+  await nextTick();
+}
+
+async function findText() {
+  const query = prompt('Find:', lastFindQuery.value);
+  if (!query) return;
+  lastFindQuery.value = query;
+  await ensureEditableForFind();
+  const found = editorRef.value?.findInEditor?.(query);
+  if (found === false) alert(`"${query}" not found.`);
+}
+
+async function findNext() {
+  if (!lastFindQuery.value) return findText();
+  await ensureEditableForFind();
+  const found = editorRef.value?.findInEditor?.(lastFindQuery.value);
+  if (found === false) alert(`"${lastFindQuery.value}" not found.`);
+}
+
+async function findReplace() {
+  const query = prompt('Find:', lastFindQuery.value);
+  if (!query) return;
+  const replacement = prompt('Replace with:', '');
+  if (replacement === null) return;
+  await ensureEditableForFind();
+  const ta = editorRef.value?.getActiveTextarea?.();
+  if (!ta) { alert('Open a document to use Find and Replace.'); return; }
+  const count = ta.value.split(query).length - 1;
+  if (count === 0) { alert(`"${query}" not found.`); return; }
+  if (!confirm(`Replace all ${count} occurrence(s) of "${query}"?`)) return;
+  ta.value = ta.value.split(query).join(replacement);
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function closeWindow() {
+  getCurrentWindow().close().catch((e) => console.error('closeWindow:', e));
+}
+
 function about() { alert('WoMD — Markdown Editor\nVersion 0.1.0'); }
+
+// ---------------------------------------------------------------------------
+// Global keyboard shortcuts. Every combo shown in the menus above must
+// actually work — a bare menu label is not a real shortcut. Preventing the
+// default action matters most for Ctrl+Z/Y: without it, a focused <textarea>
+// uses its own native undo stack, which silently desyncs from the backend
+// DocumentBuffer's undo stack (Invariant: buffer is the single source of
+// truth for undo/redo).
+// ---------------------------------------------------------------------------
+
+function isTypingTarget(el) {
+  return !!el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable);
+}
+
+function onGlobalKeydown(e) {
+  if (e.key === 'F3') { e.preventDefault(); findNext(); return; }
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod || e.altKey) return;
+  const key = e.key.toLowerCase();
+
+  // Shortcuts that must win even while typing in a document textarea.
+  switch (key) {
+    case 'n': e.preventDefault(); newDoc(); return;
+    case 'o': e.preventDefault(); openFileDialog(); return;
+    case 's': e.preventDefault(); (e.shiftKey ? saveFileAs() : saveFile()); return;
+    case 'z': e.preventDefault(); (e.shiftKey ? redo() : undo()); return;
+    case 'y': e.preventDefault(); redo(); return;
+    case 'f': e.preventDefault(); findText(); return;
+    case 'h': e.preventDefault(); findReplace(); return;
+  }
+
+  // Formatting shortcuts only make sense while editing document text.
+  if (!isTypingTarget(document.activeElement)) return;
+  switch (key) {
+    case 'b': e.preventDefault(); applyInlineFormat('**'); break;
+    case 'i': e.preventDefault(); applyInlineFormat('*'); break;
+  }
+}
+
+
 
 function detectLineEnding(text) {
   if (text.includes('\r\n')) return 'CRLF';
@@ -443,6 +608,7 @@ function scheduleAutosave() {
 watch(activeIsDirty, (dirty) => { if (dirty) scheduleAutosave(); });
 
 onMounted(async () => {
+  window.addEventListener('keydown', onGlobalKeydown);
   await refreshTabs();
   if (!tabs.value.length) {
     const defaultPath = 'C:/Users/gorod/RustroverProjects/womd/test_large.md';
@@ -453,5 +619,6 @@ onMounted(async () => {
 onUnmounted(() => {
   if (autosaveTimer) clearTimeout(autosaveTimer);
   if (resizeHandler) window.removeEventListener('resize', resizeHandler);
+  window.removeEventListener('keydown', onGlobalKeydown);
 });
 </script>

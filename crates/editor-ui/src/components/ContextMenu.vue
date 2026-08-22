@@ -2,7 +2,7 @@
   <div
     v-show="show"
     class="context-menu"
-    :style="{ top: `${y}px`, left: `${x}px` }"
+    :style="{ top: `${clampedY}px`, left: `${clampedX}px` }"
     @click.stop
   >
     <div
@@ -21,7 +21,7 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue';
+import { ref, watch, computed } from 'vue';
 
 const props = defineProps({
   show: Boolean,
@@ -34,6 +34,7 @@ const emit = defineEmits([
   'undo', 'redo', 'cut', 'copy', 'paste', 'select-all',
   'bold', 'italic', 'strikethrough', 'code', 'link',
   'heading', 'unordered-list', 'ordered-list', 'task-list', 'quote', 'hr', 'code-block',
+  'table', 'image',
   'view-rendered', 'view-source', 'toggle-tree', 'toggle-git', 'settings'
 ]);
 
@@ -51,6 +52,8 @@ const items = [
   { label: 'Strikethrough', action: () => emit('strikethrough') },
   { label: 'Inline Code', action: () => emit('code') },
   { label: 'Link', action: () => emit('link') },
+  { label: 'Image', action: () => emit('image') },
+  { label: 'Table', action: () => emit('table') },
   null,
   { label: 'Heading 1', action: () => emit('heading', 1) },
   { label: 'Heading 2', action: () => emit('heading', 2) },
@@ -76,6 +79,13 @@ function onClick(item) {
   emit('close');
   item.action();
 }
+
+// Clamp the menu inside the viewport so a right-click near the bottom/right
+// edge doesn't render (partially) off-screen.
+const menuWidth = 200;
+const menuHeightEstimate = 480;
+const clampedX = computed(() => Math.min(props.x, Math.max(0, window.innerWidth - menuWidth)));
+const clampedY = computed(() => Math.min(props.y, Math.max(0, window.innerHeight - menuHeightEstimate)));
 
 watch(() => props.show, (v) => {
   if (v) {

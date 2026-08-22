@@ -85,6 +85,7 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted, onUpdated } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { renderBlockHtml } from '../render.js';
+import * as textEditing from '../lib/textEditing.js';
 
 // ---------------------------------------------------------------------------
 // Overview
@@ -178,12 +179,8 @@ function onSourceInput() {
   emit('dirty', true);
 }
 
-function onSourceKeydown(e) {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-    e.preventDefault();
-    saveSource();
-  }
-}
+// See onKeydown above: Ctrl+S is handled once, globally, by App.vue.
+function onSourceKeydown() {}
 
 async function saveSource() {
   try {
@@ -723,14 +720,14 @@ async function exitEdit(force) {
   });
 }
 
+// Ctrl+S is intentionally not handled here: App.vue's global keydown handler
+// commits the in-progress edit (via the exposed `save()`) and then persists
+// the document to disk. Handling it here too would just call exitEdit twice.
 function onKeydown(e) {
   if (e.key === 'Escape') {
     e.preventDefault();
     exitEdit(false);
   } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-    e.preventDefault();
-    exitEdit(false);
-  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
     e.preventDefault();
     exitEdit(false);
   }
@@ -790,119 +787,56 @@ function getActiveTextarea() {
 // Source-view formatting helpers
 // ---------------------------------------------------------------------------
 
-function withSourceText(action) {
+// Apply a pure textEditing.js transform to the source-view textarea, syncing
+// the result back into sourceText and restoring the selection. Shares the
+// exact same transforms as the block-textarea editor (see applyToTextarea
+// above) so source view and block-edit view can never drift out of sync in
+// their formatting behavior.
+function withSourceText(transform) {
   const ta = sourceTextarea.value;
   if (!ta) return;
   const before = sourceText.value;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const result = action(before, start, end);
-  if (result === null || result === undefined) return;
-  sourceText.value = result.text;
+  const result = transform(before, ta.selectionStart, ta.selectionEnd);
+  sourceText.value = result.value;
   nextTick(() => {
     if (!sourceTextarea.value) return;
     sourceTextarea.value.selectionStart = result.start;
     sourceTextarea.value.selectionEnd = result.end;
-    if (result.text !== before) emit('dirty', true);
+    sourceTextarea.value.focus();
+    if (result.value !== before) emit('dirty', true);
   });
 }
 
 function sourceWrapSelection(prefix, suffix) {
-  const suf = suffix || prefix;
-  withSourceText((text, start, end) => {
-    if (start === end) {
-      const wrapped = prefix + suf;
-      return {
-        text: text.slice(0, start) + wrapped + text.slice(end),
-        start: start + wrapped.length,
-        end: start + wrapped.length,
-      };
-    }
-    const selected = text.slice(start, end);
-    const before = text.slice(Math.max(0, start - prefix.length), start);
-    const after = text.slice(end, end + suf.length);
-    if (before === prefix && after === suf) {
-      return {
-        text: text.slice(0, start - prefix.length) + selected + text.slice(end + suf.length),
-        start: start - prefix.length,
-        end: start - prefix.length + selected.length,
-      };
-    }
-    const replacement = prefix + selected + suf;
-    return {
-      text: text.slice(0, start) + replacement + text.slice(end),
-      start: start + replacement.length,
-      end: start + replacement.length,
-    };
-  });
+  withSourceText((value, start, end) => textEditing.wrapSelection(value, start, end, prefix, suffix));
 }
 
 function sourceLinePrefix(prefix) {
-  withSourceText((text, start, end) => {
-    const lineStart = text.lastIndexOf('\n', start - 1) + 1;
-    const lineEnd = text.indexOf('\n', end);
-    const endIdx = lineEnd === -1 ? text.length : lineEnd;
-    const region = text.slice(lineStart, endIdx);
-    const lines = region.split('\n');
-    const allPrefixed = lines.every(line => line.startsWith(prefix));
-    const newLines = allPrefixed
-      ? lines.map(line => line.slice(prefix.length))
-      : lines.map(line => (line ? prefix + line : line));
-    const replacement = newLines.join('\n');
-    const delta = allPrefixed ? -prefix.length : prefix.length;
-    const newStart = start === lineStart
-      ? start
-      : start + (allPrefixed ? -prefix.length : prefix.length);
-    const newEnd = end + (end - lineStart) / (region.length || 1) * (replacement.length - region.length);
-    return {
-      text: text.slice(0, lineStart) + replacement + text.slice(endIdx),
-      start: newStart,
-      end: Math.max(newStart, Math.round(newEnd)),
-    };
-  });
+  withSourceText((value, start, end) => textEditing.toggleLinePrefix(value, start, end, prefix));
 }
 
 function sourceHeading(level) {
-  withSourceText((text, start) => {
-    const lineStart = text.lastIndexOf('\n', start - 1) + 1;
-    const lineEnd = text.indexOf('\n', lineStart);
-    const endIdx = lineEnd === -1 ? text.length : lineEnd;
-    const line = text.slice(lineStart, endIdx).replace(/^#{1,6}\s+/, '');
-    const prefix = level > 0 ? '#'.repeat(level) + ' ' : '';
-    const replacement = prefix + line;
-    const delta = replacement.length - (endIdx - lineStart);
-    return {
-      text: text.slice(0, lineStart) + replacement + text.slice(endIdx),
-      start: start + (start === lineStart ? 0 : delta),
-      end: start + (start === lineStart ? 0 : delta),
-    };
-  });
+  withSourceText((value, start, end) => textEditing.toggleHeading(value, start, end, level));
 }
 
 function sourceInsert(insertion) {
-  withSourceText((text, start, end) => ({
-    text: text.slice(0, start) + insertion + text.slice(end),
-    start: start + insertion.length,
-    end: start + insertion.length,
-  }));
+  withSourceText((value, start, end) => textEditing.insertText(value, start, end, insertion));
 }
 
 function sourceLink() {
-  const ta = sourceTextarea.value;
-  if (!ta) return;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const selected = sourceText.value.slice(start, end).trim() || 'text';
   const url = prompt('URL:', 'https://');
   if (!url) return;
-  const replacement = `[${selected}](${url})`;
-  sourceText.value = sourceText.value.slice(0, start) + replacement + sourceText.value.slice(end);
-  nextTick(() => {
-    if (!sourceTextarea.value) return;
-    sourceTextarea.value.selectionStart = start + replacement.length;
-    sourceTextarea.value.selectionEnd = start + replacement.length;
-    emit('dirty', true);
-  });
+  withSourceText((value, start, end) => textEditing.makeLink(value, start, end, url));
+}
+
+function sourceImage() {
+  const url = prompt('Image URL:', 'https://');
+  if (!url) return;
+  withSourceText((value, start, end) => textEditing.makeImage(value, start, end, url));
+}
+
+function sourceTable() {
+  withSourceText((value, start, end) => textEditing.insertText(value, start, end, textEditing.makeTable()));
 }
 
 function findBlockFromSelection() {
@@ -987,111 +921,58 @@ function findPlainTextInSource(source, plainText) {
   return { start: sourcePos[idx], end: sourcePos[idx + plainText.length - 1] + 1 };
 }
 
-function toggleWrap(ta, prefix, suffix) {
+// Apply a pure textEditing.js transform to a live <textarea>, syncing the
+// resulting value/selection back into both the DOM element and editSource.
+function applyToTextarea(ta, transform) {
   if (!ta) return;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const value = ta.value;
-  const selected = value.substring(start, end) || '';
-  const before = value.substring(0, start);
-  const after = value.substring(end);
-  const hasPrefix = before.endsWith(prefix);
-  const hasSuffix = after.startsWith(suffix);
-  if (selected && hasPrefix && hasSuffix) {
-    ta.value = before.slice(0, -prefix.length) + selected + after.slice(suffix.length);
-    ta.selectionStart = start - prefix.length;
-    ta.selectionEnd = end - prefix.length;
-  } else if (selected) {
-    ta.value = before + prefix + selected + suffix + after;
-    ta.selectionStart = start + prefix.length;
-    ta.selectionEnd = end + prefix.length;
-  } else {
-    ta.value = before + prefix + suffix + after;
-    ta.selectionStart = start + prefix.length;
-    ta.selectionEnd = start + prefix.length;
-  }
+  const result = transform(ta.value, ta.selectionStart, ta.selectionEnd);
+  ta.value = result.value;
+  ta.selectionStart = result.start;
+  ta.selectionEnd = result.end;
   editSource.value = ta.value;
   nextTick(() => autoSize(ta));
   updateCursorFromTextarea();
+}
+
+function toggleWrap(ta, prefix, suffix) {
+  applyToTextarea(ta, (value, start, end) => textEditing.wrapSelection(value, start, end, prefix, suffix));
 }
 
 function toggleLinePrefix(ta, prefix) {
-  if (!ta) return;
-  const value = ta.value;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const before = value.substring(0, start);
-  const after = value.substring(end);
-  const sel = value.substring(start, end);
-  const lines = sel.split('\n');
-  const allPrefixed = lines.every(line => line.startsWith(prefix));
-  const newSel = allPrefixed
-    ? lines.map(line => line.slice(prefix.length)).join('\n')
-    : lines.map(line => (line ? prefix + line : '')).join('\n');
-  ta.value = before + newSel + after;
-  ta.selectionStart = start;
-  ta.selectionEnd = start + newSel.length;
-  editSource.value = ta.value;
-  nextTick(() => autoSize(ta));
-  updateCursorFromTextarea();
+  applyToTextarea(ta, (value, start, end) => textEditing.toggleLinePrefix(value, start, end, prefix));
 }
 
 function toggleHeadingInTextarea(ta, level) {
-  if (!ta) return;
-  const value = ta.value;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const before = value.substring(0, start);
-  const after = value.substring(end);
-  const sel = value.substring(start, end);
-  let firstLineBreak = sel.indexOf('\n');
-  if (firstLineBreak < 0) firstLineBreak = sel.length;
-  const firstLine = sel.substring(0, firstLineBreak);
-  const rest = sel.substring(firstLineBreak);
-  const match = firstLine.match(/^(#{1,6})\s+(.*)$/);
-  let newFirstLine;
-  if (level === 0) {
-    newFirstLine = match ? match[2] : firstLine;
-  } else {
-    newFirstLine = `${'#'.repeat(level)} ${match ? match[2] : firstLine}`;
-  }
-  const newSel = newFirstLine + rest;
-  ta.value = before + newSel + after;
-  ta.selectionStart = start;
-  ta.selectionEnd = start + newSel.length;
-  editSource.value = ta.value;
-  nextTick(() => autoSize(ta));
-  updateCursorFromTextarea();
+  applyToTextarea(ta, (value, start, end) => textEditing.toggleHeading(value, start, end, level));
 }
 
 function insertLinkInTextarea(ta) {
   if (!ta) return;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const value = ta.value;
-  const selected = value.substring(start, end).trim() || 'text';
   const url = prompt('URL:', 'https://');
   if (!url) return;
-  const replacement = `[${selected}](${url})`;
-  ta.value = value.substring(0, start) + replacement + value.substring(end);
-  ta.selectionStart = start + replacement.length;
-  ta.selectionEnd = start + replacement.length;
-  editSource.value = ta.value;
-  nextTick(() => autoSize(ta));
-  updateCursorFromTextarea();
+  applyToTextarea(ta, (value, start, end) => textEditing.makeLink(value, start, end, url));
+}
+
+function insertImageInTextarea(ta) {
+  if (!ta) return;
+  const url = prompt('Image URL:', 'https://');
+  if (!url) return;
+  applyToTextarea(ta, (value, start, end) => textEditing.makeImage(value, start, end, url));
+}
+
+function insertTableInTextarea(ta) {
+  if (!ta) return;
+  applyToTextarea(ta, (value, start, end) => textEditing.insertText(value, start, end, textEditing.makeTable()));
 }
 
 async function insertThematicBreak() {
-  if (currentViewMode.value === 'source') { sourceInsert('---\n'); return; }
+  if (currentViewMode.value === 'source') {
+    withSourceText((value, start) => textEditing.insertAtLineStart(value, start, '---\n'));
+    return;
+  }
   const ta = getActiveTextarea();
   if (ta) {
-    const start = ta.selectionStart;
-    const value = ta.value;
-    const line = value.lastIndexOf('\n', start) + 1;
-    ta.value = value.substring(0, line) + '---\n' + value.substring(line);
-    editSource.value = ta.value;
-    nextTick(() => autoSize(ta));
-    updateCursorFromTextarea();
+    applyToTextarea(ta, (value, start) => textEditing.insertAtLineStart(value, start, '---\n'));
   } else {
     await invoke('insert_text', { position: totalLen.value || 0, text: '---\n' });
     await loadDocument();
@@ -1100,23 +981,44 @@ async function insertThematicBreak() {
 }
 
 async function insertCodeBlock() {
-  if (currentViewMode.value === 'source') { sourceInsert('```\n\n```\n'); return; }
+  if (currentViewMode.value === 'source') {
+    withSourceText((value, start, end) => textEditing.wrapCodeBlock(value, start, end));
+    return;
+  }
   const ta = getActiveTextarea();
   if (ta) {
-    const start = ta.selectionStart;
-    const end = ta.selectionEnd;
-    const value = ta.value;
-    const selected = value.substring(start, end);
-    const replacement = '```\n' + selected + '\n```\n';
-    ta.value = value.substring(0, start) + replacement + value.substring(end);
-    editSource.value = ta.value;
-    nextTick(() => autoSize(ta));
-    updateCursorFromTextarea();
+    applyToTextarea(ta, textEditing.wrapCodeBlock);
   } else {
     await invoke('insert_text', { position: totalLen.value || 0, text: '```\n\n```\n' });
     await loadDocument();
     emit('dirty', true);
   }
+}
+
+async function insertTable() {
+  if (currentViewMode.value === 'source') { sourceTable(); return; }
+  const ta = getActiveTextarea();
+  if (ta) {
+    insertTableInTextarea(ta);
+    return;
+  }
+  await invoke('insert_text', { position: totalLen.value || 0, text: textEditing.makeTable() });
+  await loadDocument();
+  emit('dirty', true);
+}
+
+async function insertImage() {
+  if (currentViewMode.value === 'source') { sourceImage(); return; }
+  const ta = getActiveTextarea();
+  if (ta) {
+    insertImageInTextarea(ta);
+    return;
+  }
+  const url = prompt('Image URL:', 'https://');
+  if (!url) return;
+  await invoke('insert_text', { position: totalLen.value || 0, text: `![alt text](${url})` });
+  await loadDocument();
+  emit('dirty', true);
 }
 
 async function applyInlineFormat(prefix, suffix) {
@@ -1269,6 +1171,39 @@ function setViewMode(mode) {
 
 const isSourceView = computed(() => currentViewMode.value === 'source');
 
+// Find the next (or previous) occurrence of `query` in whichever textarea is
+// currently editable — the source-view textarea, or the block currently
+// being edited — and select it. Returns true if a match was found. There is
+// intentionally no search across the *rendered* (non-editing) view: that
+// content is virtualized and mostly not present in the DOM at once, so a
+// reliable "find" there requires being in an editable text surface first
+// (the caller, App.vue, switches to source view when nothing is editable).
+function findInEditor(query, { backward = false } = {}) {
+  if (!query) return false;
+  const ta = currentViewMode.value === 'source' ? sourceTextarea.value : getActiveTextarea();
+  if (!ta) return false;
+  const value = ta.value;
+  const hay = value.toLowerCase();
+  const needle = query.toLowerCase();
+  let idx;
+  if (backward) {
+    const from = Math.max(0, ta.selectionStart - 1);
+    idx = hay.lastIndexOf(needle, from - 1);
+    if (idx < 0) idx = hay.lastIndexOf(needle);
+  } else {
+    const from = ta.selectionEnd;
+    idx = hay.indexOf(needle, from);
+    if (idx < 0) idx = hay.indexOf(needle);
+  }
+  if (idx < 0) return false;
+  ta.focus();
+  ta.selectionStart = idx;
+  ta.selectionEnd = idx + query.length;
+  const linesBefore = value.slice(0, idx).split('\n').length;
+  ta.scrollTop = Math.max(0, (linesBefore - 5) * LINE_HEIGHT);
+  return true;
+}
+
 defineExpose({
   applyInlineFormat,
   applyLineFormat,
@@ -1277,6 +1212,9 @@ defineExpose({
   toggleTask,
   insertThematicBreak,
   insertCodeBlock,
+  insertTable,
+  insertImage,
+  findInEditor,
   getActiveTextarea,
   editingBlockIndex: editingIndex,
   blocks,
