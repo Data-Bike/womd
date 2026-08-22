@@ -82,7 +82,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted, onUnmounted, onUpdated } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { renderBlockHtml } from '../render.js';
 
@@ -141,6 +141,7 @@ let ignoreScroll = 0;
 let loadingVisible = false;
 let textareaEl = null;
 let resizeObserver = null;
+let blockResizeObserver = null;
 let visibleUpdateRaf = 0;
 
 const parsedOffset = ref(0);
@@ -574,6 +575,31 @@ function measureHeights() {
   }
   if (firstChanged < Infinity) rebuildOffsets(firstChanged);
   layoutReady.value = true;
+}
+
+function observeBlockHeights() {
+  if (!viewport.value || !blockResizeObserver) return;
+  blockResizeObserver.disconnect();
+  for (const el of viewport.value.querySelectorAll('[data-block-index]')) {
+    blockResizeObserver.observe(el);
+  }
+}
+
+function onBlockResize(entries) {
+  if (!viewport.value) return;
+  let firstChanged = Infinity;
+  for (const entry of entries) {
+    const el = entry.target;
+    const idx = Number(el.dataset.blockIndex);
+    if (Number.isNaN(idx) || idx < 0 || idx >= meta.length) continue;
+    if (editingIndex.value === idx) continue;
+    const h = Math.round(entry.contentRect.height);
+    if (h > 0 && h !== heights[idx]) {
+      heights[idx] = h;
+      firstChanged = Math.min(firstChanged, idx);
+    }
+  }
+  if (firstChanged < Infinity) rebuildOffsets(firstChanged);
 }
 
 async function maybeParseNextChunk() {
@@ -1214,13 +1240,20 @@ onMounted(() => {
       }
     });
     resizeObserver.observe(viewport.value);
+    blockResizeObserver = new ResizeObserver(onBlockResize);
+    observeBlockHeights();
   }
   loadDocument();
+});
+
+onUpdated(() => {
+  observeBlockHeights();
 });
 
 onUnmounted(() => {
   if (visibleUpdateRaf) cancelAnimationFrame(visibleUpdateRaf);
   if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
+  if (blockResizeObserver) { blockResizeObserver.disconnect(); blockResizeObserver = null; }
 });
 
 function save() {
