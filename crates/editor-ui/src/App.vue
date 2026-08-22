@@ -1,5 +1,67 @@
 <template>
-  <div id="app" data-theme="mocha">
+  <div id="app" data-theme="mocha" @contextmenu.prevent="onAppContextMenu">
+    <MenuBar
+      @new="newDoc"
+      @open="openFileDialog"
+      @save="saveFile"
+      @save-as="saveFile"
+      @close-window="closeWindow"
+      @about="about"
+      @undo="undo"
+      @redo="redo"
+      @cut="cut"
+      @copy="copy"
+      @paste="paste"
+      @select-all="selectAll"
+      @find="findText"
+      @find-replace="findReplace"
+      @view-rendered="viewMode = 'rendered'"
+      @view-source="viewMode = 'source'"
+      @toggle-tree="toggleTree"
+      @toggle-git="toggleGit"
+      @heading="applyHeading"
+      @bold="() => applyInlineFormat('**')"
+      @italic="() => applyInlineFormat('*')"
+      @strikethrough="() => applyInlineFormat('~~')"
+      @code="() => applyInlineFormat('`')"
+      @link="applyLink"
+      @unordered-list="() => applyLineFormat('- ')"
+      @ordered-list="() => applyLineFormat('1. ')"
+      @task-list="() => applyLineFormat('- [ ] ')"
+      @quote="() => applyLineFormat('> ')"
+      @hr="insertHr"
+      @code-block="insertCodeBlock"
+      @settings="settingsOpen = true"
+    />
+    <ContextMenu
+      :show="ctxShow"
+      :x="ctxX"
+      :y="ctxY"
+      @close="ctxShow = false"
+      @undo="undo"
+      @redo="redo"
+      @cut="cut"
+      @copy="copy"
+      @paste="paste"
+      @select-all="selectAll"
+      @bold="() => applyInlineFormat('**')"
+      @italic="() => applyInlineFormat('*')"
+      @strikethrough="() => applyInlineFormat('~~')"
+      @code="() => applyInlineFormat('`')"
+      @link="applyLink"
+      @heading="applyHeading"
+      @unordered-list="() => applyLineFormat('- ')"
+      @ordered-list="() => applyLineFormat('1. ')"
+      @task-list="() => applyLineFormat('- [ ] ')"
+      @quote="() => applyLineFormat('> ')"
+      @hr="insertHr"
+      @code-block="insertCodeBlock"
+      @view-rendered="viewMode = 'rendered'"
+      @view-source="viewMode = 'source'"
+      @toggle-tree="toggleTree"
+      @toggle-git="toggleGit"
+      @settings="settingsOpen = true"
+    />
     <TabBar
       :tabs="tabs"
       :active-tab-id="activeTabId"
@@ -98,6 +160,8 @@ import TabBar from './components/TabBar.vue';
 import GitPanel from './components/GitPanel.vue';
 import FileTree from './components/FileTree.vue';
 import SettingsModal from './components/SettingsModal.vue';
+import MenuBar from './components/MenuBar.vue';
+import ContextMenu from './components/ContextMenu.vue';
 
 const tabs = ref([]);
 const activeTabId = ref(0);
@@ -115,6 +179,9 @@ const autosave = ref(true);
 const encoding = ref('UTF-8');
 const lineEnding = ref('LF');
 const editorRef = ref(null);
+const ctxShow = ref(false);
+const ctxX = ref(0);
+const ctxY = ref(0);
 
 let autosaveTimer = null;
 let resizeHandler = null;
@@ -285,6 +352,21 @@ function toggleGit() {
 function toggleView() {
   viewMode.value = viewMode.value === 'rendered' ? 'source' : 'rendered';
 }
+
+function onAppContextMenu(e) {
+  ctxX.value = e.clientX;
+  ctxY.value = e.clientY;
+  ctxShow.value = true;
+}
+
+function cut() { document.execCommand('cut'); }
+function copy() { document.execCommand('copy'); }
+function paste() { document.execCommand('paste'); }
+function selectAll() { document.execCommand('selectAll'); }
+function findText() { window.find?.('', false, false, true, false, true, false); }
+function findReplace() { alert('Find and Replace is not yet implemented.'); }
+function closeWindow() { window.close?.(); }
+function about() { alert('WoMD — Markdown Editor\nVersion 0.1.0'); }
 
 function detectLineEnding(text) {
   if (text.includes('\r\n')) return 'CRLF';
