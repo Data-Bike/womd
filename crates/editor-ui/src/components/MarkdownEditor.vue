@@ -16,7 +16,24 @@
       class="source-view"
     >
       <div v-if="sourceLoading" class="md-block-placeholder">Loading source...</div>
-      <pre v-else class="md-source-view">{{ sourceText || '(empty)' }}</pre>
+      <div v-else class="source-view-wrap">
+        <div ref="sourceGutter" class="source-gutter">
+          <div
+            v-for="n in sourceLineCount"
+            :key="n"
+            class="source-gutter-line"
+          >{{ n }}</div>
+        </div>
+        <textarea
+          ref="sourceTextarea"
+          v-model="sourceText"
+          class="md-source-view"
+          spellcheck="false"
+          @input="onSourceInput"
+          @scroll="syncSourceScroll"
+          @keydown="onSourceKeydown"
+        />
+      </div>
     </div>
     <div
       v-else
@@ -143,6 +160,38 @@ const suppressScroll = ref(false);
 
 const sourceText = ref('');
 const sourceLoading = ref(false);
+const sourceTextarea = ref(null);
+const sourceGutter = ref(null);
+
+const sourceLineCount = computed(() => Math.max(1, sourceText.value.split(/\r?\n/).length));
+
+function syncSourceScroll() {
+  if (sourceGutter.value && sourceTextarea.value) {
+    sourceGutter.value.scrollTop = sourceTextarea.value.scrollTop;
+  }
+}
+
+function onSourceInput() {
+  emit('dirty', true);
+}
+
+function onSourceKeydown(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    saveSource();
+  }
+}
+
+async function saveSource() {
+  try {
+    const end = totalLen.value || (await invoke('get_parsed_offset'))[1];
+    await invoke('replace_text', { start: 0, end, newText: sourceText.value });
+    emit('dirty', true);
+    await loadDocument();
+  } catch (e) {
+    console.error('saveSource:', e);
+  }
+}
 
 function setTextareaRef(el) {
   if (el) textareaEl = el;
@@ -170,6 +219,11 @@ function estimateHeight(i) {
     const span = Math.max(0, (m.end || 0) - (m.start || 0));
     lines = Math.max(1, Math.round(span / AVG_CHARS_PER_LINE));
   }
+  let factor = 1.0;
+  if (m.kind.includes('table')) factor = 2.0;
+  else if (m.kind.includes('list')) factor = 1.5;
+  else if (m.kind.startsWith('heading-')) factor = 1.4;
+  lines = Math.max(1, Math.round(lines * factor));
   return Math.max(MIN_BLOCK_HEIGHT, lines * LINE_HEIGHT + 6);
 }
 
@@ -693,6 +747,125 @@ function getActiveTextarea() {
   return viewport.value?.querySelector('textarea.md-block-textarea') || null;
 }
 
+// ---------------------------------------------------------------------------
+// Source-view formatting helpers
+// ---------------------------------------------------------------------------
+
+function withSourceText(action) {
+  const ta = sourceTextarea.value;
+  if (!ta) return;
+  const before = sourceText.value;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const result = action(before, start, end);
+  if (result === null || result === undefined) return;
+  sourceText.value = result.text;
+  nextTick(() => {
+    if (!sourceTextarea.value) return;
+    sourceTextarea.value.selectionStart = result.start;
+    sourceTextarea.value.selectionEnd = result.end;
+    if (result.text !== before) emit('dirty', true);
+  });
+}
+
+function sourceWrapSelection(prefix, suffix) {
+  const suf = suffix || prefix;
+  withSourceText((text, start, end) => {
+    if (start === end) {
+      const wrapped = prefix + suf;
+      return {
+        text: text.slice(0, start) + wrapped + text.slice(end),
+        start: start + wrapped.length,
+        end: start + wrapped.length,
+      };
+    }
+    const selected = text.slice(start, end);
+    const before = text.slice(Math.max(0, start - prefix.length), start);
+    const after = text.slice(end, end + suf.length);
+    if (before === prefix && after === suf) {
+      return {
+        text: text.slice(0, start - prefix.length) + selected + text.slice(end + suf.length),
+        start: start - prefix.length,
+        end: start - prefix.length + selected.length,
+      };
+    }
+    const replacement = prefix + selected + suf;
+    return {
+      text: text.slice(0, start) + replacement + text.slice(end),
+      start: start + replacement.length,
+      end: start + replacement.length,
+    };
+  });
+}
+
+function sourceLinePrefix(prefix) {
+  withSourceText((text, start, end) => {
+    const lineStart = text.lastIndexOf('\n', start - 1) + 1;
+    const lineEnd = text.indexOf('\n', end);
+    const endIdx = lineEnd === -1 ? text.length : lineEnd;
+    const region = text.slice(lineStart, endIdx);
+    const lines = region.split('\n');
+    const allPrefixed = lines.every(line => line.startsWith(prefix));
+    const newLines = allPrefixed
+      ? lines.map(line => line.slice(prefix.length))
+      : lines.map(line => (line ? prefix + line : line));
+    const replacement = newLines.join('\n');
+    const delta = allPrefixed ? -prefix.length : prefix.length;
+    const newStart = start === lineStart
+      ? start
+      : start + (allPrefixed ? -prefix.length : prefix.length);
+    const newEnd = end + (end - lineStart) / (region.length || 1) * (replacement.length - region.length);
+    return {
+      text: text.slice(0, lineStart) + replacement + text.slice(endIdx),
+      start: newStart,
+      end: Math.max(newStart, Math.round(newEnd)),
+    };
+  });
+}
+
+function sourceHeading(level) {
+  withSourceText((text, start) => {
+    const lineStart = text.lastIndexOf('\n', start - 1) + 1;
+    const lineEnd = text.indexOf('\n', lineStart);
+    const endIdx = lineEnd === -1 ? text.length : lineEnd;
+    const line = text.slice(lineStart, endIdx).replace(/^#{1,6}\s+/, '');
+    const prefix = level > 0 ? '#'.repeat(level) + ' ' : '';
+    const replacement = prefix + line;
+    const delta = replacement.length - (endIdx - lineStart);
+    return {
+      text: text.slice(0, lineStart) + replacement + text.slice(endIdx),
+      start: start + (start === lineStart ? 0 : delta),
+      end: start + (start === lineStart ? 0 : delta),
+    };
+  });
+}
+
+function sourceInsert(insertion) {
+  withSourceText((text, start, end) => ({
+    text: text.slice(0, start) + insertion + text.slice(end),
+    start: start + insertion.length,
+    end: start + insertion.length,
+  }));
+}
+
+function sourceLink() {
+  const ta = sourceTextarea.value;
+  if (!ta) return;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const selected = sourceText.value.slice(start, end).trim() || 'text';
+  const url = prompt('URL:', 'https://');
+  if (!url) return;
+  const replacement = `[${selected}](${url})`;
+  sourceText.value = sourceText.value.slice(0, start) + replacement + sourceText.value.slice(end);
+  nextTick(() => {
+    if (!sourceTextarea.value) return;
+    sourceTextarea.value.selectionStart = start + replacement.length;
+    sourceTextarea.value.selectionEnd = start + replacement.length;
+    emit('dirty', true);
+  });
+}
+
 function findBlockFromSelection() {
   const sel = window.getSelection();
   if (!sel?.rangeCount) return null;
@@ -870,6 +1043,7 @@ function insertLinkInTextarea(ta) {
 }
 
 async function insertThematicBreak() {
+  if (currentViewMode.value === 'source') { sourceInsert('---\n'); return; }
   const ta = getActiveTextarea();
   if (ta) {
     const start = ta.selectionStart;
@@ -887,6 +1061,7 @@ async function insertThematicBreak() {
 }
 
 async function insertCodeBlock() {
+  if (currentViewMode.value === 'source') { sourceInsert('```\n\n```\n'); return; }
   const ta = getActiveTextarea();
   if (ta) {
     const start = ta.selectionStart;
@@ -906,6 +1081,7 @@ async function insertCodeBlock() {
 }
 
 async function applyInlineFormat(prefix, suffix) {
+  if (currentViewMode.value === 'source') { sourceWrapSelection(prefix, suffix); return; }
   const ta = getActiveTextarea();
   if (ta) {
     toggleWrap(ta, prefix, suffix || prefix);
@@ -941,6 +1117,7 @@ async function applyInlineFormat(prefix, suffix) {
 }
 
 async function applyLineFormat(prefix) {
+  if (currentViewMode.value === 'source') { sourceLinePrefix(prefix); return; }
   const ta = getActiveTextarea();
   if (ta) {
     toggleLinePrefix(ta, prefix);
@@ -959,6 +1136,7 @@ async function applyLineFormat(prefix) {
 }
 
 async function applyHeading(level) {
+  if (currentViewMode.value === 'source') { sourceHeading(level); return; }
   const ta = getActiveTextarea();
   if (ta) {
     toggleHeadingInTextarea(ta, level);
@@ -977,6 +1155,7 @@ async function applyHeading(level) {
 }
 
 async function applyLink() {
+  if (currentViewMode.value === 'source') { sourceLink(); return; }
   const ta = getActiveTextarea();
   if (ta) {
     insertLinkInTextarea(ta);
@@ -1001,6 +1180,7 @@ async function applyLink() {
 }
 
 async function toggleTask() {
+  if (currentViewMode.value === 'source') { sourceLinePrefix('- [ ] '); return; }
   await applyLineFormat('- [ ] ');
 }
 
@@ -1031,6 +1211,9 @@ onUnmounted(() => {
 });
 
 function save() {
+  if (currentViewMode.value === 'source') {
+    return saveSource();
+  }
   return exitEdit(false);
 }
 

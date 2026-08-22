@@ -90,6 +90,7 @@ struct DocumentInfo {
 struct ReplaceTextArgs {
     start: u64,
     end: u64,
+    #[serde(rename = "newText")]
     new_text: String,
 }
 
