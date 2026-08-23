@@ -1221,6 +1221,17 @@ function findBlockIndexForByteOffset(byteOffset) {
   return lo;
 }
 
+// Scroll block `index` into the virtualized render window (visibleBlocks),
+// if it isn't already — a no-op when it's already visible.
+async function ensureBlockVisible(index) {
+  if (!viewport.value) return;
+  if (index >= visibleRange.value.start && index <= visibleRange.value.end) return;
+  const target = Math.max(0, (offsets[index] ?? 0) - clientHeight.value / 3);
+  setScrollTop(target);
+  await updateVisibleAndLoad();
+  await nextTick();
+}
+
 // Jump the visible cursor/selection to a match, without reloading the whole
 // document: in source view, select directly (the full text is already
 // loaded, by the user's own choice of view mode); otherwise, enter-edit only
@@ -1242,9 +1253,29 @@ async function navigateToMatch(index) {
   const blockIndex = findBlockIndexForByteOffset(m.start);
   if (blockIndex < 0) return;
   if (editingIndex.value !== blockIndex) {
+    // enterEdit() only produces a real <textarea> for a block that's
+    // currently part of visibleBlocks (the virtualized render window) — it
+    // does not scroll anything into view itself (the normal click-to-edit
+    // path never needs to, since you can only click a block that's already
+    // visible). A match can be anywhere in the document, so bring its block
+    // into the viewport *first*; otherwise enterEdit sets editingIndex
+    // reactively but no textarea ever mounts, and navigation silently does
+    // nothing.
+    await ensureBlockVisible(blockIndex);
     await enterEdit(blockIndex);
+    await nextTick();
+    if (!textareaEl && editingIndex.value === blockIndex) {
+      // Block offsets above/around this index may still be estimates (never
+      // measured) rather than real heights, so the first scroll target can
+      // be off enough to miss the render buffer entirely, especially deep
+      // into a large document. Retry once, snapped exactly to this block's
+      // (now-recomputed) offset — enterEdit already loaded its data, so this
+      // just needs Vue to re-render with it inside visibleBlocks.
+      setScrollTop(Math.max(0, offsets[blockIndex] ?? 0));
+      await updateVisibleAndLoad();
+      await nextTick();
+    }
   }
-  await nextTick();
   const ta = textareaEl;
   if (!ta) return;
   const blockStart = meta[blockIndex]?.start ?? 0;
