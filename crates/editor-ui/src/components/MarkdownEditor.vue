@@ -126,6 +126,17 @@ let meta = [];          // [{ kind, start, end }] — one entry per parsed block
 let startLines = [];    // 1-based document line number for each block's start
 let heights = [];       // measured pixel heights; 0 = not yet measured
 let offsets = [];       // offsets[i] = top of block i; offsets[n] = content height (no padding)
+// Running global average of "measured pixels per source line", accumulated
+// from every block whose height has actually been rendered+measured. Used
+// to estimate the scroll position of a distant, never-rendered block (see
+// estimateScrollForBlock) far more accurately than summing thousands of
+// individually-*guessed* block heights via `offsets`: per-block guessing
+// error compounds additively with distance in a large document, whereas a
+// single calibrated ratio applied to a block's *exact* line number (known
+// from startLines, not guessed) does not.
+let measuredLineSum = 0;
+let measuredPxSum = 0;
+let measuredIndices = new Set(); // which blocks have already contributed to the calibration above
 let cache = new Map();  // index -> { source, node, ... } full block data
 let cacheKeys = [];     // insertion order of `cache`, for bounded eviction
 const loadingSet = new Set(); // indices currently being fetched from the backend
@@ -208,6 +219,38 @@ function showsLineNumber(kind) {
 // ---------------------------------------------------------------------------
 // Layout engine: cumulative offsets + binary search
 // ---------------------------------------------------------------------------
+
+// Exact (not estimated) line count for block i, from the backend-provided
+// startLines table — covers the whole document cheaply, independent of
+// which blocks have actually been rendered.
+function blockLineCount(i) {
+  const next = startLines[i + 1];
+  const cur = startLines[i];
+  if (next != null && cur != null) return Math.max(1, next - cur);
+  return 1;
+}
+
+// Feed a real (rendered) height measurement into the global px-per-line
+// calibration. Called from measureHeights/onBlockResize whenever a block's
+// actual height is learned. Only a block's *first* measurement counts,
+// so a later remeasurement (e.g. after a window resize) can't skew the
+// average by counting the same block's lines more than once.
+function recordMeasuredHeight(i, px) {
+  if (measuredIndices.has(i)) return;
+  measuredIndices.add(i);
+  measuredLineSum += blockLineCount(i);
+  measuredPxSum += px;
+}
+
+// Estimate the absolute scroll offset of block `index` using the
+// calibrated global px-per-line average and its *exact* line number,
+// instead of the cumulative `offsets` array (see comment on
+// measuredLineSum above for why that compounds error over distance).
+function estimateScrollForBlock(index) {
+  const avgPxPerLine = measuredLineSum > 0 ? measuredPxSum / measuredLineSum : LINE_HEIGHT;
+  const line = startLines[index] ?? 0;
+  return Math.max(0, avgPxPerLine * line);
+}
 
 function estimateHeight(i) {
   if (editingIndex.value === i && editingHeight.value > 0) return editingHeight.value;
@@ -420,6 +463,7 @@ async function loadDocument() {
   }
   if (!props.doc?.id) {
     meta = []; heights = []; offsets = [0]; cache = new Map(); cacheKeys = []; startLines = [];
+    measuredLineSum = 0; measuredPxSum = 0; measuredIndices = new Set();
     totalHeight.value = 0;
     layoutVersion.value++;
     dataVersion.value++;
@@ -452,6 +496,7 @@ async function loadDocument() {
     hasMoreToParse.value = off < total;
     meta = rawMeta.map(m => ({ kind: m.kind, start: m.start, end: m.end }));
     heights = new Array(meta.length).fill(0);
+    measuredLineSum = 0; measuredPxSum = 0; measuredIndices = new Set();
     startLines = await fetchLineNumbers(meta.length);
     rebuildOffsets(0);
     scrollTop.value = isDocChange ? 0 : savedScroll;
@@ -568,6 +613,7 @@ function measureHeights() {
     const h = el.offsetHeight;
     if (h > 0 && h !== heights[idx]) {
       heights[idx] = h;
+      recordMeasuredHeight(idx, h);
       firstChanged = Math.min(firstChanged, idx);
     }
   }
@@ -594,6 +640,7 @@ function onBlockResize(entries) {
     const h = Math.round(entry.contentRect.height);
     if (h > 0 && h !== heights[idx]) {
       heights[idx] = h;
+      recordMeasuredHeight(idx, h);
       firstChanged = Math.min(firstChanged, idx);
     }
   }
@@ -1224,25 +1271,29 @@ function findBlockIndexForByteOffset(byteOffset) {
 // Scroll block `index` into the virtualized render window (visibleBlocks),
 // if it isn't already — a no-op when it's already visible.
 //
-// `offsets[index]` can be a rough guess rather than a real measurement for
-// any block the user hasn't scrolled through yet (estimateHeight() falls
-// back to an average-chars-per-line approximation) — for a large document
-// with a long stretch of unmeasured blocks between the current scroll
-// position and a distant search match, that guess can be off by several
-// screens' worth of content. A single jump-and-hope lands in roughly the
-// right place, but "roughly" can visibly land a few blocks short or past
-// the target. So: jump, let the newly-rendered blocks get measured (the
-// blockResizeObserver in onMounted updates `offsets` as soon as they paint),
-// and re-check — repeating until the target's offset stops moving (i.e. the
-// estimate has converged to a real measurement) or a small iteration cap is
-// hit.
+// `offsets[index]` sums the (possibly estimated) height of every block from
+// 0 to `index`. For a block deep in a long stretch the user has never
+// scrolled through, most of those heights were never measured — they're
+// per-block guesses from estimateHeight(), and guessing error *compounds*
+// additively over thousands of blocks. A jump based purely on `offsets`
+// only gets locally corrected right around wherever it lands, so it can
+// converge to a stable-looking value that's still several blocks off from
+// the true position, without any way to detect the discrepancy.
+//
+// The first jump instead uses estimateScrollForBlock(): a single globally-
+// calibrated pixels-per-line ratio (learned from every block actually
+// measured so far) applied to the target's *exact* line number. That one
+// ratio doesn't compound with distance the way per-block guesses do, so it
+// lands far closer on the first try. Once we're in the neighborhood and
+// its surroundings get measured, `offsets` becomes locally accurate and
+// takes over to fine-tune the remaining pixels.
 async function ensureBlockVisible(index) {
   if (!viewport.value) return;
   if (index >= visibleRange.value.start && index <= visibleRange.value.end) return; // already visible
 
   let lastOffset = null;
   for (let attempt = 0; attempt < 6; attempt++) {
-    const current = offsets[index] ?? 0;
+    const current = attempt === 0 ? estimateScrollForBlock(index) : (offsets[index] ?? 0);
     const target = Math.max(0, current - clientHeight.value / 3);
     setScrollTop(target);
     await updateVisibleAndLoad();
@@ -1251,9 +1302,9 @@ async function ensureBlockVisible(index) {
     // whatever just rendered before reading `offsets` again.
     await new Promise((r) => requestAnimationFrame(r));
     const inView = index >= visibleRange.value.start && index <= visibleRange.value.end;
-    const settled = lastOffset !== null && Math.abs(current - lastOffset) < 2;
+    const settled = lastOffset !== null && Math.abs((offsets[index] ?? 0) - lastOffset) < 2;
     if (inView && settled) return;
-    lastOffset = current;
+    lastOffset = offsets[index] ?? 0;
   }
 }
 
