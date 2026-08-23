@@ -139,7 +139,7 @@
         <div class="md-block-placeholder" style="padding:24px;color:var(--fg-muted);text-align:center">
           <h1>WoMD</h1>
           <p>Open a file to start editing.</p>
-          <button @click="openFileDialog">Open test_large.md</button>
+          <button @click="openFileDialog">Open file...</button>
         </div>
       </div>
 
@@ -656,8 +656,12 @@ onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown);
   await refreshTabs();
   if (!tabs.value.length) {
-    const defaultPath = 'C:/Users/gorod/RustroverProjects/womd/test_large.md';
-    try { await openFile(defaultPath); } catch (e) { console.error('default open:', e); }
+    try {
+      await invoke('open_welcome');
+      await refreshTabs();
+    } catch (e) {
+      console.error('open_welcome:', e);
+    }
   }
 });
 

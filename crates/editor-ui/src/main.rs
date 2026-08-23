@@ -19,6 +19,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use base64::{prelude::BASE64_STANDARD, Engine};
 
+const WELCOME_MD: &str = include_str!("welcome.md");
+
 // ---------------------------------------------------------------------------
 // State: multiple document tabs
 // ---------------------------------------------------------------------------
@@ -461,6 +463,26 @@ fn new_document(state: tauri::State<'_, Mutex<AppState>>) -> Result<DocumentInfo
         byte_len: 0,
         tab_id: id,
     })
+}
+
+/// Open the built-in welcome/demo document in a new tab.
+#[tauri::command]
+fn open_welcome(state: tauri::State<'_, Mutex<AppState>>) -> Result<DocumentInfo, String> {
+    let meta = editor_domain::DocumentMeta {
+        id: DocumentId::new("welcome"),
+        has_bom: false,
+        line_ending: editor_domain::LineEnding::Lf,
+        trailing_newline: true,
+        encoding: editor_domain::Encoding::Utf8,
+    };
+    let buffer = DocumentBuffer::open(WELCOME_MD.as_bytes().to_vec(), meta, MarkdownProfile::Gfm)
+        .map_err(|e| e.to_string())?;
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let id = s.next_id;
+    s.next_id += 1;
+    let tab = DocumentTab { id, buffer, file_path: None };
+    s.push_tab(tab);
+    Ok(doc_info_from_tab(s.tabs.last().ok_or_else(|| "no tab".to_string())?))
 }
 
 /// Get the current document text (serialized from the active buffer).
@@ -2449,6 +2471,7 @@ pub fn run() {
             close_tab,
             open_document,
             new_document,
+            open_welcome,
             get_document_text,
             replace_text,
             insert_text,
