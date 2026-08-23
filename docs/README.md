@@ -222,6 +222,7 @@ The current foundation is complete for the core document model and editing flow.
 ## Document references
 
 - [`architecture.md`](./architecture.md) — full architecture and crate design.
+- [`crates/`](./crates/) — one detailed guide per crate.
 - [`adr/`](./adr/) — architecture decision records:
   - [ADR-001: UI framework](./adr/001-ui-framework.md)
   - [ADR-002: Document buffer](./adr/002-document-buffer.md)
