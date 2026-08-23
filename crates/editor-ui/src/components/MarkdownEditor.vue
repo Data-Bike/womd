@@ -86,6 +86,7 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted, onUpdated } fro
 import { invoke } from '@tauri-apps/api/core';
 import { renderBlockHtml } from '../render.js';
 import * as textEditing from '../lib/textEditing.js';
+import * as searchLib from '../lib/search.js';
 
 // ---------------------------------------------------------------------------
 // Overview
@@ -1171,37 +1172,130 @@ function setViewMode(mode) {
 
 const isSourceView = computed(() => currentViewMode.value === 'source');
 
-// Find the next (or previous) occurrence of `query` in whichever textarea is
-// currently editable — the source-view textarea, or the block currently
-// being edited — and select it. Returns true if a match was found. There is
-// intentionally no search across the *rendered* (non-editing) view: that
-// content is virtualized and mostly not present in the DOM at once, so a
-// reliable "find" there requires being in an editable text surface first
-// (the caller, App.vue, switches to source view when nothing is editable).
-function findInEditor(query, { backward = false } = {}) {
-  if (!query) return false;
-  const ta = currentViewMode.value === 'source' ? sourceTextarea.value : getActiveTextarea();
-  if (!ta) return false;
-  const value = ta.value;
-  const hay = value.toLowerCase();
-  const needle = query.toLowerCase();
-  let idx;
-  if (backward) {
-    const from = Math.max(0, ta.selectionStart - 1);
-    idx = hay.lastIndexOf(needle, from - 1);
-    if (idx < 0) idx = hay.lastIndexOf(needle);
+// ---------------------------------------------------------------------------
+// Find / Find & Replace
+// ---------------------------------------------------------------------------
+// Operates on whichever textarea is currently editable — the source-view
+// textarea, or the block currently being edited. There is intentionally no
+// search across the *rendered* (non-editing) view: that content is
+// virtualized and mostly not present in the DOM at once, so a reliable
+// search requires being in an editable text surface first (the caller,
+// App.vue/FindBar, switches to source view when nothing is editable).
+//
+// Match-finding and replacement math live in the pure, unit-tested
+// src/lib/search.js module; this section only wires that logic up to the
+// live textarea (selection, scroll position, dirty tracking).
+
+const searchStatus = ref({ count: 0, index: -1, valid: true });
+let searchQuery = '';
+let searchOptions = { caseSensitive: false, regex: false };
+let searchMatches = [];
+
+function getSearchTextarea() {
+  return currentViewMode.value === 'source' ? sourceTextarea.value : getActiveTextarea();
+}
+
+// Whether there is currently a textarea to search — used by App.vue to know
+// when it's safe to run a search after switching into source view (which
+// loads the document text asynchronously over IPC).
+function isSearchReady() {
+  return !!getSearchTextarea();
+}
+
+// Push a new value into whichever textarea is active, keeping editSource/
+// sourceText (and dirty tracking) in sync — mirrors applyToTextarea/
+// withSourceText above, but for programmatic (non-selection) replacements.
+function setSearchTextareaValue(ta, newValue, caretPos) {
+  ta.value = newValue;
+  ta.selectionStart = ta.selectionEnd = caretPos;
+  if (currentViewMode.value === 'source') {
+    sourceText.value = newValue;
+    emit('dirty', true);
   } else {
-    const from = ta.selectionEnd;
-    idx = hay.indexOf(needle, from);
-    if (idx < 0) idx = hay.indexOf(needle);
+    editSource.value = newValue;
+    nextTick(() => autoSize(ta));
   }
-  if (idx < 0) return false;
-  ta.focus();
-  ta.selectionStart = idx;
-  ta.selectionEnd = idx + query.length;
-  const linesBefore = value.slice(0, idx).split('\n').length;
+}
+
+function scrollMatchIntoView(ta, pos) {
+  const linesBefore = ta.value.slice(0, pos).split('\n').length;
   ta.scrollTop = Math.max(0, (linesBefore - 5) * LINE_HEIGHT);
-  return true;
+}
+
+function selectCurrentMatch() {
+  const ta = getSearchTextarea();
+  if (!ta || searchStatus.value.index < 0) return;
+  const m = searchMatches[searchStatus.value.index];
+  ta.focus();
+  ta.selectionStart = m.start;
+  ta.selectionEnd = m.end;
+  scrollMatchIntoView(ta, m.start);
+}
+
+/**
+ * (Re)run the search against the current textarea's contents. Returns the
+ * new status: `{ count, index, valid }` — `valid` is false when `regex` is
+ * requested but `query` is not a syntactically valid regular expression.
+ * `index` is -1 when there are zero matches.
+ */
+function searchSetQuery(query, options = {}) {
+  searchQuery = query || '';
+  searchOptions = { caseSensitive: !!options.caseSensitive, regex: !!options.regex };
+  const ta = getSearchTextarea();
+  if (!ta || !searchQuery) {
+    searchMatches = [];
+    searchStatus.value = { count: 0, index: -1, valid: true };
+    return searchStatus.value;
+  }
+  const found = searchLib.findMatches(ta.value, searchQuery, searchOptions);
+  if (found === null) {
+    searchMatches = [];
+    searchStatus.value = { count: 0, index: -1, valid: false };
+    return searchStatus.value;
+  }
+  searchMatches = found;
+  const index = searchLib.matchIndexAtOrAfter(searchMatches, ta.selectionStart);
+  searchStatus.value = { count: searchMatches.length, index, valid: true };
+  selectCurrentMatch();
+  return searchStatus.value;
+}
+
+function searchStep(delta) {
+  if (!searchMatches.length) return searchStatus.value;
+  const count = searchMatches.length;
+  const index = (searchStatus.value.index + delta + count) % count;
+  searchStatus.value = { ...searchStatus.value, index };
+  selectCurrentMatch();
+  return searchStatus.value;
+}
+
+function searchNext() { return searchStep(1); }
+function searchPrev() { return searchStep(-1); }
+
+/** Replace the currently-selected match, then advance to the next one (matches are recomputed since offsets shift). */
+function searchReplaceCurrent(replacement) {
+  const ta = getSearchTextarea();
+  if (!ta || searchStatus.value.index < 0) return searchStatus.value;
+  const m = searchMatches[searchStatus.value.index];
+  const text = searchLib.resolveReplacementText(m, replacement ?? '', searchOptions.regex);
+  const newValue = searchLib.replaceMatch(ta.value, m, text);
+  setSearchTextareaValue(ta, newValue, m.start + text.length);
+  return searchSetQuery(searchQuery, searchOptions);
+}
+
+/** Replace every match in one pass. */
+function searchReplaceAll(replacement) {
+  const ta = getSearchTextarea();
+  if (!ta || !searchMatches.length) return searchStatus.value;
+  const newValue = searchLib.replaceAllMatches(ta.value, searchMatches, replacement ?? '', searchOptions.regex);
+  setSearchTextareaValue(ta, newValue, 0);
+  return searchSetQuery(searchQuery, searchOptions);
+}
+
+function searchClear() {
+  searchQuery = '';
+  searchMatches = [];
+  searchStatus.value = { count: 0, index: -1, valid: true };
 }
 
 defineExpose({
@@ -1214,7 +1308,14 @@ defineExpose({
   insertCodeBlock,
   insertTable,
   insertImage,
-  findInEditor,
+  isSearchReady,
+  searchSetQuery,
+  searchNext,
+  searchPrev,
+  searchReplaceCurrent,
+  searchReplaceAll,
+  searchClear,
+  searchStatus,
   getActiveTextarea,
   editingBlockIndex: editingIndex,
   blocks,

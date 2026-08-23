@@ -67,6 +67,17 @@
       @toggle-git="toggleGit"
       @settings="settingsOpen = true"
     />
+    <FindBar
+      ref="findBarRef"
+      :show="findBarVisible"
+      :status="findStatus"
+      @search="onFindSearch"
+      @next="onFindNext"
+      @prev="onFindPrev"
+      @replace="onFindReplace"
+      @replace-all="onFindReplaceAll"
+      @close="onFindClose"
+    />
     <TabBar
       :tabs="tabs"
       :active-tab-id="activeTabId"
@@ -168,6 +179,7 @@ import FileTree from './components/FileTree.vue';
 import SettingsModal from './components/SettingsModal.vue';
 import MenuBar from './components/MenuBar.vue';
 import ContextMenu from './components/ContextMenu.vue';
+import FindBar from './components/FindBar.vue';
 
 const tabs = ref([]);
 const activeTabId = ref(0);
@@ -444,48 +456,75 @@ function selectAll() {
   document.execCommand('selectAll');
 }
 
-// Find / Find Next operate on the active editable textarea (the source view,
-// or the block currently being edited). If there is nothing editable focused
-// — e.g. the user is looking at the rendered view — switch to source view
-// first so there is always something to search.
-const lastFindQuery = ref('');
+// ---------------------------------------------------------------------------
+// Find / Find & Replace
+// ---------------------------------------------------------------------------
+// FindBar.vue is purely presentational (query/replacement/case/regex inputs,
+// F3-style navigation); the actual match-finding lives in MarkdownEditor's
+// exposed search* API (backed by the pure src/lib/search.js). App.vue just
+// wires the two together and keeps `findStatus` (the "N / M" counter) in
+// sync. Find operates on the active editable textarea (source view, or the
+// block currently being edited); if nothing is editable — e.g. the user is
+// looking at the rendered view — switch to source view first.
+const findBarRef = ref(null);
+const findBarVisible = ref(false);
+const findStatus = ref({ count: 0, index: -1, valid: true });
 
 async function ensureEditableForFind() {
-  if (editorRef.value?.getActiveTextarea?.() || editorRef.value?.isSourceView) return;
+  if (editorRef.value?.isSearchReady?.()) return;
   viewMode.value = 'source';
+  // Switching to source view triggers an async document load inside
+  // MarkdownEditor (it fetches the full text over IPC); wait for the
+  // source textarea to actually appear before handing control back,
+  // instead of racing it with a single nextTick.
+  for (let i = 0; i < 20; i++) {
+    await nextTick();
+    if (editorRef.value?.isSearchReady?.()) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+async function openFind(withReplace = false) {
+  if (!activeDoc.value) return;
+  await ensureEditableForFind();
+  findBarVisible.value = true;
   await nextTick();
+  findBarRef.value?.focus(withReplace);
 }
 
-async function findText() {
-  const query = prompt('Find:', lastFindQuery.value);
-  if (!query) return;
-  lastFindQuery.value = query;
-  await ensureEditableForFind();
-  const found = editorRef.value?.findInEditor?.(query);
-  if (found === false) alert(`"${query}" not found.`);
+function findText() { openFind(false); }
+function findReplace() { openFind(true); }
+
+function findNext() {
+  if (!findBarVisible.value) { openFind(false); return; }
+  findBarRef.value?.next();
 }
 
-async function findNext() {
-  if (!lastFindQuery.value) return findText();
-  await ensureEditableForFind();
-  const found = editorRef.value?.findInEditor?.(lastFindQuery.value);
-  if (found === false) alert(`"${lastFindQuery.value}" not found.`);
+function onFindSearch({ query, caseSensitive, regex }) {
+  findStatus.value = editorRef.value?.searchSetQuery?.(query, { caseSensitive, regex })
+    ?? { count: 0, index: -1, valid: true };
+}
+function onFindNext() {
+  findStatus.value = editorRef.value?.searchNext?.() ?? findStatus.value;
+}
+function onFindPrev() {
+  findStatus.value = editorRef.value?.searchPrev?.() ?? findStatus.value;
+}
+function onFindReplace(replacement) {
+  findStatus.value = editorRef.value?.searchReplaceCurrent?.(replacement) ?? findStatus.value;
+}
+function onFindReplaceAll(replacement) {
+  findStatus.value = editorRef.value?.searchReplaceAll?.(replacement) ?? findStatus.value;
+}
+function onFindClose() {
+  findBarVisible.value = false;
+  editorRef.value?.searchClear?.();
+  findStatus.value = { count: 0, index: -1, valid: true };
 }
 
-async function findReplace() {
-  const query = prompt('Find:', lastFindQuery.value);
-  if (!query) return;
-  const replacement = prompt('Replace with:', '');
-  if (replacement === null) return;
-  await ensureEditableForFind();
-  const ta = editorRef.value?.getActiveTextarea?.();
-  if (!ta) { alert('Open a document to use Find and Replace.'); return; }
-  const count = ta.value.split(query).length - 1;
-  if (count === 0) { alert(`"${query}" not found.`); return; }
-  if (!confirm(`Replace all ${count} occurrence(s) of "${query}"?`)) return;
-  ta.value = ta.value.split(query).join(replacement);
-  ta.dispatchEvent(new Event('input', { bubbles: true }));
-}
+// Switching documents invalidates any in-progress search (matches were
+// computed against a different buffer).
+watch(activeTabId, () => { if (findBarVisible.value) onFindClose(); });
 
 function closeWindow() {
   getCurrentWindow().close().catch((e) => console.error('closeWindow:', e));
@@ -507,7 +546,16 @@ function isTypingTarget(el) {
 }
 
 function onGlobalKeydown(e) {
-  if (e.key === 'F3') { e.preventDefault(); findNext(); return; }
+  if (e.key === 'F3') {
+    e.preventDefault();
+    if (e.shiftKey) { if (findBarVisible.value) findBarRef.value?.prev(); else openFind(false); }
+    else findNext();
+    return;
+  }
+  if (e.key === 'Escape' && findBarVisible.value && !isTypingTarget(document.activeElement)) {
+    onFindClose();
+    return;
+  }
   const mod = e.ctrlKey || e.metaKey;
   if (!mod || e.altKey) return;
   const key = e.key.toLowerCase();
