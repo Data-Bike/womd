@@ -1987,25 +1987,25 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io:
         let dest_path = dest.join(entry.file_name());
         if file_type.is_symlink() {
             // Copy the symlink target path itself (don't follow — avoids infinite recursion on cycles).
-            if let Ok(_target) = std::fs::read_link(&src_path) {
-                #[cfg(unix)]
-                {
+            #[cfg(unix)]
+            {
+                if let Ok(target) = std::fs::read_link(&src_path) {
                     std::os::unix::fs::symlink(&target, &dest_path)?;
                 }
-                #[cfg(windows)]
-                {
-                    // On Windows, fall back to copying the resolved target.
-                    let resolved = src_path.canonicalize().unwrap_or_else(|_| src_path.clone());
-                    if resolved.is_dir() {
-                        copy_dir_recursive(&resolved, &dest_path)?;
-                    } else {
-                        std::fs::copy(&resolved, &dest_path)?;
-                    }
+            }
+            #[cfg(windows)]
+            {
+                // On Windows, fall back to copying the resolved target.
+                let resolved = src_path.canonicalize().unwrap_or_else(|_| src_path.clone());
+                if resolved.is_dir() {
+                    copy_dir_recursive(&resolved, &dest_path)?;
+                } else {
+                    std::fs::copy(&resolved, &dest_path)?;
                 }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    std::fs::copy(&src_path, &dest_path)?;
-                }
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                std::fs::copy(&src_path, &dest_path)?;
             }
         } else if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dest_path)?;
