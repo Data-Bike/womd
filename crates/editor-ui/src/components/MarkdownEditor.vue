@@ -1223,13 +1223,38 @@ function findBlockIndexForByteOffset(byteOffset) {
 
 // Scroll block `index` into the virtualized render window (visibleBlocks),
 // if it isn't already — a no-op when it's already visible.
+//
+// `offsets[index]` can be a rough guess rather than a real measurement for
+// any block the user hasn't scrolled through yet (estimateHeight() falls
+// back to an average-chars-per-line approximation) — for a large document
+// with a long stretch of unmeasured blocks between the current scroll
+// position and a distant search match, that guess can be off by several
+// screens' worth of content. A single jump-and-hope lands in roughly the
+// right place, but "roughly" can visibly land a few blocks short or past
+// the target. So: jump, let the newly-rendered blocks get measured (the
+// blockResizeObserver in onMounted updates `offsets` as soon as they paint),
+// and re-check — repeating until the target's offset stops moving (i.e. the
+// estimate has converged to a real measurement) or a small iteration cap is
+// hit.
 async function ensureBlockVisible(index) {
   if (!viewport.value) return;
-  if (index >= visibleRange.value.start && index <= visibleRange.value.end) return;
-  const target = Math.max(0, (offsets[index] ?? 0) - clientHeight.value / 3);
-  setScrollTop(target);
-  await updateVisibleAndLoad();
-  await nextTick();
+  if (index >= visibleRange.value.start && index <= visibleRange.value.end) return; // already visible
+
+  let lastOffset = null;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const current = offsets[index] ?? 0;
+    const target = Math.max(0, current - clientHeight.value / 3);
+    setScrollTop(target);
+    await updateVisibleAndLoad();
+    await nextTick();
+    // Give the ResizeObserver one animation frame to report real heights for
+    // whatever just rendered before reading `offsets` again.
+    await new Promise((r) => requestAnimationFrame(r));
+    const inView = index >= visibleRange.value.start && index <= visibleRange.value.end;
+    const settled = lastOffset !== null && Math.abs(current - lastOffset) < 2;
+    if (inView && settled) return;
+    lastOffset = current;
+  }
 }
 
 // Jump the visible cursor/selection to a match, without reloading the whole

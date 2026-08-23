@@ -515,7 +515,11 @@ fn insert_text(
 // and Rust applies the edit(s) via the existing byte-range TextEdit path —
 // the full document text never needs to round-trip through JS at all.
 
-const MAX_SEARCH_MATCHES: usize = 20_000;
+// Generous — a few hundred KB of (start, end) pairs is still a trivial IPC
+// payload — but not unbounded, so a genuinely degenerate pattern (e.g. a
+// zero-width match repeated once per byte of a 100+ MB file) can't produce
+// an enormous JSON array.
+const MAX_SEARCH_MATCHES: usize = 100_000;
 
 #[derive(Serialize, Deserialize)]
 struct SearchArgs {
