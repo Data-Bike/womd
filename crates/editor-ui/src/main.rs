@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use editor_core::{DocumentBuffer, EditTransaction, TextEdit};
 use editor_domain::{ByteOffset, ByteRange, MarkdownProfile, ids::DocumentId};
 use editor_git::{GitExtended, VersionControl};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -498,6 +499,221 @@ fn insert_text(
     text: String,
 ) -> Result<EditResult, String> {
     replace_text(state, ReplaceTextArgs { start: position, end: position, new_text: text })
+}
+
+// ---------------------------------------------------------------------------
+// Find / Find & Replace
+// ---------------------------------------------------------------------------
+// Search runs entirely in Rust, directly against the document buffer, and
+// only ever returns match *offsets* (a few bytes each) to the frontend —
+// never the document text itself. This matters: the frontend used to switch
+// into an unvirtualized "source view" textarea just to have something to
+// search, which meant a Find keystroke on a 10+ MB file serialized the
+// entire document to a string and shipped it across the Tauri IPC boundary
+// on every search. Replacement is symmetric: the frontend sends back byte
+// offsets (from a prior search_document call) plus a replacement template,
+// and Rust applies the edit(s) via the existing byte-range TextEdit path —
+// the full document text never needs to round-trip through JS at all.
+
+const MAX_SEARCH_MATCHES: usize = 20_000;
+
+#[derive(Serialize, Deserialize)]
+struct SearchArgs {
+    query: String,
+    #[serde(rename = "caseSensitive")]
+    case_sensitive: bool,
+    regex: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchMatch {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchResult {
+    /// False when `regex` was requested but `query` is not a valid pattern.
+    valid: bool,
+    matches: Vec<SearchMatch>,
+    /// True if more than MAX_SEARCH_MATCHES matched and the list was capped.
+    truncated: bool,
+}
+
+/// Compile `query` into a `Regex`. Non-regex searches are compiled too (as an
+/// escaped literal) so both modes share one matching/replacement path and
+/// unicode-aware case-insensitive comparison always operates on the original
+/// bytes — no separate `to_lowercase()` string ever gets built, which would
+/// risk shifting byte offsets out of sync with the real document for the
+/// (rare but real) Unicode characters whose lowercase form has a different
+/// UTF-8 length than their original form.
+fn compile_search_regex(query: &str, case_sensitive: bool, is_regex: bool) -> Result<Regex, regex::Error> {
+    let pattern = if is_regex { query.to_string() } else { regex::escape(query) };
+    let pattern = if case_sensitive { pattern } else { format!("(?i){pattern}") };
+    Regex::new(&pattern)
+}
+
+/// Pure match-finding logic, factored out of the Tauri command for unit
+/// testing without a running app / `tauri::State`.
+fn find_matches_in_text(text: &str, query: &str, case_sensitive: bool, is_regex: bool) -> SearchResult {
+    if query.is_empty() {
+        return SearchResult { valid: true, matches: Vec::new(), truncated: false };
+    }
+    let re = match compile_search_regex(query, case_sensitive, is_regex) {
+        Ok(re) => re,
+        Err(_) => return SearchResult { valid: false, matches: Vec::new(), truncated: false },
+    };
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    for m in re.find_iter(text) {
+        if matches.len() >= MAX_SEARCH_MATCHES {
+            truncated = true;
+            break;
+        }
+        matches.push(SearchMatch { start: m.start() as u64, end: m.end() as u64 });
+    }
+    SearchResult { valid: true, matches, truncated }
+}
+
+/// Find every occurrence of `query` in the active document.
+#[tauri::command]
+fn search_document(state: tauri::State<'_, Mutex<AppState>>, args: SearchArgs) -> Result<SearchResult, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab()?;
+    let bytes = tab.buffer.serialize();
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(find_matches_in_text(&text, &args.query, args.case_sensitive, args.regex))
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReplaceMatchArgs {
+    start: u64,
+    end: u64,
+    query: String,
+    #[serde(rename = "caseSensitive")]
+    case_sensitive: bool,
+    regex: bool,
+    replacement: String,
+}
+
+/// Expand `$1`, `$name`, `$$`, etc. in `template` using the regex captures
+/// found by re-matching `query` against `matched_text` (the exact substring
+/// at `[start, end)`). For non-regex searches the template is used literally
+/// (no expansion — a literal replacement string should never be reinterpreted).
+fn expand_replacement(matched_text: &str, query: &str, case_sensitive: bool, is_regex: bool, template: &str) -> String {
+    if !is_regex {
+        return template.to_string();
+    }
+    let Ok(re) = compile_search_regex(query, case_sensitive, is_regex) else {
+        return template.to_string();
+    };
+    match re.captures(matched_text) {
+        Some(caps) => {
+            let mut expanded = String::new();
+            caps.expand(template, &mut expanded);
+            expanded
+        }
+        None => template.to_string(),
+    }
+}
+
+/// Replace a single, previously-found match (identified by its byte range)
+/// with `replacement`, expanding regex capture-group references if `regex`
+/// is set.
+#[tauri::command]
+fn replace_match_in_document(
+    state: tauri::State<'_, Mutex<AppState>>,
+    args: ReplaceMatchArgs,
+) -> Result<EditResult, String> {
+    let expanded = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        let tab = s.active_tab()?;
+        let bytes = tab.buffer.serialize();
+        let text = String::from_utf8_lossy(&bytes);
+        let start = args.start as usize;
+        let end = args.end as usize;
+        if start > end || end > text.len() {
+            return Err("match range out of bounds — document changed, please search again".to_string());
+        }
+        expand_replacement(&text[start..end], &args.query, args.case_sensitive, args.regex, &args.replacement)
+    };
+    replace_text(state, ReplaceTextArgs { start: args.start, end: args.end, new_text: expanded })
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReplaceAllArgs {
+    query: String,
+    #[serde(rename = "caseSensitive")]
+    case_sensitive: bool,
+    regex: bool,
+    replacement: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReplaceAllResult {
+    count: usize,
+    edit: EditResult,
+}
+
+/// Replace every match of `query` with `replacement` in a single undo step.
+///
+/// Edits are applied last-match-first: `DocumentBuffer::apply` mutates the
+/// piece table sequentially in the order given, so processing matches from
+/// the end of the document backward means every not-yet-applied match's
+/// original byte offsets stay valid throughout (nothing *before* the match
+/// currently being edited is ever touched by a later-in-the-vec edit).
+/// Processing in the opposite order would invalidate all earlier offsets
+/// after the first edit whose replacement has a different length than the
+/// match it replaced.
+#[tauri::command]
+fn replace_all_in_document(
+    state: tauri::State<'_, Mutex<AppState>>,
+    args: ReplaceAllArgs,
+) -> Result<ReplaceAllResult, String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab_mut()?;
+    let bytes = tab.buffer.serialize();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let found = find_matches_in_text(&text, &args.query, args.case_sensitive, args.regex);
+    if !found.valid {
+        return Err("invalid regular expression".to_string());
+    }
+    if found.matches.is_empty() {
+        return Ok(ReplaceAllResult { count: 0, edit: edit_result_from_tab(tab) });
+    }
+
+    let mut edits: Vec<TextEdit> = found
+        .matches
+        .iter()
+        .rev() // last-match-first, see doc comment above
+        .map(|m| {
+            let start = m.start as usize;
+            let end = m.end as usize;
+            let replacement_text = expand_replacement(
+                &text[start..end],
+                &args.query,
+                args.case_sensitive,
+                args.regex,
+                &args.replacement,
+            );
+            TextEdit::replace(
+                ByteRange::new(ByteOffset(m.start), ByteOffset(m.end)),
+                replacement_text.as_bytes(),
+            )
+        })
+        .collect();
+    // `edits` is currently last-to-first; keep that order (see doc comment).
+    edits.shrink_to_fit();
+
+    let count = found.matches.len();
+    let last_match = found.matches.last().expect("checked non-empty above");
+    let tx = EditTransaction::new(
+        edits,
+        editor_domain::Selection::caret(ByteOffset(last_match.start)),
+        editor_domain::Selection::caret(ByteOffset(last_match.start)),
+    );
+    tab.buffer.apply(tx).map_err(|e| e.to_string())?;
+    Ok(ReplaceAllResult { count, edit: edit_result_from_tab(tab) })
 }
 
 /// Get all blocks of the active document with their source text.
@@ -2202,6 +2418,9 @@ pub fn run() {
             get_document_text,
             replace_text,
             insert_text,
+            search_document,
+            replace_match_in_document,
+            replace_all_in_document,
             get_blocks,
             replace_block,
             undo,
@@ -2775,5 +2994,187 @@ mod tests {
 
         assert_eq!(std::fs::read(&dest).unwrap(), b"# Saved\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Find / Find & Replace
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn find_matches_plain_text_case_insensitive_by_default() {
+        let r = find_matches_in_text("Foo bar foo BAR foo", "foo", false, false);
+        assert!(r.valid);
+        assert_eq!(
+            r.matches.iter().map(|m| (m.start, m.end)).collect::<Vec<_>>(),
+            vec![(0, 3), (8, 11), (16, 19)]
+        );
+    }
+
+    #[test]
+    fn find_matches_plain_text_respects_case_sensitivity() {
+        let r = find_matches_in_text("Foo foo FOO", "foo", true, false);
+        assert_eq!(r.matches.iter().map(|m| (m.start, m.end)).collect::<Vec<_>>(), vec![(4, 7)]);
+    }
+
+    #[test]
+    fn find_matches_empty_query_returns_no_matches() {
+        let r = find_matches_in_text("anything", "", false, false);
+        assert!(r.valid);
+        assert!(r.matches.is_empty());
+    }
+
+    #[test]
+    fn find_matches_regex_mode_finds_pattern_matches() {
+        let r = find_matches_in_text("cat, bat, hat", "[cb]at", false, true);
+        assert!(r.valid);
+        assert_eq!(r.matches.iter().map(|m| (m.start, m.end)).collect::<Vec<_>>(), vec![(0, 3), (5, 8)]);
+    }
+
+    #[test]
+    fn find_matches_invalid_regex_is_reported_as_invalid_not_an_error() {
+        let r = find_matches_in_text("anything", "(unclosed", false, true);
+        assert!(!r.valid);
+        assert!(r.matches.is_empty());
+    }
+
+    #[test]
+    fn find_matches_does_not_hang_on_zero_length_matches() {
+        let r = find_matches_in_text("abc", "x*", false, true);
+        assert!(r.valid);
+        assert_eq!(r.matches.len(), 4); // positions 0..=3
+        assert!(r.matches.iter().all(|m| m.start == m.end));
+    }
+
+    #[test]
+    fn find_matches_caps_pathological_match_counts() {
+        let text = "a".repeat(MAX_SEARCH_MATCHES + 500);
+        let r = find_matches_in_text(&text, "a", false, false);
+        assert!(r.valid);
+        assert_eq!(r.matches.len(), MAX_SEARCH_MATCHES);
+        assert!(r.truncated);
+    }
+
+    /// Case-insensitive matching must never rely on `to_lowercase()`-ing the
+    /// haystack: for characters like German 'ß' that expand under case
+    /// folding (ß -> "ss"), a naive lowercase-then-search would shift every
+    /// subsequent byte offset out of sync with the real (original) document,
+    /// corrupting the very save/replace operations Find is meant to drive.
+    #[test]
+    fn find_matches_case_insensitive_does_not_shift_byte_offsets_on_expanding_casefold() {
+        let text = "Straße ist lang"; // 'ß' is 2 bytes in UTF-8
+        let r = find_matches_in_text(text, "ist", false, false);
+        assert!(r.valid);
+        assert_eq!(r.matches.len(), 1);
+        let m = &r.matches[0];
+        assert_eq!(&text[m.start as usize..m.end as usize], "ist");
+    }
+
+    #[test]
+    fn expand_replacement_substitutes_capture_groups() {
+        let expanded = expand_replacement("2024-01-15", r"(\d{4})-(\d{2})-(\d{2})", false, true, "$3/$2/$1");
+        assert_eq!(expanded, "15/01/2024");
+    }
+
+    #[test]
+    fn expand_replacement_is_literal_for_non_regex_search() {
+        let expanded = expand_replacement("hello", "ell", false, false, "$1 stays literal");
+        assert_eq!(expanded, "$1 stays literal");
+    }
+
+    /// Replacing every match must be a single atomic edit that, once undone,
+    /// restores the document byte-for-byte (Invariant: undo is exact).
+    #[test]
+    fn replace_all_in_document_end_to_end() {
+        let mut state = AppState::default();
+        let original = b"foo bar foo baz foo".to_vec();
+        state.push_tab(DocumentTab {
+            id: 1,
+            buffer: DocumentBuffer::open(
+                original.clone(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("untitled.md"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: None,
+        });
+        let tab = state.active_tab_mut().expect("pushed tab");
+
+        let text = String::from_utf8_lossy(&tab.buffer.serialize()).to_string();
+        let found = find_matches_in_text(&text, "foo", false, false);
+        assert_eq!(found.matches.len(), 3);
+
+        let mut edits: Vec<TextEdit> = found
+            .matches
+            .iter()
+            .rev()
+            .map(|m| {
+                TextEdit::replace(ByteRange::new(ByteOffset(m.start), ByteOffset(m.end)), b"X")
+            })
+            .collect();
+        edits.shrink_to_fit();
+        let tx = EditTransaction::new(
+            edits,
+            editor_domain::Selection::caret(ByteOffset(0)),
+            editor_domain::Selection::caret(ByteOffset(0)),
+        );
+        tab.buffer.apply(tx).unwrap();
+        assert_eq!(tab.buffer.serialize(), b"X bar X baz X");
+
+        // A single undo must fully restore the original text.
+        tab.buffer.undo().unwrap();
+        assert_eq!(tab.buffer.serialize(), original);
+    }
+
+    #[test]
+    fn replace_all_with_regex_capture_groups_end_to_end() {
+        let mut state = AppState::default();
+        let original = b"a=1;b=2;c=3".to_vec();
+        state.push_tab(DocumentTab {
+            id: 1,
+            buffer: DocumentBuffer::open(
+                original.clone(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("untitled.md"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: None,
+        });
+        let tab = state.active_tab_mut().expect("pushed tab");
+
+        let text = String::from_utf8_lossy(&tab.buffer.serialize()).to_string();
+        let found = find_matches_in_text(&text, r"(\w)=(\d)", false, true);
+        assert_eq!(found.matches.len(), 3);
+
+        let mut edits: Vec<TextEdit> = found
+            .matches
+            .iter()
+            .rev()
+            .map(|m| {
+                let start = m.start as usize;
+                let end = m.end as usize;
+                let replacement = expand_replacement(&text[start..end], r"(\w)=(\d)", false, true, "$1:$2");
+                TextEdit::replace(ByteRange::new(ByteOffset(m.start), ByteOffset(m.end)), replacement.as_bytes())
+            })
+            .collect();
+        edits.shrink_to_fit();
+        let tx = EditTransaction::new(
+            edits,
+            editor_domain::Selection::caret(ByteOffset(0)),
+            editor_domain::Selection::caret(ByteOffset(0)),
+        );
+        tab.buffer.apply(tx).unwrap();
+        assert_eq!(tab.buffer.serialize(), b"a:1;b:2;c:3");
     }
 }

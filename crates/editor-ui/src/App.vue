@@ -132,6 +132,7 @@
         @dirty="onDirty"
         @cursor="cursorPos = $event"
         @block-count="blockCount = $event"
+        @search-status="findStatus = $event"
       />
       <div v-else id="editor-container" class="welcome">
         <div class="md-block-placeholder" style="padding:24px;color:var(--fg-muted);text-align:center">
@@ -460,36 +461,21 @@ function selectAll() {
 // Find / Find & Replace
 // ---------------------------------------------------------------------------
 // FindBar.vue is purely presentational (query/replacement/case/regex inputs,
-// F3-style navigation); the actual match-finding lives in MarkdownEditor's
-// exposed search* API (backed by the pure src/lib/search.js). App.vue just
-// wires the two together and keeps `findStatus` (the "N / M" counter) in
-// sync. Find operates on the active editable textarea (source view, or the
-// block currently being edited); if nothing is editable — e.g. the user is
-// looking at the rendered view — switch to source view first.
+// F3-style navigation). The actual search runs on the backend, directly
+// against the document buffer (see search_document/replace_*_in_document in
+// main.rs) — it works regardless of view mode or document size, so there is
+// no need to force a switch into source view (and no need to wait for one to
+// load) just to search. MarkdownEditor keeps `findStatus` (the "N / M"
+// counter) up to date via a `search-status` event; App.vue just relays
+// FindBar's UI events to MarkdownEditor's exposed search* API.
 const findBarRef = ref(null);
 const findBarVisible = ref(false);
-const findStatus = ref({ count: 0, index: -1, valid: true });
+const findStatus = ref({ count: 0, index: -1, valid: true, truncated: false });
 
-async function ensureEditableForFind() {
-  if (editorRef.value?.isSearchReady?.()) return;
-  viewMode.value = 'source';
-  // Switching to source view triggers an async document load inside
-  // MarkdownEditor (it fetches the full text over IPC); wait for the
-  // source textarea to actually appear before handing control back,
-  // instead of racing it with a single nextTick.
-  for (let i = 0; i < 20; i++) {
-    await nextTick();
-    if (editorRef.value?.isSearchReady?.()) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-}
-
-async function openFind(withReplace = false) {
+function openFind(withReplace = false) {
   if (!activeDoc.value) return;
-  await ensureEditableForFind();
   findBarVisible.value = true;
-  await nextTick();
-  findBarRef.value?.focus(withReplace);
+  nextTick(() => findBarRef.value?.focus(withReplace));
 }
 
 function findText() { openFind(false); }
@@ -501,25 +487,24 @@ function findNext() {
 }
 
 function onFindSearch({ query, caseSensitive, regex }) {
-  findStatus.value = editorRef.value?.searchSetQuery?.(query, { caseSensitive, regex })
-    ?? { count: 0, index: -1, valid: true };
+  editorRef.value?.searchSetQuery?.(query, { caseSensitive, regex });
 }
 function onFindNext() {
-  findStatus.value = editorRef.value?.searchNext?.() ?? findStatus.value;
+  editorRef.value?.searchNext?.();
 }
 function onFindPrev() {
-  findStatus.value = editorRef.value?.searchPrev?.() ?? findStatus.value;
+  editorRef.value?.searchPrev?.();
 }
 function onFindReplace(replacement) {
-  findStatus.value = editorRef.value?.searchReplaceCurrent?.(replacement) ?? findStatus.value;
+  editorRef.value?.searchReplaceCurrent?.(replacement);
 }
 function onFindReplaceAll(replacement) {
-  findStatus.value = editorRef.value?.searchReplaceAll?.(replacement) ?? findStatus.value;
+  editorRef.value?.searchReplaceAll?.(replacement);
 }
 function onFindClose() {
   findBarVisible.value = false;
   editorRef.value?.searchClear?.();
-  findStatus.value = { count: 0, index: -1, valid: true };
+  findStatus.value = { count: 0, index: -1, valid: true, truncated: false };
 }
 
 // Switching documents invalidates any in-progress search (matches were

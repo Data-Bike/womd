@@ -61,13 +61,22 @@ const countLabel = computed(() => {
   if (!query.value) return '';
   if (!props.status.valid) return 'Invalid regex';
   if (props.status.count === 0) return 'No results';
-  return `${props.status.index + 1} / ${props.status.count}`;
+  const total = props.status.truncated ? `${props.status.count}+` : props.status.count;
+  return `${props.status.index + 1} / ${total}`;
 });
 
-function emitNext() { emit('next'); }
-function emitPrev() { emit('prev'); }
-function emitReplace() { emit('replace', replacement.value); }
-function emitReplaceAll() { emit('replace-all', replacement.value); }
+// Clicking a toolbar button moves DOM focus to that button; restore it to
+// the query input afterward so typing can continue uninterrupted (this is
+// distinct from — and does not touch — the document's own cursor/selection,
+// which navigateToMatch in MarkdownEditor.vue controls instead).
+function refocusQuery() {
+  nextTick(() => queryInput.value?.focus());
+}
+
+function emitNext() { emit('next'); refocusQuery(); }
+function emitPrev() { emit('prev'); refocusQuery(); }
+function emitReplace() { emit('replace', replacement.value); refocusQuery(); }
+function emitReplaceAll() { emit('replace-all', replacement.value); refocusQuery(); }
 function onEnter() { if (query.value) emitNext(); }
 function close() { emit('close'); }
 

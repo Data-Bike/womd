@@ -86,7 +86,6 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted, onUpdated } fro
 import { invoke } from '@tauri-apps/api/core';
 import { renderBlockHtml } from '../render.js';
 import * as textEditing from '../lib/textEditing.js';
-import * as searchLib from '../lib/search.js';
 
 // ---------------------------------------------------------------------------
 // Overview
@@ -112,7 +111,7 @@ const props = defineProps({
   viewMode: { type: String, default: 'rendered' }, // 'rendered' | 'source'
 });
 
-const emit = defineEmits(['dirty', 'cursor', 'blockCount']);
+const emit = defineEmits(['dirty', 'cursor', 'blockCount', 'searchStatus']);
 
 const currentViewMode = ref(props.viewMode);
 watch(() => props.viewMode, (v) => { currentViewMode.value = v; });
@@ -186,7 +185,11 @@ function onSourceKeydown() {}
 async function saveSource() {
   try {
     const end = totalLen.value || (await invoke('get_parsed_offset'))[1];
-    await invoke('replace_text', { start: 0, end, newText: sourceText.value });
+    // replace_text's Rust parameter is a single struct named `args`; Tauri's
+    // IPC looks the payload up by parameter name, so the fields must be
+    // nested under an `args` key (unlike insert_text's two scalar params,
+    // which are matched by their own individual names).
+    await invoke('replace_text', { args: { start: 0, end, newText: sourceText.value } });
     emit('dirty', true);
     await loadDocument();
   } catch (e) {
@@ -464,9 +467,6 @@ async function loadDocument() {
       target = Math.max(0, offsets[anchorIndex] + anchorOffset - savedClient / 2);
     }
     setScrollTop(target);
-    // Some block heights (especially tables) settle after fonts/paint,
-    // so re-measure once more after a short delay.
-    setTimeout(() => requestAnimationFrame(measureHeights), 300);
   } catch (e) {
     console.error('loadDocument:', e);
   }
@@ -714,9 +714,9 @@ async function exitEdit(force) {
         measureHeights();
         restoreScroll(savedScroll);
       }));
-      // Re-measure after a short delay for tables/figures whose layout
-      // settles after initial paint.
-      setTimeout(() => requestAnimationFrame(measureHeights), 200);
+      // Note: no delayed re-measure needed here — blockResizeObserver (see
+      // onMounted) picks up any further layout settling (tables/images/fonts)
+      // as soon as it happens, without a blind fixed-delay guess.
     });
   });
 }
@@ -1175,127 +1175,187 @@ const isSourceView = computed(() => currentViewMode.value === 'source');
 // ---------------------------------------------------------------------------
 // Find / Find & Replace
 // ---------------------------------------------------------------------------
-// Operates on whichever textarea is currently editable — the source-view
-// textarea, or the block currently being edited. There is intentionally no
-// search across the *rendered* (non-editing) view: that content is
-// virtualized and mostly not present in the DOM at once, so a reliable
-// search requires being in an editable text surface first (the caller,
-// App.vue/FindBar, switches to source view when nothing is editable).
+// Matching and replacing run entirely on the backend (search_document /
+// replace_match_in_document / replace_all_in_document, see main.rs) and only
+// ever exchange byte offsets — never the document text — over IPC. This is
+// what lets Find work instantly on a 10+ MB document without ever loading it
+// whole into the frontend: no more forcing a switch into an unvirtualized
+// source-view textarea just to have something to search.
 //
-// Match-finding and replacement math live in the pure, unit-tested
-// src/lib/search.js module; this section only wires that logic up to the
-// live textarea (selection, scroll position, dirty tracking).
+// Typing is debounced (150ms) so a fast typist doesn't fire an IPC round
+// trip per keystroke, and every request carries a monotonically increasing
+// id so a slow/late response can never clobber a newer one.
+//
+// Live typing (searchSetQuery) NEVER moves focus or the document selection —
+// it only updates the "N / M" counter (searchStatus). Only an explicit user
+// action — Next/Prev/Enter/F3, or a replace — jumps the cursor into the
+// document. Calling `.focus()` from the live-typing path was exactly the bug
+// where every keystroke yanked focus out of the find input.
 
-const searchStatus = ref({ count: 0, index: -1, valid: true });
+const SEARCH_DEBOUNCE_MS = 150;
+
+const searchStatus = ref({ count: 0, index: -1, valid: true, truncated: false });
+watch(searchStatus, (v) => emit('searchStatus', v), { deep: true });
 let searchQuery = '';
 let searchOptions = { caseSensitive: false, regex: false };
-let searchMatches = [];
-
-function getSearchTextarea() {
-  return currentViewMode.value === 'source' ? sourceTextarea.value : getActiveTextarea();
-}
-
-// Whether there is currently a textarea to search — used by App.vue to know
-// when it's safe to run a search after switching into source view (which
-// loads the document text asynchronously over IPC).
-function isSearchReady() {
-  return !!getSearchTextarea();
-}
-
-// Push a new value into whichever textarea is active, keeping editSource/
-// sourceText (and dirty tracking) in sync — mirrors applyToTextarea/
-// withSourceText above, but for programmatic (non-selection) replacements.
-function setSearchTextareaValue(ta, newValue, caretPos) {
-  ta.value = newValue;
-  ta.selectionStart = ta.selectionEnd = caretPos;
-  if (currentViewMode.value === 'source') {
-    sourceText.value = newValue;
-    emit('dirty', true);
-  } else {
-    editSource.value = newValue;
-    nextTick(() => autoSize(ta));
-  }
-}
+let searchMatches = []; // [{start, end}], byte offsets, ascending order
+let searchDebounceTimer = 0;
+let searchRequestId = 0;
 
 function scrollMatchIntoView(ta, pos) {
   const linesBefore = ta.value.slice(0, pos).split('\n').length;
-  ta.scrollTop = Math.max(0, (linesBefore - 5) * LINE_HEIGHT);
+  const target = Math.max(0, (linesBefore - 5) * LINE_HEIGHT);
+  if (ta.scrollTop !== target) ta.scrollTop = target;
 }
 
-function selectCurrentMatch() {
-  const ta = getSearchTextarea();
-  if (!ta || searchStatus.value.index < 0) return;
-  const m = searchMatches[searchStatus.value.index];
+// Binary search `meta` (sorted ascending by byte start) for the block
+// containing `byteOffset`. Mirrors findIndexAtOffset, but over byte offsets
+// instead of pixel offsets.
+function findBlockIndexForByteOffset(byteOffset) {
+  if (!meta.length) return -1;
+  let lo = 0, hi = meta.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (meta[mid].start <= byteOffset) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+// Jump the visible cursor/selection to a match, without reloading the whole
+// document: in source view, select directly (the full text is already
+// loaded, by the user's own choice of view mode); otherwise, enter-edit only
+// the one block containing the match (existing lazy per-block loading).
+async function navigateToMatch(index) {
+  if (index < 0 || index >= searchMatches.length) return;
+  const m = searchMatches[index];
+
+  if (currentViewMode.value === 'source') {
+    const ta = sourceTextarea.value;
+    if (!ta) return;
+    ta.focus();
+    ta.selectionStart = m.start;
+    ta.selectionEnd = m.end;
+    scrollMatchIntoView(ta, m.start);
+    return;
+  }
+
+  const blockIndex = findBlockIndexForByteOffset(m.start);
+  if (blockIndex < 0) return;
+  if (editingIndex.value !== blockIndex) {
+    await enterEdit(blockIndex);
+  }
+  await nextTick();
+  const ta = textareaEl;
+  if (!ta) return;
+  const blockStart = meta[blockIndex]?.start ?? 0;
   ta.focus();
-  ta.selectionStart = m.start;
-  ta.selectionEnd = m.end;
-  scrollMatchIntoView(ta, m.start);
+  ta.selectionStart = Math.max(0, m.start - blockStart);
+  ta.selectionEnd = Math.max(0, m.end - blockStart);
+  scrollMatchIntoView(ta, ta.selectionStart);
 }
 
-/**
- * (Re)run the search against the current textarea's contents. Returns the
- * new status: `{ count, index, valid }` — `valid` is false when `regex` is
- * requested but `query` is not a syntactically valid regular expression.
- * `index` is -1 when there are zero matches.
- */
+/** Actually run the backend search (no debounce). `requestId` lets a stale response be discarded. */
+async function performSearch(query, options, requestId) {
+  try {
+    const result = await invoke('search_document', {
+      args: { query, caseSensitive: !!options.caseSensitive, regex: !!options.regex },
+    });
+    if (requestId !== searchRequestId) return; // a newer query/clear superseded this one
+    if (!result.valid) {
+      searchMatches = [];
+      searchStatus.value = { count: 0, index: -1, valid: false, truncated: false };
+      return;
+    }
+    searchMatches = result.matches;
+    const index = searchMatches.length ? 0 : -1;
+    searchStatus.value = { count: searchMatches.length, index, valid: true, truncated: !!result.truncated };
+  } catch (e) {
+    console.error('search_document:', e);
+  }
+}
+
+/** Update the query/options driving the live match counter (debounced; never touches focus/selection). */
 function searchSetQuery(query, options = {}) {
   searchQuery = query || '';
   searchOptions = { caseSensitive: !!options.caseSensitive, regex: !!options.regex };
-  const ta = getSearchTextarea();
-  if (!ta || !searchQuery) {
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  searchRequestId++;
+  if (!searchQuery) {
     searchMatches = [];
-    searchStatus.value = { count: 0, index: -1, valid: true };
-    return searchStatus.value;
+    searchStatus.value = { count: 0, index: -1, valid: true, truncated: false };
+    return;
   }
-  const found = searchLib.findMatches(ta.value, searchQuery, searchOptions);
-  if (found === null) {
-    searchMatches = [];
-    searchStatus.value = { count: 0, index: -1, valid: false };
-    return searchStatus.value;
-  }
-  searchMatches = found;
-  const index = searchLib.matchIndexAtOrAfter(searchMatches, ta.selectionStart);
-  searchStatus.value = { count: searchMatches.length, index, valid: true };
-  selectCurrentMatch();
-  return searchStatus.value;
+  const requestId = searchRequestId;
+  searchDebounceTimer = setTimeout(() => performSearch(searchQuery, searchOptions, requestId), SEARCH_DEBOUNCE_MS);
 }
 
-function searchStep(delta) {
-  if (!searchMatches.length) return searchStatus.value;
-  const count = searchMatches.length;
-  const index = (searchStatus.value.index + delta + count) % count;
+async function searchStep(delta) {
+  if (!searchMatches.length) return;
+  const index = (searchStatus.value.index + delta + searchMatches.length) % searchMatches.length;
   searchStatus.value = { ...searchStatus.value, index };
-  selectCurrentMatch();
-  return searchStatus.value;
+  await navigateToMatch(index);
 }
 
 function searchNext() { return searchStep(1); }
 function searchPrev() { return searchStep(-1); }
 
-/** Replace the currently-selected match, then advance to the next one (matches are recomputed since offsets shift). */
-function searchReplaceCurrent(replacement) {
-  const ta = getSearchTextarea();
-  if (!ta || searchStatus.value.index < 0) return searchStatus.value;
+/** Replace the currently-selected match on the backend, then re-search and advance to the next match. */
+async function searchReplaceCurrent(replacement) {
+  if (searchStatus.value.index < 0 || !searchMatches.length) return;
+  if (editingIndex.value >= 0) await exitEdit(false); // commit any in-progress block edit first
   const m = searchMatches[searchStatus.value.index];
-  const text = searchLib.resolveReplacementText(m, replacement ?? '', searchOptions.regex);
-  const newValue = searchLib.replaceMatch(ta.value, m, text);
-  setSearchTextareaValue(ta, newValue, m.start + text.length);
-  return searchSetQuery(searchQuery, searchOptions);
+  const wasIndex = searchStatus.value.index;
+  try {
+    await invoke('replace_match_in_document', {
+      args: {
+        start: m.start,
+        end: m.end,
+        query: searchQuery,
+        caseSensitive: searchOptions.caseSensitive,
+        regex: searchOptions.regex,
+        replacement: replacement ?? '',
+      },
+    });
+    emit('dirty', true);
+    await loadDocument();
+    await performSearch(searchQuery, searchOptions, ++searchRequestId);
+    if (searchMatches.length) {
+      const nextIndex = Math.min(wasIndex, searchMatches.length - 1);
+      searchStatus.value = { ...searchStatus.value, index: nextIndex };
+      await navigateToMatch(nextIndex);
+    }
+  } catch (e) {
+    console.error('searchReplaceCurrent:', e);
+  }
 }
 
-/** Replace every match in one pass. */
-function searchReplaceAll(replacement) {
-  const ta = getSearchTextarea();
-  if (!ta || !searchMatches.length) return searchStatus.value;
-  const newValue = searchLib.replaceAllMatches(ta.value, searchMatches, replacement ?? '', searchOptions.regex);
-  setSearchTextareaValue(ta, newValue, 0);
-  return searchSetQuery(searchQuery, searchOptions);
+/** Replace every match in one backend transaction (single undo step). */
+async function searchReplaceAll(replacement) {
+  if (!searchQuery) return;
+  if (editingIndex.value >= 0) await exitEdit(false);
+  try {
+    const result = await invoke('replace_all_in_document', {
+      args: {
+        query: searchQuery,
+        caseSensitive: searchOptions.caseSensitive,
+        regex: searchOptions.regex,
+        replacement: replacement ?? '',
+      },
+    });
+    if (result.count > 0) emit('dirty', true);
+    await loadDocument();
+    await performSearch(searchQuery, searchOptions, ++searchRequestId);
+  } catch (e) {
+    console.error('searchReplaceAll:', e);
+  }
 }
 
 function searchClear() {
+  if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = 0; }
+  searchRequestId++;
   searchQuery = '';
   searchMatches = [];
-  searchStatus.value = { count: 0, index: -1, valid: true };
+  searchStatus.value = { count: 0, index: -1, valid: true, truncated: false };
 }
 
 defineExpose({
@@ -1308,7 +1368,6 @@ defineExpose({
   insertCodeBlock,
   insertTable,
   insertImage,
-  isSearchReady,
   searchSetQuery,
   searchNext,
   searchPrev,

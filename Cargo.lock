@@ -969,6 +969,7 @@ dependencies = [
  "editor-git",
  "editor-markdown",
  "editor-storage",
+ "regex",
  "serde",
  "serde_json",
  "tauri",
