@@ -17,6 +17,7 @@ use editor_domain::{ByteOffset, ByteRange, MarkdownProfile, ids::DocumentId};
 use editor_git::{GitExtended, VersionControl};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use base64::{prelude::BASE64_STANDARD, Engine};
 
 // ---------------------------------------------------------------------------
 // State: multiple document tabs
@@ -2404,6 +2405,35 @@ fn block_kind_name(block: &editor_markdown::Block) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Image insertion
+// ---------------------------------------------------------------------------
+
+/// Read an image file from disk and return it as a `data:<mime>;base64,...` URL.
+/// The frontend uses this to embed images directly into the Markdown source
+/// instead of linking to an external file.
+#[tauri::command]
+fn read_image_file(path: String) -> Result<String, String> {
+    let path = PathBuf::from(path);
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    };
+    Ok(format!("data:{mime};base64,{}", BASE64_STANDARD.encode(&bytes)))
+}
+
+// ---------------------------------------------------------------------------
 // App entry point
 // ---------------------------------------------------------------------------
 
@@ -2504,6 +2534,7 @@ pub fn run() {
             create_file,
             create_directory,
             get_tear_off_file,
+            read_image_file,
         ])
         .setup(|_app| {
             #[cfg(debug_assertions)]

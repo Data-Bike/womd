@@ -84,6 +84,7 @@
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onUnmounted, onUpdated } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 import { renderBlockHtml } from '../render.js';
 import * as textEditing from '../lib/textEditing.js';
 import { byteOffsetToTextareaIndex } from '../lib/byteOffset.js';
@@ -878,10 +879,17 @@ function sourceLink() {
   withSourceText((value, start, end) => textEditing.makeLink(value, start, end, url));
 }
 
-function sourceImage() {
-  const url = prompt('Image URL:', 'https://');
-  if (!url) return;
-  withSourceText((value, start, end) => textEditing.makeImage(value, start, end, url));
+async function sourceImage() {
+  const ta = sourceTextarea.value;
+  const start = ta ? ta.selectionStart : 0;
+  const end = ta ? ta.selectionEnd : 0;
+  const dataUrl = await pickImageDataUrl();
+  if (!dataUrl) return;
+  if (ta) {
+    ta.selectionStart = start;
+    ta.selectionEnd = end;
+  }
+  withSourceText((value, s, e) => textEditing.makeImage(value, s, e, dataUrl));
 }
 
 function sourceTable() {
@@ -1002,11 +1010,30 @@ function insertLinkInTextarea(ta) {
   applyToTextarea(ta, (value, start, end) => textEditing.makeLink(value, start, end, url));
 }
 
-function insertImageInTextarea(ta) {
+async function pickImageDataUrl() {
+  const path = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico'] }],
+  });
+  if (!path) return null;
+  try {
+    return await invoke('read_image_file', { path });
+  } catch (e) {
+    console.error('read_image_file:', e);
+    return null;
+  }
+}
+
+async function insertImageInTextarea(ta) {
   if (!ta) return;
-  const url = prompt('Image URL:', 'https://');
-  if (!url) return;
-  applyToTextarea(ta, (value, start, end) => textEditing.makeImage(value, start, end, url));
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const dataUrl = await pickImageDataUrl();
+  if (!dataUrl) return;
+  ta.selectionStart = start;
+  ta.selectionEnd = end;
+  applyToTextarea(ta, (value, s, e) => textEditing.makeImage(value, s, e, dataUrl));
 }
 
 function insertTableInTextarea(ta) {
@@ -1057,15 +1084,15 @@ async function insertTable() {
 }
 
 async function insertImage() {
-  if (currentViewMode.value === 'source') { sourceImage(); return; }
+  if (currentViewMode.value === 'source') { await sourceImage(); return; }
   const ta = getActiveTextarea();
   if (ta) {
-    insertImageInTextarea(ta);
+    await insertImageInTextarea(ta);
     return;
   }
-  const url = prompt('Image URL:', 'https://');
-  if (!url) return;
-  await invoke('insert_text', { position: totalLen.value || 0, text: `![alt text](${url})` });
+  const dataUrl = await pickImageDataUrl();
+  if (!dataUrl) return;
+  await invoke('insert_text', { position: totalLen.value || 0, text: `![alt text](${dataUrl})` });
   await loadDocument();
   emit('dirty', true);
 }
