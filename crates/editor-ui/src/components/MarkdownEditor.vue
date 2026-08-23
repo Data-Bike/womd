@@ -1083,6 +1083,17 @@ async function insertTable() {
   emit('dirty', true);
 }
 
+function positionForRenderedInsert() {
+  const sel = window.getSelection();
+  if (sel?.rangeCount && !sel.isCollapsed) {
+    const found = findBlockFromSelection();
+    if (found != null) return meta[found.index]?.end ?? totalLen.value;
+  }
+  const y = scrollTop.value + (clientHeight.value / 2);
+  const idx = findIndexAtOffset(y);
+  return meta[idx]?.end ?? totalLen.value;
+}
+
 async function insertImage() {
   if (currentViewMode.value === 'source') { await sourceImage(); return; }
   const ta = getActiveTextarea();
@@ -1092,7 +1103,12 @@ async function insertImage() {
   }
   const dataUrl = await pickImageDataUrl();
   if (!dataUrl) return;
-  await invoke('insert_text', { position: totalLen.value || 0, text: `![alt text](${dataUrl})` });
+  const position = positionForRenderedInsert();
+  const atEnd = position >= (totalLen.value || 0);
+  const text = atEnd
+    ? `\n![alt text](${dataUrl})\n`
+    : `\n![alt text](${dataUrl})\n\n`;
+  await invoke('insert_text', { position, text });
   await loadDocument();
   emit('dirty', true);
 }
