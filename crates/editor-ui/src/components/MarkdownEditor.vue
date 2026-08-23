@@ -1268,8 +1268,26 @@ function findBlockIndexForByteOffset(byteOffset) {
   return lo;
 }
 
-// Scroll block `index` into the virtualized render window (visibleBlocks),
-// if it isn't already — a no-op when it's already visible.
+// Is block `index` within the actual on-screen viewport (scrollTop to
+// scrollTop + clientHeight)? This is deliberately *not* the same question as
+// "is it in visibleRange" — visibleRange also includes RENDER_BUFFER
+// (800px) of pre-rendered content above/below the fold, for smooth
+// scrolling. A block can be part of visibleBlocks (rendered in the DOM)
+// while still being physically off-screen. Using visibleRange as an
+// "already visible" check let the viewport silently drift up to ~800px
+// (several blocks) away from a highlighted match before ever correcting —
+// exactly the "scroll doesn't follow, then suddenly jumps" symptom.
+function isBlockOnScreen(index) {
+  const top = offsets[index] ?? 0;
+  const bottom = offsets[index + 1] ?? top;
+  const viewTop = scrollTop.value;
+  const viewBottom = scrollTop.value + clientHeight.value;
+  return top < viewBottom && bottom > viewTop;
+}
+
+// Scroll block `index` into the *actual visible viewport* (not just the
+// virtualized render window, see isBlockOnScreen above) if it isn't there
+// already.
 //
 // `offsets[index]` sums the (possibly estimated) height of every block from
 // 0 to `index`. For a block deep in a long stretch the user has never
@@ -1289,7 +1307,7 @@ function findBlockIndexForByteOffset(byteOffset) {
 // takes over to fine-tune the remaining pixels.
 async function ensureBlockVisible(index) {
   if (!viewport.value) return;
-  if (index >= visibleRange.value.start && index <= visibleRange.value.end) return; // already visible
+  if (isBlockOnScreen(index)) return; // already on-screen, nothing to do
 
   let lastOffset = null;
   for (let attempt = 0; attempt < 6; attempt++) {
@@ -1301,9 +1319,8 @@ async function ensureBlockVisible(index) {
     // Give the ResizeObserver one animation frame to report real heights for
     // whatever just rendered before reading `offsets` again.
     await new Promise((r) => requestAnimationFrame(r));
-    const inView = index >= visibleRange.value.start && index <= visibleRange.value.end;
     const settled = lastOffset !== null && Math.abs((offsets[index] ?? 0) - lastOffset) < 2;
-    if (inView && settled) return;
+    if (isBlockOnScreen(index) && settled) return;
     lastOffset = offsets[index] ?? 0;
   }
 }
@@ -1351,6 +1368,13 @@ async function navigateToMatch(index) {
       await updateVisibleAndLoad();
       await nextTick();
     }
+  } else {
+    // Two consecutive matches landed in the same block that's already open
+    // for editing — re-check on-screen visibility anyway. The block itself
+    // hasn't moved, but the user may have manually scrolled the outer page
+    // away from it since the last match, or (for an unusually tall block)
+    // this match may sit in a part of it that isn't currently on-screen.
+    await ensureBlockVisible(blockIndex);
   }
   const ta = textareaEl;
   if (!ta) return;
