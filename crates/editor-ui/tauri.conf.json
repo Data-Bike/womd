@@ -36,5 +36,15 @@
       "icons/128x128.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://github.com/Data-Bike/womd/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEyQkQwODQ3MkU3RTQxNkMKUldSc1FYNHVSd2k5RWhmTXpRTEZaNWsvbUtoSnRVc29FeDBKdDFwNEtjamZLMmJHNlZYMkQrVGkK"
+    }
   }
 }

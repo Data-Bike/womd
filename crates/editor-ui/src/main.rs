@@ -2560,6 +2560,9 @@ pub fn run() {
             read_image_file,
         ])
         .setup(|_app| {
+            #[cfg(desktop)]
+            _app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+
             #[cfg(debug_assertions)]
             {
                 use tauri::Manager;

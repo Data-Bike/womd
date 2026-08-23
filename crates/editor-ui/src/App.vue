@@ -174,6 +174,7 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { open, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { check } from '@tauri-apps/plugin-updater';
 import MarkdownEditor from './components/MarkdownEditor.vue';
 import ToolBar from './components/ToolBar.vue';
 import StatusBar from './components/StatusBar.vue';
@@ -652,6 +653,25 @@ function scheduleAutosave() {
 
 watch(activeIsDirty, (dirty) => { if (dirty) scheduleAutosave(); });
 
+async function checkForUpdate() {
+  try {
+    const update = await check();
+    if (update?.available) {
+      const install = confirm(
+        `A new version of WoMD is available: ${update.version}. Install now?`
+      );
+      if (install) {
+        await update.downloadAndInstall((event) => {
+          console.log('update progress', event);
+        });
+        // The installer has been downloaded; Tauri will relaunch the app.
+      }
+    }
+  } catch (e) {
+    console.error('checkForUpdate:', e);
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown);
   await refreshTabs();
@@ -663,6 +683,7 @@ onMounted(async () => {
       console.error('open_welcome:', e);
     }
   }
+  checkForUpdate();
 });
 
 onUnmounted(() => {
