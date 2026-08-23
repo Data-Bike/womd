@@ -14,9 +14,7 @@ jobs:
       matrix:
         include:
           - platform: ubuntu-latest
-            bundle-ext: deb
           - platform: windows-latest
-            bundle-ext: msi
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -54,11 +52,18 @@ jobs:
           projectPath: crates/editor-ui
           args: --verbose
 
-      - name: Upload bundle artifact
+      - name: Find produced bundles
+        if: success()
+        shell: bash
+        run: |
+          echo "--- bundle tree ---"
+          find target/release/bundle -type f 2>/dev/null || true
+
+      - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
-          name: womd-${{ matrix.platform }}-${{ matrix.bundle-ext }}
-          path: |
-            target/release/bundle/*/*.${{ matrix.bundle-ext }}
-            target/release/bundle/**/*.${{ matrix.bundle-ext }}
+          name: womd-${{ matrix.platform }}-bundle
+          path: target/release/bundle/**/*
+          if-no-files-found: error
+          retention-days: 7
