@@ -35,6 +35,7 @@
       @table="insertTable"
       @image="insertImage"
       @settings="settingsOpen = true"
+      @help="helpOpen = true"
     />
     <ContextMenu
       :show="ctxShow"
@@ -155,6 +156,8 @@
     </div>
 
     <SettingsModal v-model:open="settingsOpen" />
+    <AboutModal v-model:open="aboutOpen" />
+    <HelpModal v-model:open="helpOpen" />
 
     <StatusBar
       :cursor-pos="cursorText"
@@ -178,6 +181,8 @@ import TabBar from './components/TabBar.vue';
 import GitPanel from './components/GitPanel.vue';
 import FileTree from './components/FileTree.vue';
 import SettingsModal from './components/SettingsModal.vue';
+import AboutModal from './components/AboutModal.vue';
+import HelpModal from './components/HelpModal.vue';
 import MenuBar from './components/MenuBar.vue';
 import ContextMenu from './components/ContextMenu.vue';
 import FindBar from './components/FindBar.vue';
@@ -190,6 +195,8 @@ const fileTreeWidth = ref(260);
 const gitVisible = ref(false);
 const gitWidth = ref(380);
 const settingsOpen = ref(false);
+const aboutOpen = ref(false);
+const helpOpen = ref(false);
 const viewMode = ref('rendered');
 const branchInfo = ref('');
 const cursorPos = ref({ line: 1, col: 1 });
@@ -515,7 +522,7 @@ function closeWindow() {
   getCurrentWindow().close().catch((e) => console.error('closeWindow:', e));
 }
 
-function about() { alert('WoMD — Markdown Editor\nVersion 0.1.0'); }
+function about() { aboutOpen.value = true; }
 
 // ---------------------------------------------------------------------------
 // Global keyboard shortcuts. Every combo shown in the menus above must
@@ -531,6 +538,11 @@ function isTypingTarget(el) {
 }
 
 function onGlobalKeydown(e) {
+  if (e.key === 'F1') {
+    e.preventDefault();
+    helpOpen.value = true;
+    return;
+  }
   if (e.key === 'F3') {
     e.preventDefault();
     if (e.shiftKey) { if (findBarVisible.value) findBarRef.value?.prev(); else openFind(false); }

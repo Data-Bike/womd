@@ -36,7 +36,7 @@ const emit = defineEmits([
   'view-rendered', 'view-source', 'toggle-tree', 'toggle-git',
   'heading', 'bold', 'italic', 'strikethrough', 'code', 'link',
   'unordered-list', 'ordered-list', 'task-list', 'quote', 'hr', 'code-block', 'table', 'image',
-  'settings', 'about'
+  'settings', 'about', 'help'
 ]);
 
 const active = ref(null);
@@ -136,6 +136,8 @@ const menus = [
   {
     label: 'Help',
     items: [
+      { label: 'Help...', action: () => emit('help'), shortcut: 'F1' },
+      null,
       { label: 'About WoMD', action: () => emit('about') },
     ]
   },
