@@ -85,6 +85,7 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted, onUpdated } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { renderBlockHtml } from '../render.js';
 import * as textEditing from '../lib/textEditing.js';
 import { byteOffsetToTextareaIndex } from '../lib/byteOffset.js';
@@ -179,6 +180,8 @@ const suppressScroll = ref(false);
 const sourceText = ref('');
 const sourceLoading = ref(false);
 const sourceTextarea = ref(null);
+
+let unlistenDragDrop = null;
 
 const sourceLineCount = computed(() => Math.max(1, sourceText.value.split(/\r?\n/).length));
 
@@ -1083,6 +1086,96 @@ async function insertTable() {
   emit('dirty', true);
 }
 
+function isImagePath(path) {
+  return /\.(png|jpe?g|gif|svg|webp|bmp|ico)$/i.test(path);
+}
+
+function lineStartAt(text, line) {
+  let start = 0;
+  let current = 0;
+  while (current < line) {
+    const next = text.indexOf('\n', start);
+    if (next === -1) return text.length;
+    start = next + 1;
+    current++;
+  }
+  return start;
+}
+
+function sourceInsertAt(offset, text) {
+  const ta = sourceTextarea.value;
+  if (!ta) return;
+  const { value, start: newStart } = textEditing.insertText(sourceText.value, offset, offset, text);
+  sourceText.value = value;
+  ta.value = value;
+  nextTick(() => {
+    ta.selectionStart = newStart;
+    ta.selectionEnd = newStart;
+    ta.focus();
+    syncGutter();
+  });
+}
+
+async function insertImageAtRendered(clientY, imageText) {
+  if (!viewport.value) return;
+  const viewportRect = viewport.value.getBoundingClientRect();
+  const yDoc = (clientY - viewportRect.top) + viewport.value.scrollTop;
+  const idx = findIndexAtOffset(yDoc);
+  const position = meta[idx]?.end ?? totalLen.value;
+  const atEnd = position >= (totalLen.value || 0);
+  const text = atEnd
+    ? `\n${imageText}\n`
+    : `\n${imageText}\n\n`;
+  await invoke('insert_text', { position, text });
+  await loadDocument();
+  emit('dirty', true);
+}
+
+async function insertImageFromDrop(clientX, clientY, paths) {
+  if (!viewport.value) return;
+  const viewportRect = viewport.value.getBoundingClientRect();
+  if (clientY < viewportRect.top || clientY > viewportRect.bottom
+      || clientX < viewportRect.left || clientX > viewportRect.right) {
+    return;
+  }
+
+  const imagePaths = paths.filter(isImagePath);
+  if (!imagePaths.length) return;
+
+  const dataUrls = [];
+  for (const path of imagePaths) {
+    try {
+      dataUrls.push(await invoke('read_image_file', { path }));
+    } catch (e) {
+      console.error('read_image_file:', e);
+    }
+  }
+  if (!dataUrls.length) return;
+  const imageText = dataUrls.map((u) => `![alt text](${u})`).join('\n');
+
+  if (currentViewMode.value === 'source') {
+    const ta = sourceTextarea.value;
+    if (!ta) return;
+    const taRect = ta.getBoundingClientRect();
+    if (clientY < taRect.top || clientY > taRect.bottom) return;
+    const lineHeight = parseInt(window.getComputedStyle(ta).lineHeight, 10) || 20;
+    const line = Math.max(0, Math.floor((clientY - taRect.top + ta.scrollTop) / lineHeight));
+    const offset = lineStartAt(sourceText.value, line);
+    sourceInsertAt(offset, imageText + '\n');
+    emit('dirty', true);
+    return;
+  }
+
+  await insertImageAtRendered(clientY, imageText);
+}
+
+async function handleDragDrop(event) {
+  if (event.type !== 'drop' || !event.paths?.length) return;
+  const clientX = event.position.x / (window.devicePixelRatio || 1);
+  const clientY = event.position.y / (window.devicePixelRatio || 1);
+  await insertImageFromDrop(clientX, clientY, event.paths);
+}
+
 function positionForRenderedInsert() {
   const sel = window.getSelection();
   if (sel?.rangeCount && !sel.isCollapsed) {
@@ -1237,6 +1330,11 @@ onMounted(() => {
     blockResizeObserver = new ResizeObserver(onBlockResize);
     observeBlockHeights();
   }
+  getCurrentWebview().onDragDropEvent(handleDragDrop).then((u) => {
+    unlistenDragDrop = u;
+  }).catch((e) => {
+    console.error('onDragDropEvent:', e);
+  });
   loadDocument();
 });
 
@@ -1248,6 +1346,7 @@ onUnmounted(() => {
   if (visibleUpdateRaf) cancelAnimationFrame(visibleUpdateRaf);
   if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
   if (blockResizeObserver) { blockResizeObserver.disconnect(); blockResizeObserver = null; }
+  if (unlistenDragDrop) { unlistenDragDrop(); unlistenDragDrop = null; }
 });
 
 function save() {
