@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { byteOffsetToIndex, indexToByteOffset } from './byteOffset.js';
+import { byteOffsetToIndex, indexToByteOffset, byteOffsetToTextareaIndex } from './byteOffset.js';
 
 describe('byteOffsetToIndex', () => {
   it('is a no-op for pure ASCII text', () => {
@@ -86,5 +86,49 @@ describe('indexToByteOffset', () => {
   it('clamps to the string length for an out-of-range index', () => {
     const text = 'short';
     expect(indexToByteOffset(text, 1000)).toBe(new TextEncoder().encode(text).length);
+  });
+});
+
+describe('byteOffsetToTextareaIndex', () => {
+  it('is a no-op when the raw text has no carriage returns', () => {
+    const raw = 'Кириллица test';
+    const byteOffset = new TextEncoder().encode('Кириллица ').length;
+    expect(byteOffsetToTextareaIndex(raw, byteOffset)).toBe(byteOffsetToIndex(raw, byteOffset));
+  });
+
+  it('compensates for CRLF line endings that the textarea normalizes to LF', () => {
+    // Raw backend bytes: 'ab\r\ncd' -> 6 bytes. Textarea API value: 'ab\ncd' (5 chars).
+    const raw = 'ab\r\ncd';
+    const apiValue = 'ab\ncd';
+    // Match 'cd' in the raw document starts at byte 4, ends at byte 6 (exclusive).
+    expect(byteOffsetToTextareaIndex(raw, 4)).toBe(apiValue.indexOf('cd')); // 3
+    expect(byteOffsetToTextareaIndex(raw, 6)).toBe(apiValue.indexOf('cd') + 2); // 5
+  });
+
+  it('compensates for multiple CRLF sequences', () => {
+    const raw = 'line1\r\nline2\r\nline3';
+    const apiValue = 'line1\nline2\nline3';
+    // 'line3' starts at raw byte (5 + 2 + 5 + 2) = 14, ends at 19.
+    const line3Start = new TextEncoder().encode('line1\r\nline2\r\n').length;
+    expect(line3Start).toBe(14);
+    expect(byteOffsetToTextareaIndex(raw, line3Start)).toBe(apiValue.indexOf('line3')); // 12
+    expect(byteOffsetToTextareaIndex(raw, line3Start + 5)).toBe(apiValue.indexOf('line3') + 5); // 17
+  });
+
+  it('handles bare CR (old Mac) line endings the same way', () => {
+    // Raw 'ab\rcd' (5 chars, 5 bytes). Textarea API value: 'ab\ncd' (5 chars).
+    const raw = 'ab\rcd';
+    const apiValue = 'ab\ncd';
+    expect(byteOffsetToTextareaIndex(raw, 3)).toBe(apiValue.indexOf('cd'));       // start of 'c'
+    expect(byteOffsetToTextareaIndex(raw, 5)).toBe(apiValue.indexOf('cd') + 2);   // end of 'd'
+  });
+
+  it('combines multi-byte UTF-8 and CRLF normalization', () => {
+    // 'Ки' = 4 bytes, then CRLF (2 bytes), then 'Ми' = 4 bytes. Total raw = 10 bytes.
+    // API value: 'Ки\nМи' (7 chars): К(0) и(1) \n(2) М(3) и(4).
+    const raw = 'Ки\r\nМи';
+    const apiValue = 'Ки\nМи';
+    expect(byteOffsetToTextareaIndex(raw, 6)).toBe(apiValue.indexOf('Ми')); // 3
+    expect(byteOffsetToTextareaIndex(raw, 10)).toBe(apiValue.length); // 5
   });
 });

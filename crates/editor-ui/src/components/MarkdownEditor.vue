@@ -86,7 +86,7 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted, onUpdated } fro
 import { invoke } from '@tauri-apps/api/core';
 import { renderBlockHtml } from '../render.js';
 import * as textEditing from '../lib/textEditing.js';
-import { byteOffsetToIndex } from '../lib/byteOffset.js';
+import { byteOffsetToTextareaIndex } from '../lib/byteOffset.js';
 
 // ---------------------------------------------------------------------------
 // Overview
@@ -1338,8 +1338,8 @@ async function navigateToMatch(index) {
     const ta = sourceTextarea.value;
     if (!ta) return;
     ta.focus();
-    ta.selectionStart = byteOffsetToIndex(ta.value, m.start);
-    ta.selectionEnd = byteOffsetToIndex(ta.value, m.end);
+    ta.selectionStart = byteOffsetToTextareaIndex(sourceText.value, m.start);
+    ta.selectionEnd = byteOffsetToTextareaIndex(sourceText.value, m.end);
     scrollMatchIntoView(ta, ta.selectionStart);
     return;
   }
@@ -1380,9 +1380,10 @@ async function navigateToMatch(index) {
   const ta = textareaEl;
   if (!ta) return;
   const blockStart = meta[blockIndex]?.start ?? 0;
+  const rawSource = editOriginal.value;
   ta.focus();
-  ta.selectionStart = byteOffsetToIndex(ta.value, m.start - blockStart);
-  ta.selectionEnd = byteOffsetToIndex(ta.value, m.end - blockStart);
+  ta.selectionStart = byteOffsetToTextareaIndex(rawSource, m.start - blockStart);
+  ta.selectionEnd = byteOffsetToTextareaIndex(rawSource, m.end - blockStart);
   scrollMatchIntoView(ta, ta.selectionStart);
 }
 

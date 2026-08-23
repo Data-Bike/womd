@@ -59,3 +59,29 @@ export function indexToByteOffset(text, index) {
   }
   return bytes;
 }
+
+/**
+ * Convert a UTF-8 byte offset into a `<textarea>` selection index.
+ *
+ * `<textarea>` values are "API values" per the HTML spec: every line break
+ * (`\r`, `\r\n`, or `\n`) is normalized to a single `\n` before the value is
+ * exposed to JavaScript. That means the string the user selects from
+ * (`ta.value`) can have fewer characters than the raw UTF-8 bytes the Rust
+ * backend operates on — one fewer for every `\r` in the original source.
+ *
+ * `rawText` must be the original string that corresponds to the backend bytes
+ * (i.e. the same characters with any `\r` still intact). The returned index is
+ * valid for the line-feed-normalized `ta.value`.
+ */
+export function byteOffsetToTextareaIndex(rawText, byteOffset) {
+  if (byteOffset <= 0) return 0;
+  const rawIndex = byteOffsetToIndex(rawText, byteOffset);
+  // The HTML textarea API value normalizes every line ending (CR, CRLF, LF)
+  // to a single LF. Only the CR in a CRLF pair is actually removed; a bare
+  // CR is replaced by an LF keeping the same character count.
+  let crlfCount = 0;
+  for (let i = 0; i < rawIndex; i++) {
+    if (rawText[i] === '\r' && rawText[i + 1] === '\n') crlfCount++;
+  }
+  return Math.max(0, rawIndex - crlfCount);
+}
