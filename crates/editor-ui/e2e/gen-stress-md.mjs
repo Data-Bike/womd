@@ -9,6 +9,7 @@
 //   defaults: test-data/womd-stress-100mb.md at repo root, 100 MiB
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -25,6 +26,55 @@ const rnd = () => {
   return (seed >>> 0) / 4294967296;
 };
 const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+
+// Minimal PNG encoder: 16x16 RGB checkerboard-gradient, real decodable image
+// embedded as a data: URI so rendered previews actually show something.
+function crc32(buf) {
+  let c, table = crc32.table;
+  if (!table) {
+    table = crc32.table = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c;
+    }
+  }
+  c = -1;
+  for (let i = 0; i < buf.length; i++) c = table[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+function pngChunk(type, data) {
+  const out = Buffer.alloc(12 + data.length);
+  out.writeUInt32BE(data.length, 0);
+  out.write(type, 4);
+  data.copy(out, 8);
+  out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length);
+  return out;
+}
+function makePng(w = 16, h = 16) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; ihdr[9] = 2; // 8-bit RGB
+  const raw = Buffer.alloc(h * (1 + w * 3));
+  for (let y = 0; y < h; y++) {
+    const row = y * (1 + w * 3);
+    raw[row] = 0;
+    for (let x = 0; x < w; x++) {
+      const p = row + 1 + x * 3;
+      raw[p] = (x + y) % 2 ? 0x3b : 0x9c;      // R
+      raw[p + 1] = (x * 16) & 0xff;            // G gradient
+      raw[p + 2] = (y * 16) & 0xff;            // B gradient
+    }
+  }
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+  return `data:image/png;base64,${png.toString('base64')}`;
+}
+const IMG_DATA_URI = makePng();
 
 const WORDS = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf',
   'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar'];
@@ -69,11 +119,11 @@ function chapter(i) {
   // Tables
   s.push(`| Col A ${i} | Col B ${i} | Col C ${i} |\n|:--|:--:|--:|\n| a${i} | b${i} | c${i} |\n| d${i} | e${i} | f${i} |\n`);
   s.push(`|x${i}|y${i}|\n|-|-|\n|1|2|\n`);
-  // Math
-  s.push(`$$E_${i} = m c^2 + \\frac{${i}}{n}$$\n`);
-  s.push(`Inline math $x_{i}^{2} + y = ${i}$ inside a sentence.\n`);
-  // Inline-heavy paragraph
-  s.push(`***bold-italic ${i}*** __underline__ \`inline\` **[b](https://b.example/${i})** ![img ${i}](img-${i}.png "title ${i}")\n`);
+  // Math — the parser's supported forms: \[ display \] and \( inline \).
+  s.push(`\\[x_${i} = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a} + \\frac{${i}}{n}\\]\n`);
+  s.push(`Inline math \\(x_{${i}}^{2} + y = ${i}\\) inside a sentence.\n`);
+  // Inline-heavy paragraph (image uses a real embedded PNG so it renders).
+  s.push(`***bold-italic ${i}*** __underline__ \`inline\` **[b](https://b.example/${i})** ![img ${i}](${IMG_DATA_URI} "title ${i}")\n`);
   // HTML block
   s.push(`<div class="html-${i}">\n  <p>html block ${i} <b>bold html</b></p>\n</div>\n`);
   s.push(`<table><tr><td>raw table ${i}</td></tr></table>\n`);
