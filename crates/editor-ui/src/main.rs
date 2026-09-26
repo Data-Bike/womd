@@ -268,7 +268,17 @@ struct GitFileDiff {
     path: String,
     old_path: Option<String>,
     hunks: Vec<GitHunkInfo>,
+    /// True when the diff was capped at MAX_DIFF_LINES — a 100 MB modified or
+    /// newly-added file would otherwise materialize millions of line objects
+    /// into the webview and freeze it.
+    truncated: bool,
 }
+
+/// Hard cap on diff lines sent to the UI per file. A monorepo-scale or
+/// generated 100 MB file produces millions of `+`/`-` lines — serializing and
+/// rendering them as individual DOM rows locks the webview. Beyond the cap we
+/// stop collecting and flag `truncated` so the UI can say so.
+const MAX_DIFF_LINES: usize = 20_000;
 
 #[derive(Serialize, Deserialize)]
 struct GitCommitInfo {
@@ -1303,15 +1313,7 @@ fn git_diff(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitFileDiff>
     let dir = path.parent().ok_or("no parent directory")?;
     let git = editor_git::GitCli::open(dir).map_err(|e| e.to_string())?;
     let diffs = git.diff(editor_git::DiffRequest::WorkingTreeVsHead).map_err(|e| e.to_string())?;
-    Ok(diffs.iter().map(|fd| GitFileDiff {
-        path: fd.path.clone(),
-        old_path: fd.old_path.clone(),
-        hunks: fd.hunks.iter().map(|h| GitHunkInfo {
-            old_start: h.old_start,
-            new_start: h.new_start,
-            lines: h.lines.iter().map(|lc| line_change_to_info(lc)).collect(),
-        }).collect(),
-    }).collect())
+    Ok(diffs.iter().map(file_diff_to_ui).collect())
 }
 
 /// Convert a repo-root-relative path to a git pathspec that works from any
@@ -1367,8 +1369,8 @@ fn git_diff_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) ->
     let rel = repo_relative_path(&git, &file_path)?;
     let ps = root_pathspec(&rel);
     let text = git.diff_file_raw(&ps).map_err(|e| e.to_string())?;
-    let hunks = parse_unified_diff(&text);
-    Ok(GitFileDiff { path: rel, old_path: None, hunks })
+    let (hunks, truncated) = parse_unified_diff(&text);
+    Ok(GitFileDiff { path: rel, old_path: None, hunks, truncated })
 }
 
 /// Get unified diff for a single file between two commits.
@@ -1378,8 +1380,8 @@ fn git_diff_file_commits(state: tauri::State<'_, Mutex<AppState>>, file_path: St
     let rel = repo_relative_path(&git, &file_path)?;
     let ps = root_pathspec(&rel);
     let text = git.diff_file_commits_raw(&ps, &commit_a, &commit_b).map_err(|e| e.to_string())?;
-    let hunks = parse_unified_diff(&text);
-    Ok(GitFileDiff { path: rel, old_path: None, hunks })
+    let (hunks, truncated) = parse_unified_diff(&text);
+    Ok(GitFileDiff { path: rel, old_path: None, hunks, truncated })
 }
 
 /// Get unified diff for a single file between working tree and a commit.
@@ -1389,8 +1391,8 @@ fn git_diff_file_vs_commit(state: tauri::State<'_, Mutex<AppState>>, file_path: 
     let rel = repo_relative_path(&git, &file_path)?;
     let ps = root_pathspec(&rel);
     let text = git.diff_file_vs_commit_raw(&ps, &commit).map_err(|e| e.to_string())?;
-    let hunks = parse_unified_diff(&text);
-    Ok(GitFileDiff { path: rel, old_path: None, hunks })
+    let (hunks, truncated) = parse_unified_diff(&text);
+    Ok(GitFileDiff { path: rel, old_path: None, hunks, truncated })
 }
 
 /// Discard changes to a file (restore from HEAD). Equivalent to `git checkout -- <file>`.
@@ -1672,15 +1674,7 @@ fn worktree_op(
 fn git_diff_commits(state: tauri::State<'_, Mutex<AppState>>, commit_a: String, commit_b: String) -> Result<Vec<GitFileDiff>, String> {
     let git = open_git_for_active(&state)?;
     let diffs = git.diff_commits(&commit_a, &commit_b).map_err(|e| e.to_string())?;
-    Ok(diffs.iter().map(|fd| GitFileDiff {
-        path: fd.path.clone(),
-        old_path: fd.old_path.clone(),
-        hunks: fd.hunks.iter().map(|h| GitHunkInfo {
-            old_start: h.old_start,
-            new_start: h.new_start,
-            lines: h.lines.iter().map(|lc| line_change_to_info(lc)).collect(),
-        }).collect(),
-    }).collect())
+    Ok(diffs.iter().map(file_diff_to_ui).collect())
 }
 
 /// Diff between working tree and a specific commit.
@@ -1688,15 +1682,7 @@ fn git_diff_commits(state: tauri::State<'_, Mutex<AppState>>, commit_a: String, 
 fn git_diff_vs_commit(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<Vec<GitFileDiff>, String> {
     let git = open_git_for_active(&state)?;
     let diffs = git.diff_working_tree_vs_commit(&commit).map_err(|e| e.to_string())?;
-    Ok(diffs.iter().map(|fd| GitFileDiff {
-        path: fd.path.clone(),
-        old_path: fd.old_path.clone(),
-        hunks: fd.hunks.iter().map(|h| GitHunkInfo {
-            old_start: h.old_start,
-            new_start: h.new_start,
-            lines: h.lines.iter().map(|lc| line_change_to_info(lc)).collect(),
-        }).collect(),
-    }).collect())
+    Ok(diffs.iter().map(file_diff_to_ui).collect())
 }
 
 /// Get detailed commit log (with short SHA, body, parents).
@@ -2723,10 +2709,31 @@ fn line_change_to_info(lc: &editor_diff::LineChange) -> GitDiffLine {
     }
 }
 
+/// Map a parsed `editor_git::FileDiff` to the UI shape, capping the line
+/// payload at MAX_DIFF_LINES per file (see the const's doc comment).
+fn file_diff_to_ui(fd: &editor_git::FileDiff) -> GitFileDiff {
+    let mut total = 0usize;
+    let mut truncated = false;
+    let hunks = fd.hunks.iter().map(|h| {
+        let mut lines = Vec::with_capacity(h.lines.len().min(MAX_DIFF_LINES));
+        for lc in &h.lines {
+            if total >= MAX_DIFF_LINES { truncated = true; break; }
+            lines.push(line_change_to_info(lc));
+            total += 1;
+        }
+        GitHunkInfo { old_start: h.old_start, new_start: h.new_start, lines }
+    }).collect();
+    GitFileDiff { path: fd.path.clone(), old_path: fd.old_path.clone(), hunks, truncated }
+}
+
 /// Parse a unified diff text into hunks with line-level changes.
 /// Each hunk header: `@@ -old_start,old_count +new_start,new_count @@`
 /// Body lines: ` ` equal, `+` insert, `-` delete, `\` no-newline marker.
-fn parse_unified_diff(text: &str) -> Vec<GitHunkInfo> {
+/// Returns the hunks plus a `truncated` flag — parsing stops at
+/// MAX_DIFF_LINES so a giant generated/modified file can't wedge the UI.
+fn parse_unified_diff(text: &str) -> (Vec<GitHunkInfo>, bool) {
+    let mut total_lines = 0usize;
+    let mut truncated = false;
     let mut hunks = Vec::new();
     let mut current_hunk: Option<GitHunkInfo> = None;
     let mut old_line: u32 = 0;
@@ -2763,6 +2770,10 @@ fn parse_unified_diff(text: &str) -> Vec<GitHunkInfo> {
             if bytes.is_empty() { continue; }
             // Inside a hunk `--- x`/`+++ x` are NOT file headers: they are a
             // deleted line whose text was `-- x` or an added `++ x`.
+            if total_lines >= MAX_DIFF_LINES {
+                truncated = true;
+                break;
+            }
             match bytes[0] {
                 b' ' => {
                     let text_content = &line[1..];
@@ -2800,12 +2811,13 @@ fn parse_unified_diff(text: &str) -> Vec<GitHunkInfo> {
                 }
                 _ => {}
             }
+            total_lines += 1;
         }
     }
     if let Some(h) = current_hunk {
         hunks.push(h);
     }
-    hunks
+    (hunks, truncated)
 }
 
 // ── AST serialization for frontend rendering ────────────────────────────────
@@ -3640,7 +3652,7 @@ mod tests {
     #[test]
     fn test_parse_unified_diff_basic() {
         let diff = "diff --git a/file.txt b/file.txt\nindex abc..def 100644\n--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,4 @@\n line1\n line2\n+new line\n line3\n";
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 1, "should have 1 hunk");
         assert_eq!(hunks[0].old_start, 1);
         assert_eq!(hunks[0].new_start, 1);
@@ -3656,7 +3668,7 @@ mod tests {
     #[test]
     fn test_parse_unified_diff_multiple_hunks() {
         let diff = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n-old line\n+new line\n@@ -10,2 +10,2 @@\n-old2\n+new2\n";
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 2, "should have 2 hunks");
         assert_eq!(hunks[0].lines.len(), 2);
         assert_eq!(hunks[0].lines[0].kind, "delete");
@@ -3669,7 +3681,7 @@ mod tests {
     #[test]
     fn test_parse_unified_diff_new_file() {
         let diff = "diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..abc\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+line1\n+line2\n";
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 1, "should have 1 hunk for new file");
         assert_eq!(hunks[0].lines.len(), 2);
         assert_eq!(hunks[0].lines[0].kind, "insert");
@@ -3680,7 +3692,7 @@ mod tests {
     #[test]
     fn test_parse_unified_diff_deleted_file() {
         let diff = "diff --git a/del.txt b/del.txt\ndeleted file mode 100644\nindex abc..0000000\n--- a/del.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-line1\n-line2\n";
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 1, "should have 1 hunk for deleted file");
         assert_eq!(hunks[0].lines.len(), 2);
         assert_eq!(hunks[0].lines[0].kind, "delete");
@@ -3690,7 +3702,7 @@ mod tests {
     /// parse_unified_diff should handle empty diff (no changes).
     #[test]
     fn test_parse_unified_diff_empty() {
-        let hunks = parse_unified_diff("");
+        let hunks = parse_unified_diff("").0;
         assert!(hunks.is_empty());
     }
 
@@ -3698,7 +3710,7 @@ mod tests {
     #[test]
     fn test_parse_unified_diff_with_function_context() {
         let diff = "--- a/file.rs\n+++ b/file.rs\n@@ -10,3 +10,4 @@ fn my_function(x: i32) -> i32 {\n     let y = x + 1;\n     y\n+    y * 2\n }\n";
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].old_start, 10);
         assert_eq!(hunks[0].new_start, 10);
@@ -3709,7 +3721,7 @@ mod tests {
     #[test]
     fn test_parse_unified_diff_no_newline_marker() {
         let diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1,1 +1,2 @@\n line1\n+line2\n\\ No newline at end of file\n";
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 1);
         // The \ line should be skipped, so only 2 lines.
         assert_eq!(hunks[0].lines.len(), 2);
@@ -3719,7 +3731,7 @@ mod tests {
     #[test]
     fn test_parse_unified_diff_no_counts() {
         let diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1,2 @@\n-old\n+new1\n+new2\n";
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].old_start, 1);
         assert_eq!(hunks[0].new_start, 1);
@@ -3731,7 +3743,7 @@ mod tests {
     #[test]
     fn test_parse_unified_diff_dashed_content_lines() {
         let diff = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n--- deleted text\n+++ added text\n";
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].lines.len(), 2);
         assert_eq!(hunks[0].lines[0].kind, "delete");
@@ -3753,7 +3765,7 @@ mod tests {
             "index 111..222 100644\n",
             "--- a/f2\n+++ b/f2\n@@ -1 +1 @@\n-x\n+y\n"
         );
-        let hunks = parse_unified_diff(diff);
+        let hunks = parse_unified_diff(diff).0;
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0].lines.len(), 2);
         assert_eq!(hunks[0].lines[0].text, "a");
@@ -3762,6 +3774,26 @@ mod tests {
         assert_eq!(hunks[1].lines[0].text, "x");
         assert_eq!(hunks[1].lines[0].kind, "delete");
         assert_eq!(hunks[1].lines[1].kind, "insert");
+    }
+
+    /// A giant diff must be capped rather than materialized unboundedly —
+    /// a 100 MB modified/untracked file otherwise produces millions of line
+    /// objects and freezes the webview (regression for the Load-diff hang).
+    #[test]
+    fn test_parse_unified_diff_truncates_at_cap() {
+        let mut diff = String::from("@@ -1 +1 @@\n");
+        for i in 0..MAX_DIFF_LINES + 500 {
+            diff.push_str(&format!("+line{i}\n"));
+        }
+        let (hunks, truncated) = parse_unified_diff(&diff);
+        assert!(truncated);
+        let total: usize = hunks.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(total, MAX_DIFF_LINES);
+
+        // Small diffs are not truncated.
+        let (hunks, truncated) = parse_unified_diff("@@ -1 +1 @@\n-a\n+b\n");
+        assert!(!truncated);
+        assert_eq!(hunks[0].lines.len(), 2);
     }
 
     /// root_pathspec should prepend the top-level literal pathspec magic.

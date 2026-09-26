@@ -168,7 +168,9 @@ let lastDocId = null;
 // cache at the same indices, showing one document's content inside another.
 let docGeneration = 0;
 let anchorAfterEdit = -1;
-let ignoreScroll = 0;
+// scrollTop values we set programmatically — their scroll events are ours,
+// so onScroll ignores exactly those (see onScroll for why not a counter).
+const pendingScrollTops = new Set();
 let loadingVisible = false;
 let textareaEl = null;
 let resizeObserver = null;
@@ -317,9 +319,14 @@ function estimateHeight(i) {
   if (nextStart != null && startLines[i] != null) {
     lines = Math.max(1, nextStart - startLines[i]);
   } else {
-    const span = Math.max(0, (m.end || 0) - (m.start || 0));
-    lines = Math.max(1, Math.round(span / AVG_CHARS_PER_LINE));
+    lines = 0;
   }
+  // Long source lines wrap into many visual lines — source-line count alone
+  // badly underestimates their height (the biggest scroll-jerk source).
+  // Blend with a chars-per-line estimate so both directions are covered.
+  const span = Math.max(0, (m.end || 0) - (m.start || 0));
+  lines = Math.max(lines, Math.round(span / AVG_CHARS_PER_LINE));
+  lines = Math.max(1, lines);
   let factor = 1.0;
   if (m.kind.includes('table')) factor = 4.0;
   else if (m.kind.includes('list')) factor = 2.5;
@@ -343,6 +350,22 @@ function rebuildOffsets(fromIndex = 0) {
   totalHeight.value = top + pad;
   layoutVersion.value++;
   emit('blockCount', meta.length);
+}
+
+// Scroll anchoring: when a height measurement lands, rebuildOffsets shifts
+// the offsets of every block below `firstChanged`. If that shifted content
+// ABOVE the current scrollTop, the text under the viewport visibly jumps —
+// the classic virtualized-list scroll jerk. Anchor on the topmost on-screen
+// block's offset before the rebuild, then shift scrollTop by that offset's
+// delta so what the user is reading stays put. Changes wholly below the
+// viewport produce delta 0 and cost nothing.
+function rebuildOffsetsAnchored(firstChanged) {
+  if (!viewport.value) { rebuildOffsets(firstChanged); return; }
+  const anchorIdx = findIndexAtOffset(scrollTop.value);
+  const anchorTop = offsets[anchorIdx] ?? 0;
+  rebuildOffsets(firstChanged);
+  const shift = (offsets[anchorIdx] ?? 0) - anchorTop;
+  if (shift !== 0) setScrollTop(scrollTop.value + shift);
 }
 
 // Largest index i such that offsets[i] <= y (i.e. the block containing y).
@@ -659,9 +682,16 @@ watch(() => [props.doc?.id, currentViewMode.value], async (newV, oldV) => {
 // ---------------------------------------------------------------------------
 
 function onScroll() {
-  if (ignoreScroll > 0) { ignoreScroll--; return; }
   if (suppressScroll.value || !viewport.value) return;
-  scrollTop.value = viewport.value.scrollTop;
+  const y = viewport.value.scrollTop;
+  // Distinguish our own programmatic scrolls from the user's by VALUE, not
+  // by count: a counter would swallow a real user scroll that lands while a
+  // programmatic-scroll event is still in flight, leaving the `scrollTop`
+  // ref desynced from the DOM (the virtualized window would then render the
+  // wrong range — blank/jumpy viewport until the next scroll).
+  if (pendingScrollTops.has(y)) { pendingScrollTops.delete(y); return; }
+  pendingScrollTops.clear();
+  scrollTop.value = y;
   if (gutter.value) gutter.value.scrollTop = scrollTop.value;
   scheduleVisibleUpdate();
 }
@@ -679,7 +709,7 @@ function setScrollTop(value) {
   if (!viewport.value) return;
   const clamped = Math.max(0, value);
   if (viewport.value.scrollTop === clamped) return;
-  ignoreScroll++;
+  pendingScrollTops.add(clamped);
   viewport.value.scrollTop = clamped;
   scrollTop.value = clamped;
   if (gutter.value) gutter.value.scrollTop = clamped;
@@ -766,7 +796,7 @@ function measureHeights() {
       firstChanged = Math.min(firstChanged, idx);
     }
   }
-  if (firstChanged < Infinity) rebuildOffsets(firstChanged);
+  if (firstChanged < Infinity) rebuildOffsetsAnchored(firstChanged);
   layoutReady.value = true;
 }
 
@@ -793,7 +823,7 @@ function onBlockResize(entries) {
       firstChanged = Math.min(firstChanged, idx);
     }
   }
-  if (firstChanged < Infinity) rebuildOffsets(firstChanged);
+  if (firstChanged < Infinity) rebuildOffsetsAnchored(firstChanged);
 }
 
 async function maybeParseNextChunk() {

@@ -1182,6 +1182,105 @@ const imgDoc = await page.evaluate(() => new TextDecoder().decode(
 check('image+table edit committed', imgDoc.includes('data:image/png;base64,'),
   imgDoc.slice(-160).replace(/\n/g, '|'));
 
+// ── 56. Scroll anchoring: a resize above the viewport must not jerk ──────
+await setStep("56. Scroll anchoring");
+await page.evaluate(() => { window.__mockDialogOpen = '/repo/big.md'; });
+await page.locator('#btn-open').click();
+// Chunked parsing feeds blocks incrementally — wait for the FULL count
+// (mock knows it synchronously) before scrolling mid-document.
+await page.waitForFunction(() => {
+  const m = window.__tauriMock;
+  const total = m.docInfo(m.state.tabs[m.state.active]).block_count;
+  const shown = parseInt(document.querySelector('#block-count')?.textContent || '0');
+  return total > 0 && shown >= total;
+}, null, { timeout: 15000 });
+// Park the viewport mid-document (as a fraction of the real sizer height —
+// estimated offsets, not a fixed px). The post-load scroll restore can land
+// late and reset scrollTop to 0 — retry the assignment until it sticks.
+for (let attempt = 0; attempt < 5; attempt++) {
+  await page.evaluate(() => {
+    const vp = document.querySelector('#block-editor');
+    vp.scrollTop = Math.floor(vp.scrollHeight * 0.4);
+  });
+  try {
+    await page.waitForFunction(
+      () => document.querySelector('#block-editor').scrollTop > 1000,
+      null, { timeout: 1200 });
+    break;
+  } catch { /* restore raced us — retry */ }
+}
+await page.waitForTimeout(900);
+const anchorInfo = await page.evaluate(() => {
+  const vp = document.querySelector('#block-editor');
+  const vpTop = vp.getBoundingClientRect().top;
+  const els = [...document.querySelectorAll('.md-block')];
+  const top = els.find((el) => el.getBoundingClientRect().bottom > vpTop);
+  // A rendered block ABOVE the viewport (inside overscan) to grow.
+  const above = [...els].reverse().find((el) => el.getBoundingClientRect().bottom <= vpTop);
+  return {
+    scroll: vp.scrollTop,
+    topIdx: top ? Number(top.dataset.blockIndex) : -1,
+    topText: top ? top.textContent.slice(0, 40) : '',
+    aboveIdx: above ? Number(above.dataset.blockIndex) : -1,
+  };
+});
+check('anchor probe: rendered blocks exist above viewport',
+  anchorInfo.aboveIdx >= 0 && anchorInfo.topIdx > anchorInfo.aboveIdx,
+  JSON.stringify(anchorInfo));
+const GROW = 320;
+await page.evaluate((g) => {
+  const vp = document.querySelector('#block-editor');
+  const vpTop = vp.getBoundingClientRect().top;
+  const els = [...document.querySelectorAll('.md-block')];
+  const above = [...els].reverse().find((el) => el.getBoundingClientRect().bottom <= vpTop);
+  if (above) {
+    // A real child — ResizeObserver reports content-box height, so padding
+    // tricks don't count; an in-flow child grows the box like real content.
+    const filler = document.createElement('div');
+    filler.style.height = `${g}px`;
+    above.appendChild(filler);
+  }
+}, GROW);
+await page.waitForTimeout(700); // ResizeObserver -> rebuildOffsets -> anchor shift
+const afterGrow = await page.evaluate(() => {
+  const vp = document.querySelector('#block-editor');
+  const vpTop = vp.getBoundingClientRect().top;
+  const els = [...document.querySelectorAll('.md-block')];
+  const top = els.find((el) => el.getBoundingClientRect().bottom > vpTop);
+  return {
+    scroll: vp.scrollTop,
+    topIdx: top ? Number(top.dataset.blockIndex) : -1,
+    topText: top ? top.textContent.slice(0, 40) : '',
+  };
+});
+// The grown block pushed everything below by ~GROW px; scrollTop must be
+// compensated so the SAME block stays at the viewport top (no visual jump).
+check('resize above viewport compensates scrollTop',
+  Math.abs(afterGrow.scroll - (anchorInfo.scroll + GROW)) < 40,
+  `${anchorInfo.scroll} -> ${afterGrow.scroll} (expected ~${anchorInfo.scroll + GROW})`);
+check('same block stays at viewport top (no jump)',
+  afterGrow.topIdx === anchorInfo.topIdx && afterGrow.topText === anchorInfo.topText,
+  `${anchorInfo.topIdx}:"${anchorInfo.topText}" -> ${afterGrow.topIdx}:"${afterGrow.topText}"`);
+// A resize BELOW the viewport must NOT move scrollTop.
+const belowInfo = await page.evaluate(() => {
+  const vp = document.querySelector('#block-editor');
+  const vpBottom = vp.getBoundingClientRect().bottom;
+  const els = [...document.querySelectorAll('.md-block')];
+  const below = els.find((el) => el.getBoundingClientRect().top > vpBottom);
+  if (below) {
+    const filler = document.createElement('div');
+    filler.style.height = '200px';
+    below.appendChild(filler);
+  }
+  return { belowIdx: below ? Number(below.dataset.blockIndex) : -1, scroll: vp.scrollTop };
+});
+await page.waitForTimeout(700);
+const scrollAfterBelow = await page.evaluate(
+  () => document.querySelector('#block-editor').scrollTop);
+check('resize below viewport leaves scrollTop alone',
+  belowInfo.belowIdx >= 0 && scrollAfterBelow === belowInfo.scroll,
+  `below=${belowInfo.belowIdx} ${belowInfo.scroll} -> ${scrollAfterBelow}`);
+
 // ── Summary ─────────────────────────────────────────────────────────────
 console.log('\n──── console errors ────');
 for (const e of errors) console.log('  ' + e.slice(0, 300));

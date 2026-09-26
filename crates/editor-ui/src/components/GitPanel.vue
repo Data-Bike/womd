@@ -86,6 +86,9 @@
               </div>
             </div>
             <div v-if="!selectedFileDiff.hunks?.length" class="file-tree-empty">No diff</div>
+            <div v-if="selectedFileDiff.truncated" class="diff-truncated">
+              Diff too large — showing first 20,000 lines
+            </div>
           </div>
         </div>
       </div>
@@ -172,6 +175,9 @@
               <span class="diff-line-sign">{{ sign(line.kind) }}</span>
               <span class="diff-line-content">{{ line.text }}</span>
             </div>
+          </div>
+          <div v-if="file.truncated" class="diff-truncated">
+            Diff too large — showing first 20,000 lines
           </div>
         </div>
         <div v-if="!diff?.length" class="file-tree-empty">Select a diff mode and click Load diff</div>
@@ -450,13 +456,19 @@ function toRepoRelative(absPath) {
   return absPath;
 }
 
+// Same cap the backend enforces — an untracked 100 MB file would otherwise
+// materialize millions of line objects and freeze the webview.
+const MAX_DIFF_LINES = 20000;
+
 function syntheticUntrackedDiff(path, text) {
-  const lines = (text || '').split('\n');
+  const all = (text || '').split('\n');
+  const truncated = all.length > MAX_DIFF_LINES;
+  const lines = truncated ? all.slice(0, MAX_DIFF_LINES) : all;
   const ls = [];
   for (let i = 0; i < lines.length; i++) {
     ls.push({ kind: 'insert', old_no: null, new_no: i + 1, text: lines[i] });
   }
-  return { path, old_path: null, hunks: [{ old_start: 0, new_start: 1, lines: ls }] };
+  return { path, old_path: null, truncated, hunks: [{ old_start: 0, new_start: 1, lines: ls }] };
 }
 
 async function loadDiffForPath(rawPath) {
@@ -465,9 +477,15 @@ async function loadDiffForPath(rawPath) {
     if (diffMode.value === 'working') {
       const d = await invoke('git_diff_file', { filePath: path });
       if (d?.hunks?.length) return d;
-      // Untracked or new file: show full content as added.
-      const content = await invoke('git_read_file_at_revision', { filePath: path, revision: '' });
-      if (content != null) return syntheticUntrackedDiff(path, content);
+      // Untracked or new file: show full content as added — but cap before
+      // the expensive split: a 100 MB file becomes millions of objects.
+      let content = await invoke('git_read_file_at_revision', { filePath: path, revision: '' });
+      if (content != null) {
+        const cut = content.indexOf('\n', MAX_DIFF_LINES * 40) < 0
+          ? MAX_DIFF_LINES * 40 : content.indexOf('\n', MAX_DIFF_LINES * 40);
+        if (content.length > cut) content = content.slice(0, cut);
+        return syntheticUntrackedDiff(path, content);
+      }
       return null;
     } else if (diffMode.value === 'commit') {
       if (!diffCommit.value.trim()) return null;
