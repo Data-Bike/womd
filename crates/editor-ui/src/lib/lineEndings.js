@@ -17,24 +17,33 @@ export function normalizeForTextarea(raw) {
 }
 
 /**
- * The dominant line ending of a text: "\r\n" if any CRLF pair exists,
- * otherwise "\n" (lone `\r` is treated as LF-style by textarea anyway).
+ * The dominant line ending of a text: the most frequent of the three
+ * families ("\r\n" pairs, lone "\r", lone "\n"), preferring "\r\n" then
+ * "\n" on ties. A lone `\r` is a real line ending (classic Mac) — a CR-only
+ * file must restore `\n` back to `\r`, not stay LF.
  */
 export function dominantLineEnding(text) {
-  return String(text).includes('\r\n') ? '\r\n' : '\n';
+  const s = String(text);
+  const pairs = (s.match(/\r\n/g) || []).length;
+  const crs = (s.match(/\r(?!\n)/g) || []).length;
+  const lfs = (s.match(/(?<!\r)\n/g) || []).length;
+  if (pairs > 0 && pairs >= crs && pairs >= lfs) return '\r\n';
+  if (crs > lfs) return '\r';
+  return '\n';
 }
 
 /**
  * Restore the original block's line endings in edited textarea output.
  * `original` is the raw block source as loaded from the backend; `edited`
- * is the LF-only text coming out of the textarea. If the original block was
- * CRLF, every `\n` in the edited text becomes `\r\n` so unchanged lines keep
- * their original bytes and the edit diff stays minimal.
+ * is the LF-only text coming out of the textarea. Every `\n` in the edited
+ * text becomes the block's dominant ending so unchanged lines keep their
+ * original bytes and the edit diff stays minimal.
  */
 export function restoreLineEndings(original, edited) {
-  if (dominantLineEnding(original) === '\r\n' && !String(edited).includes('\r')) {
-    return String(edited).replace(/\n/g, '\r\n');
-  }
+  if (String(edited).includes('\r')) return edited;
+  const ending = dominantLineEnding(original);
+  if (ending === '\r\n') return String(edited).replace(/\n/g, '\r\n');
+  if (ending === '\r') return String(edited).replace(/\n/g, '\r');
   return edited;
 }
 
@@ -44,4 +53,44 @@ export function restoreLineEndings(original, edited) {
  */
 export function contentChanged(original, edited) {
   return normalizeForTextarea(original) !== normalizeForTextarea(edited);
+}
+
+/**
+ * Classify a document's line-ending style for display: 'CRLF', 'CR', 'LF',
+ * or 'Mixed' when more than one family is present. Same rules as the
+ * backend's `detect_line_ending`: a single stray CRLF in an LF file (or
+ * vice versa) is Mixed, not a mislabeled dominant type. Unlike
+ * `dominantLineEnding` (which picks a style to restore), every family
+ * counts once here — presence, not majority, decides Mixed.
+ */
+export function detectLineEnding(text) {
+  const s = String(text);
+  let crlf = 0, lf = 0, cr = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\r') {
+      if (s[i + 1] === '\n') { crlf++; i++; } else { cr++; }
+    } else if (s[i] === '\n') {
+      lf++;
+    }
+  }
+  const kinds = (crlf > 0) + (lf > 0) + (cr > 0);
+  if (kinds > 1) return 'Mixed';
+  if (crlf) return 'CRLF';
+  if (cr) return 'CR';
+  return 'LF';
+}
+
+/**
+ * Classify from a bounded prefix sample. Truncating right between the `\r`
+ * and `\n` of a CRLF pair would leave a dangling `\r` that reads as a bare
+ * CR — mislabeling a pure-CRLF file as Mixed (or CR when the pair was the
+ * only break in the sample). The dangling byte is dropped before counting.
+ */
+export function detectLineEndingSampled(text, limit = 4096) {
+  const s = String(text);
+  let sample = s.substring(0, limit);
+  if (s.length > sample.length && sample.endsWith('\r')) {
+    sample = sample.slice(0, -1);
+  }
+  return detectLineEnding(sample);
 }

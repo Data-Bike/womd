@@ -128,6 +128,7 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { fetchGitHubStatus } from '../lib/githubStatus.js';
 
 const props = defineProps({
   open: Boolean,
@@ -207,13 +208,12 @@ function close() {
 }
 
 async function refreshGh() {
-  try {
-    ghAuth.value = await invoke('github_auth_status');
-    ghRepo.value = await invoke('github_repo_metadata');
-  } catch (e) {
-    console.error('refreshGh:', e);
-    ghAuth.value = { authenticated: false, user: '' };
-  }
+  // Auth and repo metadata are independent calls — `repo view` legitimately
+  // fails when the open file is not inside a GitHub repo, and that failure
+  // must not report the user as logged out (see lib/githubStatus.js).
+  const { auth, repo } = await fetchGitHubStatus(invoke);
+  ghAuth.value = auth;
+  ghRepo.value = repo;
 }
 
 async function ghLogin() {

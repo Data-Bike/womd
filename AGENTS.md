@@ -10,6 +10,10 @@
 - `npm test` (from `crates/editor-ui/`) — runs the Vitest suite for pure frontend
   logic (currently `src/lib/textEditing.js`, the shared block/source-view formatting
   helpers). `npm run build` still must pass too.
+- `npm run test:e2e` (from `crates/editor-ui/`) — Playwright click-driven probe
+  (`e2e/probe.mjs`) against the Vite dev server with a mocked Tauri backend
+  (`e2e/mock-tauri.mjs`). Requires `vite dev` (or `cargo tauri dev`) already
+  running on :5173. Screenshots land in `e2e/shots/` (gitignored).
 - Workspace uses `resolver = "3"`, edition 2024, Rust 1.95+.
 - `unsafe_code = "deny"` across the workspace (§74, §85). Exception: `editor-storage`
   uses `warn` + crate-root `deny` + `allow` only in `src/mmap.rs` (mmap requires unsafe,

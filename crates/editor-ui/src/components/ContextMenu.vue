@@ -3,6 +3,7 @@
     v-show="show"
     class="context-menu"
     :style="{ top: `${clampedY}px`, left: `${clampedX}px` }"
+    @mousedown.prevent
     @click.stop
   >
     <div
@@ -21,7 +22,7 @@
 </template>
 
 <script setup>
-import { ref, watch, computed } from 'vue';
+import { ref, watch, computed, onUnmounted } from 'vue';
 
 const props = defineProps({
   show: Boolean,
@@ -87,14 +88,30 @@ const menuHeightEstimate = 480;
 const clampedX = computed(() => Math.min(props.x, Math.max(0, window.innerWidth - menuWidth)));
 const clampedY = computed(() => Math.min(props.y, Math.max(0, window.innerHeight - menuHeightEstimate)));
 
+// Microtasks run between event listeners during the same dispatch: the
+// watcher (flushed in a microtask after App's contextmenu handler sets
+// show=true) used to register a window 'contextmenu' listener that then
+// fired for the very right-click that opened the menu — it self-closed
+// before becoming visible. 'contextmenu' is intentionally NOT a closer:
+// a second right-click repositions the menu (standard behavior).
+let closeListeners = null;
+function clearCloseListeners() {
+  if (closeListeners) {
+    for (const [t, fn] of closeListeners) window.removeEventListener(t, fn);
+    closeListeners = null;
+  }
+}
 watch(() => props.show, (v) => {
+  // Re-armed on each open; dropped on close/unmount so stale once-listeners
+  // can't leak or close a menu opened later.
+  clearCloseListeners();
   if (v) {
     const close = () => emit('close');
-    window.addEventListener('click', close, { once: true });
-    window.addEventListener('contextmenu', close, { once: true });
-    window.addEventListener('scroll', close, { once: true });
+    closeListeners = [['click', close], ['scroll', close]];
+    for (const [t, fn] of closeListeners) window.addEventListener(t, fn, { once: true });
   }
 });
+onUnmounted(clearCloseListeners);
 </script>
 
 <style scoped>

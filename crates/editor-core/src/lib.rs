@@ -281,8 +281,15 @@ impl DocumentBuffer {
         while content.last() == Some(&b'\n') || content.last() == Some(&b'\r') {
             content = &content[..content.len() - 1];
         }
-        let last_nl = content.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
+        let last_nl = content.iter().rposition(|&b| b == b'\n' || b == b'\r').map(|i| i + 1).unwrap_or(0);
         let last_line = &content[last_nl..];
+        // A single-line block can't be closed: its last line IS the opener
+        // (` "```\n" ` right at the chunk boundary) — the fence continues into
+        // the next chunk. Treating the opener as a valid closer would leave
+        // the fence body to be parsed as fresh Markdown.
+        if last_nl == 0 {
+            return true;
+        }
         // CommonMark: a closing fence may be indented by at most 3 spaces.
         // A 4+-indented (or tab-indented) line is code content, not a closer —
         // the fence is still open and the chunk must back up.
@@ -311,7 +318,7 @@ impl DocumentBuffer {
     /// so we must not skip blanks here.
     fn chunk_continues_container(&self, offset: u64, end: u64, marker: u8) -> bool {
         let bytes = self.table.to_range(offset, end.min(offset + 256));
-        let Some(line) = bytes.split(|&b| b == b'\n').next() else {
+        let Some(line) = logical_lines(&bytes).next() else {
             return false;
         };
         let mut l = line;
@@ -347,7 +354,7 @@ impl DocumentBuffer {
     fn chunk_continues_paragraph(&self, offset: u64, end: u64) -> bool {
         let bytes = self.table.to_range(offset, end.min(offset + 256));
         let mut skipped_blank = false;
-        for line in bytes.split(|&b| b == b'\n') {
+        for line in logical_lines(&bytes) {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 skipped_blank = true;
                 continue;
@@ -371,41 +378,15 @@ impl DocumentBuffer {
             if indent >= 4 {
                 return true;
             }
-            // `---`/`===` are NOT in this list: they may be a setext heading
-            // underline continuing the paragraph, so we merge and let the
-            // reparse decide (thematic break vs setext H2).
-            if l.starts_with(b"#")
-                || l.starts_with(b">")
-                || l.starts_with(b"```")
-                || l.starts_with(b"~~~")
-                || l.starts_with(b"***")
-                || l.starts_with(b"___")
-                || l.starts_with(b"$$")
-            {
-                return false;
-            }
-            let rest = if matches!(l.first(), Some(b'-' | b'*' | b'+')) {
-                &l[1..]
-            } else {
-                l
-            };
-            if !rest.is_empty() && rest.len() < l.len() {
-                if rest.first().is_some_and(|b| b.is_ascii_whitespace()) {
-                    return false; // list bullet
-                }
-            }
-            let mut i = 0;
-            while i < l.len() && l[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i > 0
-                && i < l.len()
-                && matches!(l[i], b'.' | b')')
-                && l.get(i + 1).is_some_and(|b| b.is_ascii_whitespace())
-            {
-                return false; // ordered list item
-            }
-            return true;
+            // Delegate to the parser's own block-start predicate — the
+            // ad-hoc prefix list here used to split `#x` (no space after the
+            // hash is NOT a heading — it's a lazy continuation), `>x`,
+            // `-x`, `1.x`, HTML blocks, etc. differently from a full parse,
+            // producing two paragraph blocks where one belongs.
+            // `---`/`===`-runs are already excluded inside the predicate:
+            // they may be setext underlines continuing the paragraph, so we
+            // merge and let the reparse decide (thematic break vs H2).
+            return !editor_markdown::parser::line_starts_new_block(l);
         }
         false
     }
@@ -419,7 +400,7 @@ impl DocumentBuffer {
     fn chunk_continues_list(&self, offset: u64, end: u64) -> bool {
         let bytes = self.table.to_range(offset, end.min(offset + 256));
         let mut first_line = true;
-        for line in bytes.split(|&b| b == b'\n') {
+        for line in logical_lines(&bytes) {
             // `first_line` must turn false after the *physical* first line —
             // a leading blank kills laziness for everything after it, so
             // reset before the blank-skip `continue`, not after it.
@@ -554,7 +535,40 @@ impl DocumentBuffer {
             // Incremental reparse: find blocks overlapping the affected range, reparse
             // only that window from the post-edit bytes, splice in the new blocks,
             // and shift subsequent blocks by the net delta (ADR-003 §58).
-            self.incremental_reparse(affected_start, affected_end_pre, net_delta)?;
+            // On failure the piece table is already edited and the undo entry is
+            // recorded — returning Err here would report "edit failed" while the
+            // bytes actually changed and `syntax` no longer describes them.
+            // Retry with a full reparse (a superset of the incremental input, so
+            // it can only fail for reasons that also invalidate the document);
+            // if that fails too, roll the table back so error == no change.
+            if self
+                .incremental_reparse(affected_start, affected_end_pre, net_delta)
+                .is_err()
+            {
+                let bytes = self.table.to_bytes();
+                match editor_markdown::parse_with(&bytes, self.profile.clone()) {
+                    Ok(syn) => self.syntax = syn,
+                    Err(e) => {
+                        // Discard the undo entry outright — `undo.undo()`
+                        // would push the rolled-back transaction onto the
+                        // redo stack, offering to re-apply an edit that was
+                        // never committed.
+                        if let Some(rolled) = self.undo.undo.pop() {
+                            for prev in rolled.edits.iter().rev() {
+                                let s = prev.range.start.0;
+                                let end = s + prev.replacement.len() as u64;
+                                self.table.replace(
+                                    ByteRange::new(ByteOffset(s), ByteOffset(end)),
+                                    &prev.removed,
+                                );
+                            }
+                            self.selection.set_primary(rolled.selection_before);
+                        }
+                        self.update_dirty();
+                        return Err(e);
+                    }
+                }
+            }
         } else if self.edits_beyond_parsed_frontier(affected_start, net_delta) {
             // Multi-edit transaction entirely inside the unparsed tail of a lazy
             // document: the parsed block tree is untouched, and the upcoming
@@ -667,20 +681,24 @@ impl DocumentBuffer {
         }
         // Splice: replace blocks[first..=last] with new_blocks.
         self.syntax.blocks.splice(first..=last, new_blocks);
-        // The parsed frontier sits after the edit point, so it moves with the
-        // inserted/removed bytes — otherwise `parse_next_chunk` would resume at
-        // a stale offset and produce overlapping/garbage blocks.
-        self.syntax.parsed_offset =
-            (self.syntax.parsed_offset as i64 + net_delta).max(0) as u64;
+        // The parsed frontier is defined by coverage: it must equal the last
+        // parsed block's end. A blind `parsed_offset += net_delta` overstates
+        // the frontier when the reparse window produced shorter blocks (e.g.
+        // the edit split the frontier block) — `parse_next_chunk` would then
+        // resume past the coverage end and skip the gap bytes forever: no
+        // block would ever cover them. Deriving the frontier from the last
+        // block keeps `parse_next_chunk`'s `span.end == offset` continuation
+        // checks and the gap-recovery property intact.
+        let coverage_end = self
+            .syntax
+            .blocks
+            .last()
+            .map(|b| b.meta().span.end.0)
+            .unwrap_or(0);
+        self.syntax.parsed_offset = coverage_end;
         // Document span end follows the last parsed block (== total len for
         // fully-parsed documents, == parsed_offset for lazy ones).
-        self.syntax.span.end = ByteOffset(
-            self.syntax
-                .blocks
-                .last()
-                .map(|b| b.meta().span.end.0)
-                .unwrap_or(0),
-        );
+        self.syntax.span.end = ByteOffset(coverage_end);
         Ok(())
     }
 
@@ -689,7 +707,18 @@ impl DocumentBuffer {
         let Some(tx) = self.undo.undo() else {
             return Ok(());
         };
-        self.apply_inverse(&tx)?;
+        if let Err(e) = self.apply_inverse(&tx) {
+            // The inverse edits already hit the table before reparse failed —
+            // re-apply the forward edits so "undo failed" means "nothing
+            // changed", then move the transaction back onto the undo stack.
+            for edit in &tx.edits {
+                self.table.replace(edit.range, &edit.replacement);
+            }
+            let _ = self.undo.redo.pop();
+            self.undo.undo.push(tx);
+            self.update_dirty();
+            return Err(e);
+        }
         self.selection.set_primary(tx.selection_before);
         Ok(())
     }
@@ -703,20 +732,51 @@ impl DocumentBuffer {
         for edit in &tx.edits {
             self.table.replace(edit.range, &edit.replacement);
         }
-        self.selection.set_primary(tx.selection_after);
-        if tx.edits.len() == 1 {
+        let reparse = if tx.edits.len() == 1 {
             let e = &tx.edits[0];
-            self.incremental_reparse(e.range.start.0, e.range.end.0, e.delta())?;
+            // Same contract as apply(): a failed window reparse retries with a
+            // full reparse before giving up — the bytes are already committed.
+            if self
+                .incremental_reparse(e.range.start.0, e.range.end.0, e.delta())
+                .is_ok()
+            {
+                Ok(())
+            } else {
+                let bytes = self.table.to_bytes();
+                editor_markdown::parse_with(&bytes, self.profile.clone()).map(|syn| {
+                    self.syntax = syn;
+                })
+            }
         } else {
             let (start, _end, delta) = compute_edit_impact(&tx.edits);
             if self.edits_beyond_parsed_frontier(start, delta) {
                 // Same lazy-tail shortcut as in apply() — a full reparse here
                 // would materialize a >RAM document just to redo a tail edit.
+                Ok(())
             } else {
                 let bytes = self.table.to_bytes();
-                self.syntax = editor_markdown::parse_with(&bytes, self.profile.clone())?;
+                editor_markdown::parse_with(&bytes, self.profile.clone()).map(|syn| {
+                    self.syntax = syn;
+                })
             }
+        };
+        if let Err(e) = reparse {
+            // Roll the table back (inverse edits) and put the transaction
+            // back on the redo stack — a failed redo must not consume it.
+            for edit in tx.edits.iter().rev() {
+                let s = edit.range.start.0;
+                let end = s + edit.replacement.len() as u64;
+                self.table.replace(
+                    ByteRange::new(ByteOffset(s), ByteOffset(end)),
+                    &edit.removed,
+                );
+            }
+            let _ = self.undo.undo.pop();
+            self.undo.redo.push(tx);
+            self.update_dirty();
+            return Err(e);
         }
+        self.selection.set_primary(tx.selection_after);
         self.update_dirty();
         Ok(())
     }
@@ -734,23 +794,33 @@ impl DocumentBuffer {
                 &edit.removed,
             );
         }
-        if tx.edits.len() == 1 {
+        let reparse = if tx.edits.len() == 1 {
             let e = &tx.edits[0];
             // The inverse change replaced [s, s+|replacement|) with `removed`.
             let start = e.range.start.0;
             let end_pre = start + e.replacement.len() as u64;
             let delta = e.removed.len() as i64 - e.replacement.len() as i64;
-            self.incremental_reparse(start, end_pre, delta)?;
+            self.incremental_reparse(start, end_pre, delta)
         } else {
             // Inverse delta is the negation of the original net delta; edits
             // wholly beyond the parsed frontier still touch no parsed block.
             let (start, _end, delta) = compute_edit_impact(&tx.edits);
             if self.edits_beyond_parsed_frontier(start, -delta) {
                 // skip reparse — the parsed tree is untouched
+                Ok(())
             } else {
                 let bytes = self.table.to_bytes();
-                self.syntax = editor_markdown::parse_with(&bytes, self.profile.clone())?;
+                editor_markdown::parse_with(&bytes, self.profile.clone()).map(|syn| {
+                    self.syntax = syn;
+                })
             }
+        };
+        // Fall back to a full reparse when the incremental window could not
+        // be rebuilt — the table bytes are already reverted, so returning Err
+        // here would leave `syntax` describing the pre-undo document.
+        if reparse.is_err() {
+            let bytes = self.table.to_bytes();
+            self.syntax = editor_markdown::parse_with(&bytes, self.profile.clone())?;
         }
         self.update_dirty();
         Ok(())
@@ -779,27 +849,19 @@ impl DocumentBuffer {
         old: &str,
         new: &str,
     ) -> Result<(), editor_domain::DocumentError> {
-        let current = self.table.to_bytes();
-        // A stale span (e.g. captured before a later edit) must not panic
-        // the slice below — validate bounds first.
-        if para_span.end.0 as usize > current.len()
-            || para_span.start.0 > para_span.end.0
-        {
-            return Err(editor_domain::DocumentError::InvalidEdit);
-        }
-        let Some((new_bytes, _delta)) = editor_markdown::serialize::replace_text_run(&current, para_span, old, new)
-        else {
-            return Err(editor_domain::DocumentError::InvalidEdit);
-        };
-        // Apply as a single edit covering the old run. `windows(0)` panics —
-        // reject an empty needle explicitly (the serialize helper above also
-        // guards, but this slice bounds-check is ours).
+        // `windows(0)` panics — reject an empty needle explicitly.
         if old.is_empty() {
             return Err(editor_domain::DocumentError::InvalidEdit);
         }
-        let region = &current[para_span.start.0 as usize..para_span.end.0 as usize];
-        let pos = region.windows(old.len()).position(|w| w == old.as_bytes());
-        let Some(pos) = pos else {
+        // A stale span (e.g. captured before a later edit) must not silently
+        // corrupt the document — validate bounds against the table length.
+        if para_span.start.0 > para_span.end.0 || para_span.end.0 > self.table.len() {
+            return Err(editor_domain::DocumentError::InvalidEdit);
+        }
+        // Copy out only the paragraph span — never materialize a lazy (>RAM)
+        // document just to find a needle inside one block (Invariant 6).
+        let region = self.table.to_range(para_span.start.0, para_span.end.0);
+        let Some(pos) = region.windows(old.len()).position(|w| w == old.as_bytes()) else {
             return Err(editor_domain::DocumentError::InvalidEdit);
         };
         let abs = para_span.start.0 + pos as u64;
@@ -809,9 +871,7 @@ impl DocumentBuffer {
         );
         let before = self.selection.primary();
         let after = Selection::caret(ByteOffset(abs + new.len() as u64));
-        self.apply(EditTransaction::single(edit, before, after))?;
-        let _ = new_bytes;
-        Ok(())
+        self.apply(EditTransaction::single(edit, before, after))
     }
 
     /// Mark the buffer as saved (clears dirty flag; does NOT commit to Git — §62).
@@ -842,6 +902,20 @@ fn compute_edit_impact(edits: &[TextEdit]) -> (u64, u64, i64) {
         min_start = 0;
     }
     (min_start, max_end, net_delta)
+}
+
+/// Iterate logical lines of a byte window where `\n`, `\r\n`, and bare `\r`
+/// each count as a single line terminator. Splitting naively on both bytes
+/// would emit a phantom empty line between the `\r` and `\n` of a CRLF pair,
+/// which the blank-line checks in the chunk-continuation heuristics would
+/// misread as a real blank line.
+fn logical_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes.split(|&b| b == b'\n').flat_map(|piece| {
+        // A trailing '\r' belongs to a '\r\n' terminator; interior '\r's are
+        // bare-CR line endings.
+        let piece = piece.strip_suffix(b"\r").unwrap_or(piece);
+        piece.split(|&b| b == b'\r')
+    })
 }
 
 /// Round a target byte offset up to the next line ending (the byte after a
@@ -1257,6 +1331,39 @@ mod tests {
         assert_eq!(buf.serialize(), src);
     }
 
+    /// A fence whose OPENER is the last line of the chunk (block span is a
+    /// single line) is still unclosed — the body lives in the next chunk.
+    /// Mistaking the opener line for a closer would parse the body as fresh
+    /// Markdown paragraphs.
+    #[test]
+    fn lazy_fence_opener_alone_at_boundary_stays_unclosed() {
+        // Chunk boundary lands right after the fence opener line.
+        let src = b"para one\npara two\n```\nlet x = 1;\nlet y = 2;\n";
+        let mut buf = open_lazy(src, 20); // rounds to line end at offset 22 — right after "```"
+        let mut parsed = buf.parsed_offset();
+        let mut iterations = 0;
+        while parsed < buf.total_len() && iterations < 20 {
+            parsed = buf.parse_next_chunk(parsed, 20).unwrap();
+            iterations += 1;
+        }
+        assert_eq!(buf.serialize(), src);
+        let code_blocks = buf
+            .syntax()
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::CodeBlock(_)))
+            .count();
+        assert_eq!(code_blocks, 1, "fence body must not be re-parsed as Markdown");
+        // No paragraph for the code body — only the leading paragraph.
+        let paragraphs = buf
+            .syntax()
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Paragraph(_)))
+            .count();
+        assert_eq!(paragraphs, 1);
+    }
+
     /// A fence that DOES close before the chunk boundary must not trigger the
     /// back-up — the check is specifically for unclosed fences.
     #[test]
@@ -1383,6 +1490,33 @@ mod tests {
             .filter(|b| matches!(b, Block::Paragraph(_)))
             .count();
         assert_eq!(paras, 2, "boundary-split paragraph must merge into one");
+    }
+
+    /// `#x` (hash without a following space) is NOT a heading — it's a lazy
+    /// paragraph continuation. A chunk boundary before it must still yield
+    /// one paragraph, matching a full parse.
+    #[test]
+    fn lazy_hash_without_space_continues_paragraph() {
+        let src = b"para text here\n#x not a heading\nmore text\n";
+        let mut buf = open_lazy(src, 15); // boundary inside the paragraph run
+        let mut parsed = buf.parsed_offset();
+        let mut it = 0;
+        while parsed < buf.total_len() && it < 20 {
+            parsed = buf.parse_next_chunk(parsed, 15).unwrap();
+            it += 1;
+        }
+        assert_eq!(buf.serialize(), src);
+        let paras = buf
+            .syntax()
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Paragraph(_)))
+            .count();
+        assert_eq!(paras, 1, "`#x` must lazily continue the paragraph, not split it");
+        assert_eq!(
+            buf.syntax().blocks.iter().filter(|b| matches!(b, Block::Heading(_))).count(),
+            0
+        );
     }
 
     /// `para\n---` across a boundary is a setext H2, NOT a paragraph +
@@ -1546,6 +1680,67 @@ mod tests {
             }
         });
         assert_eq!((quotes, paras), (1, 1));
+    }
+
+    /// `logical_lines` must treat `\r\n` as ONE terminator (no phantom blank
+    /// line between the bytes) and bare `\r` as a terminator too.
+    #[test]
+    fn logical_lines_handles_all_terminators() {
+        let lines: Vec<&[u8]> = logical_lines(b"a\r\nb\r\nc").collect();
+        assert_eq!(lines, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        let lines: Vec<&[u8]> = logical_lines(b"a\rb\rc").collect();
+        assert_eq!(lines, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        let lines: Vec<&[u8]> = logical_lines(b"a\nb\nc").collect();
+        assert_eq!(lines, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        // Mixed families, and a real blank line is still reported.
+        let lines: Vec<&[u8]> = logical_lines(b"a\r\n\rb").collect();
+        assert_eq!(lines, vec![b"a".as_slice(), b"".as_slice(), b"b".as_slice()]);
+    }
+
+    /// A bare-CR (classic Mac) document parsed lazily: the quote spanning the
+    /// chunk boundary must stay ONE block and serialize byte-identically —
+    /// the continuation heuristics must see logical CR lines, not one giant
+    /// "line" per window.
+    #[test]
+    fn lazy_cr_document_quote_spanning_boundary() {
+        let src = b"> line one\r> line two\r> line three\r\rpara\r";
+        let mut buf = open_lazy(src, 12);
+        let mut parsed = buf.parsed_offset();
+        let mut it = 0;
+        while parsed < buf.total_len() && it < 30 {
+            parsed = buf.parse_next_chunk(parsed, 12).unwrap();
+            it += 1;
+        }
+        assert_eq!(parsed, buf.total_len());
+        assert_eq!(buf.serialize(), src);
+        let quotes = buf
+            .syntax()
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::BlockQuote(_)))
+            .count();
+        assert_eq!(quotes, 1, "CR quote spanning the boundary must be one block");
+    }
+
+    /// Same for a boundary-split paragraph in a bare-CR document.
+    #[test]
+    fn lazy_cr_document_paragraph_spanning_boundary() {
+        let src = b"line one of para\rline two of para\rline three\r\rnext\r";
+        let mut buf = open_lazy(src, 17);
+        let mut parsed = buf.parsed_offset();
+        let mut it = 0;
+        while parsed < buf.total_len() && it < 30 {
+            parsed = buf.parse_next_chunk(parsed, 17).unwrap();
+            it += 1;
+        }
+        assert_eq!(buf.serialize(), src);
+        let paras = buf
+            .syntax()
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Paragraph(_)))
+            .count();
+        assert_eq!(paras, 2, "boundary-split CR paragraph must merge into one");
     }
 
     fn open_lazy(src: &[u8], chunk: usize) -> DocumentBuffer {

@@ -125,12 +125,18 @@ impl RepositoryHostAdapter for GithubAdapter {
     }
 
     fn authenticate(&self) -> Result<AuthSession, AdapterError> {
-        let text = self.gh_text(&["auth", "status"])?;
-        let user = extract_user(&text);
-        if text.contains("Logged in") {
+        if !self.gh_available() {
+            return Err(AdapterError::Other("gh CLI not installed".to_string()));
+        }
+        // `gh auth status` exits 0 when logged in but writes its report to
+        // STDERR — stdout is empty either way, so `gh_text` would always
+        // report "not authenticated".
+        let out = run_with_timeout(&self.gh_bin, &self.work_dir, &["auth", "status"], CMD_TIMEOUT)?;
+        let text = String::from_utf8_lossy(&out.stderr).to_string();
+        if out.status.success() && (text.contains("Logged in") || text.contains("account ")) {
             Ok(AuthSession {
                 provider: self.provider.clone(),
-                user,
+                user: extract_user(&text),
                 token: String::new(),
             })
         } else {
@@ -256,13 +262,43 @@ fn json_string_end(rest: &str) -> Option<usize> {
     None
 }
 
-/// Minimal JSON string unescape for the escapes gh realistically emits.
+/// Minimal JSON string unescape, in a single left-to-right pass.
+/// Sequential `replace` calls are wrong: `\\n` (an escaped backslash
+/// followed by a literal 'n') matches the `\n` rule and produces a newline
+/// instead of `\n` text — the escapes must be consumed strictly in order.
 fn json_unescape(s: &str) -> String {
-    s.replace("\\\"", "\"")
-        .replace("\\/", "/")
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\\", "\\")
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{C}'),
+            Some('"') => out.push('"'),
+            Some('/') => out.push('/'),
+            Some('\\') => out.push('\\'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                let code = u32::from_str_radix(&hex, 16).unwrap_or(0xFFFD);
+                // Surrogates can't form a `char`; lone/invalid escapes
+                // degrade to U+FFFD rather than being dropped silently.
+                out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+            }
+            // Unknown escape: keep both bytes so nothing is silently eaten.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Extract a string field from simple JSON (no serde dep for the adapter skeleton).
@@ -297,12 +333,17 @@ fn extract_json_int(json: &str, field: &str) -> u64 {
     0
 }
 
-/// Extract the username from `gh auth status` output.
+/// Extract the username from `gh auth status` output. gh versions report it
+/// either as `account <user>` or `as <user> (…)` — try both.
 fn extract_user(text: &str) -> String {
-    if let Some(idx) = text.find("account ") {
-        let rest = &text[idx + 8..];
-        let user: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-        return user;
+    for marker in ["account ", " as "] {
+        if let Some(idx) = text.find(marker) {
+            let rest = &text[idx + marker.len()..];
+            let user: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+            if !user.is_empty() {
+                return user;
+            }
+        }
     }
     String::new()
 }
@@ -366,6 +407,32 @@ mod tests {
     fn extract_json_field_escaped_quote() {
         let json = r#"{"title":"say \"hi\" now"}"#;
         assert_eq!(extract_json_field(json, "title"), "say \"hi\" now");
+    }
+
+    /// An escaped backslash followed by a literal 'n' must decode to `\n`
+    /// TEXT, not a newline — sequential `replace` calls unescape twice.
+    #[test]
+    fn json_unescape_no_double_unescaping() {
+        // Raw JSON content `a\\n` = 'a' + escaped backslash + 'n'.
+        assert_eq!(json_unescape("a\\\\n"), "a\\n");
+        // Raw JSON content `a\nb` = 'a' + escaped newline + 'b'.
+        assert_eq!(json_unescape("a\\nb"), "a\nb");
+        // `\\\\` = two escaped backslashes -> `\\` text, not re-unescaped.
+        assert_eq!(json_unescape("x\\\\\\\\y"), "x\\\\y");
+        // \uXXXX escape.
+        assert_eq!(json_unescape("caf\\u00e9"), "caf\u{e9}");
+        // Unknown escapes keep their backslash instead of being eaten.
+        assert_eq!(json_unescape("a\\qb"), "a\\qb");
+        // A lone trailing backslash survives.
+        assert_eq!(json_unescape("tail\\"), "tail\\");
+    }
+
+    /// `extract_user` accepts both gh report formats.
+    #[test]
+    fn extract_user_both_formats() {
+        assert_eq!(extract_user("  ✓ Logged in to github.com account octocat"), "octocat");
+        assert_eq!(extract_user("  ✓ Logged in to github.com as monalisa (oauth_token)"), "monalisa");
+        assert_eq!(extract_user("You are not logged in"), "");
     }
 
     #[test]

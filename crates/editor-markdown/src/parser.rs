@@ -38,17 +38,23 @@ fn collect_lines(bytes: &[u8], start: u64, end: u64) -> Vec<Line> {
     let mut i = start;
     while i < end {
         let line_start = i;
-        // find end of content (next \n or end)
+        // Find the next line terminator. A line ends at `\n`, `\r\n`, or a
+        // bare `\r` (CommonMark treats CR as a line ending too — a classic-Mac
+        // file must not collapse into a single giant line).
         let mut j = i;
-        while j < end && bytes[j as usize] != b'\n' {
+        while j < end && bytes[j as usize] != b'\n' && bytes[j as usize] != b'\r' {
             j += 1;
         }
-        // content_end excludes a trailing \r (for CRLF)
-        let mut content_end = j;
-        if content_end > line_start && bytes[(content_end - 1) as usize] == b'\r' {
-            content_end -= 1;
-        }
-        let line_end = if j < end { j + 1 } else { j }; // include newline
+        let content_end = j;
+        let line_end = if j < end {
+            if bytes[j as usize] == b'\r' && j + 1 < end && bytes[(j + 1) as usize] == b'\n' {
+                j + 2 // CRLF
+            } else {
+                j + 1 // LF or bare CR
+            }
+        } else {
+            j
+        };
         out.push(Line { start: line_start, end: line_end, content_end });
         i = line_end;
     }

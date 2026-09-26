@@ -107,7 +107,59 @@ fn regenerate_block(block: &Block, source: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Split a raw line (as yielded by `split_inclusive` on `\n`) into content and
+/// Split `raw` into lines including their terminators, treating `\n`, `\r\n`
+/// and a bare `\r` all as line endings (the parser's `collect_lines`
+/// semantics). `split_inclusive('\n')` would see a bare-CR document as one
+/// line and de-mark only its first marker.
+fn split_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        if pos >= raw.len() {
+            return None;
+        }
+        let end = match raw[pos..].iter().position(|&b| b == b'\n' || b == b'\r') {
+            Some(i) => {
+                let mut e = pos + i + 1;
+                if raw[pos + i] == b'\r' && raw.get(pos + i + 1) == Some(&b'\n') {
+                    e += 1;
+                }
+                e
+            }
+            None => raw.len(),
+        };
+        let line = &raw[pos..end];
+        pos = end;
+        Some(line)
+    })
+}
+
+/// `str::lines()` splits on `\n` and `\r\n` but not bare `\r` — same fix as
+/// `split_lines`, for already-decoded text.
+fn iter_lines(text: &str) -> impl Iterator<Item = &str> {
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        if pos >= text.len() {
+            return None;
+        }
+        let rel = bytes[pos..].iter().position(|&b| b == b'\n' || b == b'\r');
+        let (line_end, next) = match rel {
+            Some(i) => {
+                let mut n = pos + i + 1;
+                if bytes[pos + i] == b'\r' && bytes.get(pos + i + 1) == Some(&b'\n') {
+                    n += 1;
+                }
+                (pos + i, n)
+            }
+            None => (text.len(), text.len()),
+        };
+        let line = &text[pos..line_end];
+        pos = next;
+        Some(line)
+    })
+}
+
+/// Split a raw line (as yielded by `split_lines`) into content and
 /// line ending, mirroring the parser's `content_end` semantics — a trailing
 /// `\r` belongs to the ending.
 fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
@@ -126,7 +178,7 @@ fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
 /// serializing clean children against the document would read wrong bytes.
 fn de_mark_quote_source(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
-    for line in raw.split_inclusive(|&b| b == b'\n') {
+    for line in split_lines(raw) {
         let (content, ending) = split_line_ending(line);
         let ind = content.iter().take_while(|&&b| b == b' ').count();
         let s = &content[ind.min(content.len())..];
@@ -152,7 +204,7 @@ fn de_mark_quote_source(raw: &[u8]) -> Vec<u8> {
 fn de_mark_item_source(raw: &[u8], ordered: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut strip = 0usize;
-    for (k, line) in raw.split_inclusive(|&b| b == b'\n').enumerate() {
+    for (k, line) in split_lines(raw).enumerate() {
         let (content, ending) = split_line_ending(line);
         if k == 0 {
             let ind = content.iter().take_while(|&&b| b == b' ').count();
@@ -228,7 +280,7 @@ fn regenerate_list(list: &List, source: &[u8], out: &mut Vec<u8>) {
                 let mut child_buf = Vec::new();
                 serialize_block(child, &de, &mut child_buf);
                 let text = String::from_utf8_lossy(&child_buf);
-                let mut lines = text.lines();
+                let mut lines = iter_lines(&text);
                 if let Some(first_line) = lines.next() {
                     out.extend_from_slice(first_line.as_bytes());
                     out.push(b'\n');
@@ -248,7 +300,7 @@ fn regenerate_list(list: &List, source: &[u8], out: &mut Vec<u8>) {
                 let mut child_buf = Vec::new();
                 serialize_block(child, &de, &mut child_buf);
                 let text = String::from_utf8_lossy(&child_buf);
-                for line in text.lines() {
+                for line in iter_lines(&text) {
                     if !line.is_empty() {
                         out.extend_from_slice(b"  ");
                     }
@@ -277,7 +329,7 @@ fn regenerate_block_quote(bq: &BlockQuote, source: &[u8], out: &mut Vec<u8>) {
         serialize_block_with_indent(child, &de, &mut child_buf, 0);
         // Prefix each line with `> `.
         let text = String::from_utf8_lossy(&child_buf);
-        for line in text.lines() {
+        for line in iter_lines(&text) {
             out.extend_from_slice(b"> ");
             out.extend_from_slice(line.as_bytes());
             out.push(b'\n');
@@ -293,7 +345,7 @@ fn serialize_block_with_indent(block: &Block, source: &[u8], out: &mut Vec<u8>, 
         let mut tmp = Vec::new();
         regenerate_block(block, source, &mut tmp);
         let text = String::from_utf8_lossy(&tmp);
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&str> = iter_lines(&text).collect();
         let last_idx = lines.len().saturating_sub(1);
         for (i, line) in lines.iter().enumerate() {
             for _ in 0..indent {
@@ -303,7 +355,7 @@ fn serialize_block_with_indent(block: &Block, source: &[u8], out: &mut Vec<u8>, 
             // Add newline after each line except the last (unless the original ended with one).
             if i < last_idx {
                 out.push(b'\n');
-            } else if i == last_idx && tmp.last() == Some(&b'\n') {
+            } else if i == last_idx && matches!(tmp.last(), Some(&b'\n') | Some(&b'\r')) {
                 out.push(b'\n');
             }
         }
@@ -312,7 +364,7 @@ fn serialize_block_with_indent(block: &Block, source: &[u8], out: &mut Vec<u8>, 
         let span = meta.span;
         let bytes = &source[span.start.0 as usize..span.end.0 as usize];
         let text = String::from_utf8_lossy(bytes);
-        for line in text.lines() {
+        for line in iter_lines(&text) {
             for _ in 0..indent {
                 out.push(b' ');
             }
@@ -708,5 +760,36 @@ mod dirty_tests {
         serialize_block(&block, b"", &mut out);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("> Quoted"), "block quote prefix should be present: {text}");
+    }
+
+    /// `split_inclusive('\n')` sees a bare-CR document as ONE line — only the
+    /// first marker would be stripped, corrupting every continuation line.
+    #[test]
+    fn de_mark_source_handles_bare_cr_lines() {
+        assert_eq!(de_mark_quote_source(b"> a\r> b\r"), b"a\rb\r".to_vec());
+        assert_eq!(de_mark_quote_source(b"> a\r\n> b\r\n"), b"a\r\nb\r\n".to_vec());
+        // List item: first line strips the "- " marker, continuation lines
+        // strip the content indent.
+        assert_eq!(de_mark_item_source(b"- a\r  b\r", false), b"a\rb\r".to_vec());
+        assert_eq!(de_mark_item_source(b"- a\r\n  b\r\n", false), b"a\r\nb\r\n".to_vec());
+    }
+
+    /// A dirty quote in a bare-CR document must regenerate `> ` on every
+    /// line — `str::lines()` doesn't split bare `\r` and would emit the whole
+    /// quote as a single prefixed line with embedded CRs.
+    #[test]
+    fn dirty_quote_on_bare_cr_document_splits_lines() {
+        let src = b"> a\rb\r";
+        let mut doc = crate::parse(src, editor_domain::MarkdownProfile::Gfm).expect("parse");
+        for b in &mut doc.blocks {
+            b.meta_mut().dirty = true;
+        }
+        let out = serialize(&doc, src);
+        let text = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected two regenerated lines: {text:?}");
+        assert!(lines.iter().all(|l| l.starts_with("> ")), "{text}");
+        // No stray bare-CR may survive inside a regenerated line.
+        assert!(!lines[0].contains('\r') && !lines[1].contains('\r'), "{text}");
     }
 }

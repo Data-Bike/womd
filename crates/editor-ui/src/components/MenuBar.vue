@@ -1,11 +1,11 @@
 <template>
-  <div class="menu-bar" @mouseleave="active = null">
+  <div class="menu-bar" @mouseleave="active = null" @mousedown.prevent>
     <div
       v-for="menu in menus"
       :key="menu.label"
       class="menu-top"
       :class="{ open: active === menu.label }"
-      @mouseenter="active = menu.label"
+      @mouseenter="onHover(menu)"
       @click="active = active === menu.label ? null : menu.label"
     >
       <span class="menu-label">{{ menu.label }}</span>
@@ -40,6 +40,13 @@ const emit = defineEmits([
 ]);
 
 const active = ref(null);
+
+// Standard menubar behavior: hover switches menus only while one is open.
+// An unconditional hover-open made every pass over the bar flash dropdowns
+// and made click-to-open impossible (hover pre-opened → click toggled off).
+function onHover(menu) {
+  if (active.value && active.value !== menu.label) active.value = menu.label;
+}
 
 const menus = [
   {

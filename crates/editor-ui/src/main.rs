@@ -217,7 +217,6 @@ struct TableCellNode {
 struct BlockInfo {
     index: usize,
     kind: String,
-    source: String,
     start: u64,
     end: u64,
 }
@@ -404,6 +403,40 @@ fn find_tab_idx_for_path(tabs: &[DocumentTab], canonical: &PathBuf) -> Option<us
     })
 }
 
+/// Build a `DocumentBuffer` for an on-disk file: mmap-backed storage for
+/// zero-copy reads (Invariant 6: >RAM files) and lazy chunked parsing past
+/// the 20 MB threshold so opening a huge file doesn't parse it all at once.
+/// Returns the buffer and the file's byte length.
+fn buffer_for_file(
+    path: &PathBuf,
+    storage_doc_id: &str,
+    meta_doc_label: &str,
+) -> Result<(DocumentBuffer, usize), String> {
+    let doc_id = DocumentId::new(storage_doc_id);
+    let storage = editor_storage::MmapStorage::open(path, doc_id)
+        .map_err(|e| e.to_string())?;
+    let byte_source = storage.byte_source();
+    let bytes = byte_source.as_bytes();
+    let meta = editor_domain::DocumentMeta {
+        id: DocumentId::new(meta_doc_label),
+        has_bom: bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        line_ending: detect_line_ending(bytes),
+        trailing_newline: bytes.last() == Some(&b'\n'),
+        encoding: editor_domain::Encoding::Utf8,
+    };
+    let byte_len = byte_source.len();
+    const LAZY_THRESHOLD: usize = 20 * 1024 * 1024; // 20 MB
+    const CHUNK_SIZE: usize = 10 * 1024 * 1024;     // 10 MB
+    let buffer = if byte_len > LAZY_THRESHOLD {
+        DocumentBuffer::open_lazy(byte_source, meta, MarkdownProfile::Gfm, CHUNK_SIZE)
+            .map_err(|e| e.to_string())?
+    } else {
+        DocumentBuffer::open_from_buffer(byte_source, meta, MarkdownProfile::Gfm)
+            .map_err(|e| e.to_string())?
+    };
+    Ok((buffer, byte_len))
+}
+
 /// Open a file from disk in a new tab.
 #[tauri::command]
 fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Result<DocumentInfo, String> {
@@ -418,37 +451,12 @@ fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Resu
             return Ok(doc_info_from_tab(tab));
         }
     }
-    // Use mmap-backed storage for zero-copy reads (Invariant 6: >RAM file support).
-    let doc_id = DocumentId::new(&path);
-    let storage = editor_storage::MmapStorage::open(&path, doc_id)
-        .map_err(|e| e.to_string())?;
-    let byte_source = storage.byte_source();
     let file_name = PathBuf::from(&path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
-    let bytes = byte_source.as_bytes();
-    let trailing_newline = bytes.last() == Some(&b'\n');
-    let meta = editor_domain::DocumentMeta {
-        id: DocumentId::new(&file_name),
-        has_bom: bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
-        line_ending: detect_line_ending(bytes),
-        trailing_newline,
-        encoding: editor_domain::Encoding::Utf8,
-    };
-    let byte_len = byte_source.len();
-    // For large files (>20MB), use lazy/chunked parsing: only parse the first
-    // 10MB chunk. Additional chunks are parsed on demand via parse_next_chunk.
-    // This avoids parsing 100+ MB at once (Invariant 6: >RAM files).
-    const LAZY_THRESHOLD: usize = 20 * 1024 * 1024; // 20 MB
-    const CHUNK_SIZE: usize = 10 * 1024 * 1024;     // 10 MB
-    let buffer = if byte_len > LAZY_THRESHOLD {
-        DocumentBuffer::open_lazy(byte_source, meta, MarkdownProfile::Gfm, CHUNK_SIZE)
-            .map_err(|e| e.to_string())?
-    } else {
-        DocumentBuffer::open_from_buffer(byte_source, meta, MarkdownProfile::Gfm)
-            .map_err(|e| e.to_string())?
-    };
+    // Use mmap-backed storage for zero-copy reads (Invariant 6: >RAM file support).
+    let (buffer, byte_len) = buffer_for_file(&PathBuf::from(&path), &path, &file_name)?;
     let block_count = buffer.syntax().blocks.len();
     // For large documents, don't serialize the full text — frontend will
     // use get_syntax_tree_meta + get_block_data for virtualized rendering.
@@ -541,8 +549,19 @@ fn open_welcome(state: tauri::State<'_, Mutex<AppState>>) -> Result<DocumentInfo
 /// Get the current document text (serialized from the active buffer).
 #[tauri::command]
 fn get_document_text(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, String> {
+    // Callers guard on document size first (source view refuses >64 MB), but
+    // a missed guard would OOM on a lazy mmap-backed document — enforce the
+    // same bound as search/replace here too.
+    const MAX_TEXT_BYTES: u64 = 256 * 1024 * 1024;
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
+    if tab.buffer.len() > MAX_TEXT_BYTES {
+        return Err(format!(
+            "document too large to materialize as text ({} bytes, max {})",
+            tab.buffer.len(),
+            MAX_TEXT_BYTES
+        ));
+    }
     Ok(String::from_utf8_lossy(&tab.buffer.serialize()).to_string())
 }
 
@@ -679,8 +698,19 @@ fn find_matches_in_text(text: &str, query: &str, case_sensitive: bool, is_regex:
 /// Find every occurrence of `query` in the active document.
 #[tauri::command]
 fn search_document(state: tauri::State<'_, Mutex<AppState>>, args: SearchArgs) -> Result<SearchResult, String> {
+    // Whole-document search requires the text in memory — a lazy document
+    // can exceed RAM, so refuse past a bound rather than OOM the process.
+    // (Chunked search would silently miss matches spanning chunk edges.)
+    const MAX_SEARCH_BYTES: u64 = 256 * 1024 * 1024;
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
+    let len = tab.buffer.len();
+    if len > MAX_SEARCH_BYTES {
+        return Err(format!(
+            "document too large to search ({} bytes, max {})",
+            len, MAX_SEARCH_BYTES
+        ));
+    }
     let bytes = tab.buffer.serialize();
     // Strict UTF-8 — `from_utf8_lossy` would substitute U+FFFD for invalid
     // sequences, shifting every subsequent byte offset and corrupting the
@@ -740,6 +770,38 @@ fn expand_replacement(matched_text: &str, query: &str, case_sensitive: bool, is_
     }
 }
 
+/// Compute the bounded serialization window used to verify a match range.
+/// It covers the line containing `start` through the line containing `end`,
+/// extended on both sides:
+///
+/// - one byte left to include the '\n' ending the previous line — regex
+///   anchors bind to the *haystack* (the window), not the document, so a
+///   window starting exactly on a line start would let `^x` falsely verify
+///   a stale mid-document range, and `\b` needs the real look-behind char;
+/// - one line right so a window ending in '\n' can't satisfy a `$`-anchored
+///   pattern at its trailing newline (in the regex crate `$` also fires
+///   before a final newline). When the range sits at EOF the window end IS
+///   the document end — the only correct anchor anyway.
+///
+/// All returned offsets are line-start-based and therefore UTF-8 boundaries.
+fn match_window(line_starts: &[u64], len: u64, start: u64, end: u64) -> (u64, u64) {
+    let ws = {
+        let ls = line_starts[line_starts
+            .partition_point(|&ls| ls <= start)
+            .saturating_sub(1)];
+        if ls > 0 { ls - 1 } else { 0 }
+    };
+    let we = {
+        let i = line_starts.partition_point(|&ls| ls <= end);
+        let mut e = if i < line_starts.len() { line_starts[i] } else { len };
+        if e < len {
+            e = if i + 1 < line_starts.len() { line_starts[i + 1] } else { len };
+        }
+        e
+    };
+    (ws, we)
+}
+
 /// Replace a single, previously-found match (identified by its byte range)
 /// with `replacement`, expanding regex capture-group references if `regex`
 /// is set.
@@ -750,12 +812,20 @@ fn replace_match_in_document(
 ) -> Result<EditResult, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
-    let bytes = tab.buffer.serialize();
-    let text = std::str::from_utf8(&bytes)
+    let len = tab.buffer.len();
+    let start = args.start;
+    let end = args.end;
+    if start > end || end > len {
+        return Err("match range out of bounds — document changed, please search again".to_string());
+    }
+    let line_starts = tab.buffer.text().line_starts();
+    let (win_start, win_end) = match_window(line_starts, len, start, end);
+    let win_bytes = tab.buffer.serialize_range(win_start, win_end);
+    let text = std::str::from_utf8(&win_bytes)
         .map_err(|_| "document is not valid UTF-8 — replace unavailable".to_string())?;
-    let start = args.start as usize;
-    let end = args.end as usize;
-    if start > end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+    let ws = (start - win_start) as usize;
+    let we = (end - win_start) as usize;
+    if !text.is_char_boundary(ws) || !text.is_char_boundary(we) {
         return Err("match range out of bounds — document changed, please search again".to_string());
     }
     // Verify the range still matches the query: the document may have
@@ -763,12 +833,12 @@ fn replace_match_in_document(
     // a stale range would destroy whatever bytes now sit there. The lock is
     // held through the replace_text_in_tab call below, so no concurrent edit
     // can invalidate the offsets between check and write.
-    let still = range_still_matches(text, start, end, &args.query, args.case_sensitive, args.regex)
+    let still = range_still_matches(text, ws, we, &args.query, args.case_sensitive, args.regex)
         .map_err(|_| "invalid regular expression".to_string())?;
     if !still {
         return Err("match no longer matches — document changed, please search again".to_string());
     }
-    let matched = &text[start..end];
+    let matched = &text[ws..we];
     let expanded = expand_replacement(matched, &args.query, args.case_sensitive, args.regex, &args.replacement);
     replace_text_in_tab(tab, args.start, args.end, &expanded)
 }
@@ -803,8 +873,18 @@ fn replace_all_in_document(
     state: tauri::State<'_, Mutex<AppState>>,
     args: ReplaceAllArgs,
 ) -> Result<ReplaceAllResult, String> {
+    // Same materialization bound as search_document — a lazy document can
+    // exceed RAM; refuse rather than OOM.
+    const MAX_REPLACE_ALL_BYTES: u64 = 256 * 1024 * 1024;
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
+    if tab.buffer.len() > MAX_REPLACE_ALL_BYTES {
+        return Err(format!(
+            "document too large for replace-all ({} bytes, max {})",
+            tab.buffer.len(),
+            MAX_REPLACE_ALL_BYTES
+        ));
+    }
     let bytes = tab.buffer.serialize();
     // Borrow, don't copy — `.to_string()` here would allocate a second
     // full-document buffer (100+ MB) for no reason.
@@ -842,11 +922,16 @@ fn replace_all_in_document(
     edits.shrink_to_fit();
 
     let count = found.matches.len();
-    let last_match = found.matches.last().expect("checked non-empty above");
+    // Caret anchor: the FIRST match's start is identical in old and new
+    // coordinates (every edit sits at or after it). The last match's start
+    // would point past the end of a document that shrank under replace-all,
+    // leaving a stored selection out of bounds — later insert-at-caret
+    // commands would then build out-of-range edits that apply() rejects.
+    let anchor = ByteOffset(found.matches.first().expect("checked non-empty above").start);
     let tx = EditTransaction::new(
         edits,
-        editor_domain::Selection::caret(ByteOffset(last_match.start)),
-        editor_domain::Selection::caret(ByteOffset(last_match.start)),
+        editor_domain::Selection::caret(anchor),
+        editor_domain::Selection::caret(anchor),
     );
     tab.buffer.apply(tx).map_err(|e| e.to_string())?;
     Ok(ReplaceAllResult { count, edit: edit_result_from_tab(tab) })
@@ -858,9 +943,10 @@ fn replace_all_in_document(
 fn get_blocks(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<BlockInfo>, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
-    // Blocks only cover [0, parsed_offset) — serializing the whole buffer
-    // would materialize the unparsed tail of a lazy (>RAM) document.
-    let serialized = tab.buffer.serialize_range(0, tab.buffer.parsed_offset());
+    // Metadata only — the frontend maps kind/start/end and fetches each
+    // visible block's text on demand via get_block_data. Emitting `source`
+    // here serialized the whole parsed range (possibly tens of MB) into the
+    // IPC payload on every document load for data nobody consumed.
     let blocks: Vec<BlockInfo> = tab
         .buffer
         .syntax()
@@ -869,19 +955,9 @@ fn get_blocks(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<BlockInfo>
         .enumerate()
         .map(|(i, b)| {
             let m = b.meta();
-            let start = m.span.start.0 as usize;
-            let end = m.span.end.0 as usize;
-            // Slice raw bytes (not a &str) — a span that lands mid-char must
-            // not panic the command.
-            let source = if start <= end && end <= serialized.len() {
-                String::from_utf8_lossy(&serialized[start..end]).to_string()
-            } else {
-                String::new()
-            };
             BlockInfo {
                 index: i,
                 kind: block_kind_name(b),
-                source,
                 start: m.span.start.0,
                 end: m.span.end.0,
             }
@@ -976,12 +1052,17 @@ fn save_document(
 ) -> Result<bool, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
-    let bytes = tab.buffer.serialize();
     let save_path = resolve_save_path(path.map(PathBuf::from), tab.file_path.as_ref());
     let save_path = save_path.ok_or(
         "no file path to save to — the frontend must prompt for one (untitled document)",
     )?;
-    editor_storage::atomic_save(&save_path, &bytes).map_err(|e| e.to_string())?;
+    // Chunked write: serialize() would materialize the whole buffer, which a
+    // lazy mmap-backed document can exceed RAM on (Invariant 6).
+    let total = tab.buffer.len();
+    editor_storage::atomic_save_chunked(&save_path, total, |start, end| {
+        tab.buffer.serialize_range(start, end)
+    })
+    .map_err(|e| e.to_string())?;
     tab.buffer.mark_saved();
     tab.file_path = Some(save_path);
     Ok(true)
@@ -998,7 +1079,9 @@ fn get_syntax_tree(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<Synta
     // materializing the whole, possibly >RAM, buffer.
     let parsed_len = tab.buffer.parsed_offset();
     let parsed_text = tab.buffer.serialize_range(0, parsed_len);
-    let text_str = String::from_utf8_lossy(&parsed_text).to_string();
+    // Position-preserving decode: `from_utf8_lossy` inflates each bad byte to
+    // 3-byte U+FFFD, desyncing every AST span after the first invalid byte.
+    let text_str = stable_lossy_text(&parsed_text);
     let blocks: Vec<SyntaxBlock> = tab
         .buffer
         .syntax()
@@ -1103,8 +1186,11 @@ fn get_block_data(
     // For AST rendering, block_to_ast uses span_text() with absolute byte offsets
     // from the block's meta.span. Since we only have the block's local bytes (not
     // the full document), we must rebase offsets to be relative to the block start.
-    // block_to_ast_relative subtracts `start` from all span accesses.
-    let node = block_to_ast_relative(b, &source, start);
+    // The AST text uses the position-preserving decode — `source` is display
+    // text, but inline spans index raw bytes and must not be shifted by U+FFFD
+    // expansion on invalid UTF-8.
+    let stable = stable_lossy_text(&range_bytes);
+    let node = block_to_ast_relative(b, &stable, start);
     Ok(Some(SyntaxBlock {
         kind: block_kind_name(b),
         source,
@@ -1233,58 +1319,144 @@ fn git_diff(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitFileDiff>
 /// applies glob matching — `:(top,literal)` anchors AND treats `*?[...]` as
 /// ordinary characters, so files whose names contain metacharacters work.
 fn root_pathspec(path: &str) -> String {
-    if path.starts_with(':') {
+    // Only `:(` is real pathspec magic — a bare `:` name like `:foo` is a
+    // legitimate (if odd) file name that git would reject as bad magic;
+    // it must be wrapped in `:(top,literal)` to match literally.
+    if path.starts_with(":(") {
         path.to_string()
     } else {
         format!(":(top,literal){path}")
     }
 }
 
+/// Normalize a caller-supplied file path to a repo-root-relative string.
+///
+/// The frontend usually sends the relative path `git status` reported, but
+/// can also hand back an ABSOLUTE path (the active tab's file path). Two
+/// failure modes that produced silently-empty diffs/history or failing
+/// pathspecs before:
+///
+/// - `:(top,literal)`-wrapping an absolute path never matches — git expects
+///   the anchor-relative form;
+/// - a tab repointed after a move holds the verbatim `\\?\` prefix while
+///   `rev-parse --show-toplevel` returns the plain form, so the strip must
+///   compare canonicalized paths on both sides.
+///
+/// Relative paths (including `:(magic)` pathspecs) pass through normalized
+/// to `/` separators.
+fn repo_relative_path(git: &editor_git::GitCli, file_path: &str) -> Result<String, String> {
+    let p = std::path::Path::new(file_path);
+    if !p.is_absolute() {
+        return Ok(file_path.replace('\\', "/"));
+    }
+    let root = git.repo_root().map_err(|e| e.to_string())?;
+    let canon_root = canonical_or_self(&PathBuf::from(&root));
+    let canon_path = canonical_or_self(&p.to_path_buf());
+    let rel = canon_path
+        .strip_prefix(&canon_root)
+        .map(|x| x.to_path_buf())
+        .or_else(|_| p.strip_prefix(&root).map(|x| x.to_path_buf()))
+        .map_err(|_| format!("path is outside the repository: {file_path}"))?;
+    Ok(rel.to_string_lossy().replace('\\', "/"))
+}
+
 /// Get unified diff for a single file (working tree vs HEAD) with parsed hunks and lines.
 #[tauri::command]
 fn git_diff_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
-    let ps = root_pathspec(&file_path);
+    let rel = repo_relative_path(&git, &file_path)?;
+    let ps = root_pathspec(&rel);
     let text = git.diff_file_raw(&ps).map_err(|e| e.to_string())?;
     let hunks = parse_unified_diff(&text);
-    Ok(GitFileDiff { path: file_path, old_path: None, hunks })
+    Ok(GitFileDiff { path: rel, old_path: None, hunks })
 }
 
 /// Get unified diff for a single file between two commits.
 #[tauri::command]
 fn git_diff_file_commits(state: tauri::State<'_, Mutex<AppState>>, file_path: String, commit_a: String, commit_b: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
-    let ps = root_pathspec(&file_path);
+    let rel = repo_relative_path(&git, &file_path)?;
+    let ps = root_pathspec(&rel);
     let text = git.diff_file_commits_raw(&ps, &commit_a, &commit_b).map_err(|e| e.to_string())?;
     let hunks = parse_unified_diff(&text);
-    Ok(GitFileDiff { path: file_path, old_path: None, hunks })
+    Ok(GitFileDiff { path: rel, old_path: None, hunks })
 }
 
 /// Get unified diff for a single file between working tree and a commit.
 #[tauri::command]
 fn git_diff_file_vs_commit(state: tauri::State<'_, Mutex<AppState>>, file_path: String, commit: String) -> Result<GitFileDiff, String> {
     let git = open_git_for_active(&state)?;
-    let ps = root_pathspec(&file_path);
+    let rel = repo_relative_path(&git, &file_path)?;
+    let ps = root_pathspec(&rel);
     let text = git.diff_file_vs_commit_raw(&ps, &commit).map_err(|e| e.to_string())?;
     let hunks = parse_unified_diff(&text);
-    Ok(GitFileDiff { path: file_path, old_path: None, hunks })
+    Ok(GitFileDiff { path: rel, old_path: None, hunks })
 }
 
 /// Discard changes to a file (restore from HEAD). Equivalent to `git checkout -- <file>`.
 #[tauri::command]
-fn git_discard_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
+fn git_discard_file(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    let ps = root_pathspec(&file_path);
+    let rel = repo_relative_path(&git, &file_path)?;
+    let root = git.repo_root().map_err(|e| e.to_string())?;
+    let abs = canonical_or_self(&PathBuf::from(&root).join(&rel));
+    // If the file is open with unsaved buffer edits, discarding on disk is
+    // pointless — the next autosave writes the buffer back over HEAD — and
+    // silently wiping the buffer would lose user work. Refuse instead.
+    {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        if let Some(idx) = find_tab_idx_for_path(&s.tabs, &abs) {
+            if s.tabs[idx].buffer.is_dirty() {
+                return Err(format!(
+                    "{file_path} has unsaved changes — save or close it before discarding"
+                ));
+            }
+        }
+    }
+    let ps = root_pathspec(&rel);
     git.discard_file(&ps).map_err(|e| e.to_string())?;
+    // A clean open tab still holds the pre-discard snapshot — reload it from
+    // disk so it shows the reverted content.
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let mut changed = 0;
+    if let Some(idx) = find_tab_idx_for_path(&s.tabs, &abs) {
+        let label = s.tabs[idx]
+            .file_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| file_path.clone());
+        if let Ok((buffer, _)) = buffer_for_file(&abs, &label, &file_path) {
+            s.tabs[idx].buffer = buffer;
+            changed = 1;
+        }
+    }
+    drop(s);
+    emit_worktree_changed(&app, changed);
     Ok(true)
 }
 
 /// Remove an untracked file (delete from disk).
 #[tauri::command]
-fn git_remove_untracked(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
+fn git_remove_untracked(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, file_path: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    let ps = root_pathspec(&file_path);
+    let rel = repo_relative_path(&git, &file_path)?;
+    let root = git.repo_root().map_err(|e| e.to_string())?;
+    let ps = root_pathspec(&rel);
+    // Resolve the canonical form BEFORE `git clean` deletes the file —
+    // canonicalize fails afterwards, and tabs holding the `\\?\`-form path
+    // (e.g. after a repoint) would never match the raw path.
+    let abs = PathBuf::from(&root).join(&rel);
+    let canonical = canonical_or_self(&abs);
     git.clean_files(&ps).map_err(|e| e.to_string())?;
+    // `git clean` removed the file (or an untracked directory) from disk —
+    // detach open tabs pointing at it or the next autosave would silently
+    // resurrect what the user just deleted.
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let had = s.tabs.iter().filter(|t| t.file_path.is_some()).count();
+    detach_tabs_for_deleted_path(&mut s, &abs, &canonical);
+    let detached = had - s.tabs.iter().filter(|t| t.file_path.is_some()).count();
+    drop(s);
+    emit_worktree_changed(&app, detached);
     Ok(true)
 }
 
@@ -1308,7 +1480,10 @@ fn git_stage_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String) -
     let path = tab.file_path.as_ref().ok_or("no file open")?;
     let dir = path.parent().ok_or("no parent directory")?;
     let git = editor_git::GitCli::open(dir).map_err(|e| e.to_string())?;
-    git.stage(editor_git::ChangeSelection::File { path: file_path }).map_err(|e| e.to_string())?;
+    // Relativize absolute paths: `literal_pathspec` would pass them through,
+    // but a verbatim `\\?\` path is not a usable git pathspec.
+    let rel = repo_relative_path(&git, &file_path)?;
+    git.stage(editor_git::ChangeSelection::File { path: rel }).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -1320,7 +1495,8 @@ fn git_unstage_file(state: tauri::State<'_, Mutex<AppState>>, file_path: String)
     let path = tab.file_path.as_ref().ok_or("no file open")?;
     let dir = path.parent().ok_or("no parent directory")?;
     let git = editor_git::GitCli::open(dir).map_err(|e| e.to_string())?;
-    git.unstage(editor_git::ChangeSelection::File { path: file_path }).map_err(|e| e.to_string())?;
+    let rel = repo_relative_path(&git, &file_path)?;
+    git.unstage(editor_git::ChangeSelection::File { path: rel }).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -1341,14 +1517,18 @@ fn git_commit(state: tauri::State<'_, Mutex<AppState>>, message: String) -> Resu
 
 /// Checkout a branch.
 #[tauri::command]
-fn git_checkout(state: tauri::State<'_, Mutex<AppState>>, branch: String) -> Result<bool, String> {
+fn git_checkout(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, branch: String) -> Result<bool, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
     let path = tab.file_path.as_ref().ok_or("no file open")?;
     let dir = path.parent().ok_or("no parent directory")?;
     let git = editor_git::GitCli::open(dir).map_err(|e| e.to_string())?;
-    git.checkout(editor_git::Revision::Branch(branch)).map_err(|e| e.to_string())?;
-    Ok(true)
+    drop(s);
+    // Checkout rewrote the working tree — resync open buffers even when git
+    // reported an error (a partially-applied checkout still changes files).
+    worktree_op(&app, &state, &git, || {
+        git.checkout(editor_git::Revision::Branch(branch)).map_err(|e| e.to_string())
+    })
 }
 
 /// Get file history (commit log for the current file).
@@ -1362,12 +1542,7 @@ fn git_file_history(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitC
     // History needs the repo-root-relative path — the bare file name only
     // matches files at the top level, silently returning empty history for
     // anything in a subdirectory.
-    let root = git.repo_root().map_err(|e| e.to_string())?;
-    let rel = path
-        .strip_prefix(&root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let rel = repo_relative_path(&git, &path.to_string_lossy())?;
     let history = editor_git::file_history(&git, &rel).map_err(|e| e.to_string())?;
     Ok(history.iter().map(|e| GitCommitInfo {
         sha: e.revision.0.clone(),
@@ -1409,6 +1584,87 @@ fn open_git_for_active(state: &tauri::State<'_, Mutex<AppState>>) -> Result<edit
         dir.to_path_buf()
     };
     editor_git::GitCli::open(dir).map_err(|e| e.to_string())
+}
+
+/// Re-sync open tabs with the working tree after a git operation that may
+/// have rewritten files on disk (checkout, pull, merge, rebase, stash
+/// pop/apply/push, reset --hard, revert, cherry-pick). Without this, every
+/// open tab keeps the pre-operation buffer: clean tabs silently show stale
+/// content, and autosave would eventually write the OLD snapshot back over
+/// the newly checked-out file.
+///
+/// - Clean buffers are reloaded from disk (they mirror the file anyway).
+/// - Dirty buffers are left untouched — unsaved user work must not be
+///   discarded by a git operation (editors conventionally keep the buffer
+///   and let the user resolve the divergence).
+/// - Tabs whose file no longer exists are detached, so a later save does
+///   not resurrect a file the operation deliberately removed.
+fn resync_tabs_after_worktree_change(state: &mut AppState, repo_root: &str) -> usize {
+    // Compare both raw and canonicalized roots: canonicalization of a
+    // DELETED file fails and returns the raw spelling, which would not
+    // prefix-match a `\\?\`-canonicalized root (and vice versa).
+    let raw_root = PathBuf::from(repo_root);
+    let canon_root = canonical_or_self(&raw_root);
+    let mut changed = 0;
+    for tab in &mut state.tabs {
+        let Some(fp) = tab.file_path.clone() else { continue };
+        let canon_fp = canonical_or_self(&fp);
+        let in_repo = canon_fp.starts_with(&canon_root)
+            || fp.starts_with(&raw_root)
+            || fp.starts_with(&canon_root);
+        if !in_repo {
+            continue;
+        }
+        if !fp.exists() {
+            tab.file_path = None;
+            changed += 1;
+            continue;
+        }
+        if tab.buffer.is_dirty() {
+            continue;
+        }
+        let label = fp.to_string_lossy().to_string();
+        let name = fp
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| label.clone());
+        if let Ok((buffer, _)) = buffer_for_file(&fp, &label, &name) {
+            tab.buffer = buffer;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Emit `worktree-changed` when a git operation actually rewrote buffers, so
+/// the frontend reloads the visible document instead of showing stale blocks.
+fn emit_worktree_changed(app: &tauri::AppHandle, changed: usize) {
+    if changed > 0 {
+        use tauri::Emitter;
+        let _ = app.emit("worktree-changed", changed);
+    }
+}
+
+/// Run a worktree-mutating git operation and resync open tabs with the disk
+/// — regardless of whether the op succeeded. A "failed" merge/rebase/pull/
+/// cherry-pick still leaves conflict markers and partially-applied changes
+/// in the worktree, so resyncing only on success would leave open buffers
+/// describing a tree that no longer exists (autosave would then clobber the
+/// conflict state on disk).
+fn worktree_op(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, Mutex<AppState>>,
+    git: &editor_git::GitCli,
+    op: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    let root = git.repo_root().map_err(|e| e.to_string())?;
+    let result = op();
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let changed = resync_tabs_after_worktree_change(&mut s, &root);
+    drop(s);
+    emit_worktree_changed(app, changed);
+    result?;
+    Ok(true)
 }
 
 /// Diff between two commits.
@@ -1473,24 +1729,25 @@ fn git_stash_list(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitSta
 }
 
 #[tauri::command]
-fn git_stash_push(state: tauri::State<'_, Mutex<AppState>>, message: Option<String>) -> Result<bool, String> {
+fn git_stash_push(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, message: Option<String>) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.stash_push(message.as_deref()).map_err(|e| e.to_string())?;
-    Ok(true)
+    // `stash push` reverts tracked files to HEAD — the working tree changed.
+    worktree_op(&app, &state, &git, || {
+        git.stash_push(message.as_deref()).map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
-fn git_stash_pop(state: tauri::State<'_, Mutex<AppState>>, index: usize) -> Result<bool, String> {
+fn git_stash_pop(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, index: usize) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.stash_pop(index).map_err(|e| e.to_string())?;
-    Ok(true)
+    // Pop conflicts leave the worktree half-applied — resync either way.
+    worktree_op(&app, &state, &git, || git.stash_pop(index).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
-fn git_stash_apply(state: tauri::State<'_, Mutex<AppState>>, index: usize) -> Result<bool, String> {
+fn git_stash_apply(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, index: usize) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.stash_apply(index).map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.stash_apply(index).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
@@ -1524,7 +1781,7 @@ fn git_rename_branch(state: tauri::State<'_, Mutex<AppState>>, old_name: String,
 
 /// Merge.
 #[tauri::command]
-fn git_merge(state: tauri::State<'_, Mutex<AppState>>, branch: String, strategy: String) -> Result<bool, String> {
+fn git_merge(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, branch: String, strategy: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
     let strat = match strategy.as_str() {
         "ff-only" => editor_git::MergeStrategy::FastForwardOnly,
@@ -1532,52 +1789,45 @@ fn git_merge(state: tauri::State<'_, Mutex<AppState>>, branch: String, strategy:
         "squash" => editor_git::MergeStrategy::Squash,
         _ => editor_git::MergeStrategy::Merge,
     };
-    git.merge(&branch, strat).map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.merge(&branch, strat).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
-fn git_merge_abort(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+fn git_merge_abort(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.merge_abort().map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.merge_abort().map_err(|e| e.to_string()))
 }
 
 /// Rebase.
 #[tauri::command]
-fn git_rebase(state: tauri::State<'_, Mutex<AppState>>, branch: String) -> Result<bool, String> {
+fn git_rebase(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, branch: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.rebase(&branch).map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.rebase(&branch).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
-fn git_rebase_abort(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+fn git_rebase_abort(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.rebase_abort().map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.rebase_abort().map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
-fn git_rebase_continue(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
+fn git_rebase_continue(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.rebase_continue().map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.rebase_continue().map_err(|e| e.to_string()))
 }
 
 /// Cherry-pick / Revert.
 #[tauri::command]
-fn git_cherry_pick(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
+fn git_cherry_pick(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.cherry_pick(&commit).map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.cherry_pick(&commit).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
-fn git_revert(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
+fn git_revert(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.revert(&commit).map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.revert(&commit).map_err(|e| e.to_string()))
 }
 
 /// Tags.
@@ -1635,10 +1885,11 @@ fn git_push_to_remote(state: tauri::State<'_, Mutex<AppState>>, remote: String, 
 }
 
 #[tauri::command]
-fn git_pull_from_remote(state: tauri::State<'_, Mutex<AppState>>, remote: String, branch: String) -> Result<bool, String> {
+fn git_pull_from_remote(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, remote: String, branch: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.pull_from_remote(&remote, &branch).map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || {
+        git.pull_from_remote(&remote, &branch).map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
@@ -1664,18 +1915,17 @@ fn git_reset_mixed(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> 
 }
 
 #[tauri::command]
-fn git_reset_hard(state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
+fn git_reset_hard(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, commit: String) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.reset_hard(&commit).map_err(|e| e.to_string())?;
-    Ok(true)
+    worktree_op(&app, &state, &git, || git.reset_hard(&commit).map_err(|e| e.to_string()))
 }
 
 /// Clean untracked files.
 #[tauri::command]
-fn git_clean(state: tauri::State<'_, Mutex<AppState>>, directories: bool, force: bool) -> Result<bool, String> {
+fn git_clean(app: tauri::AppHandle, state: tauri::State<'_, Mutex<AppState>>, directories: bool, force: bool) -> Result<bool, String> {
     let git = open_git_for_active(&state)?;
-    git.clean(directories, force).map_err(|e| e.to_string())?;
-    Ok(true)
+    // Deleted untracked files/dirs — detach or reload affected open tabs.
+    worktree_op(&app, &state, &git, || git.clean(directories, force).map_err(|e| e.to_string()))
 }
 
 /// Get current branch name.
@@ -1697,21 +1947,24 @@ fn git_head_commit(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, S
 #[tauri::command]
 fn git_read_file_at_revision(state: tauri::State<'_, Mutex<AppState>>, file_path: String, revision: String) -> Result<String, String> {
     let git = open_git_for_active(&state)?;
+    // Normalize absolute paths (e.g. a `\\?\`-form tab path) to repo-relative
+    // — `git show REV:path` needs the relative form and the working-copy read
+    // must not escape the repository root.
+    let rel = repo_relative_path(&git, &file_path)?;
     if revision.is_empty() {
-        // `file_path` is repo-relative; reject absolute paths and `..`
-        // components so the read can't escape the repository root.
-        let rel = std::path::Path::new(&file_path);
-        if rel.is_absolute()
-            || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
-        {
+        // `rel` is repo-relative; `..` components can't be produced by the
+        // strip above, but a caller-supplied relative path still could —
+        // reject so the read can't escape the repository root.
+        let rel_path = std::path::Path::new(&rel);
+        if rel_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
             return Err("file_path must be a repo-relative path without '..'".to_string());
         }
         let root = git.repo_root().map_err(|e| e.to_string())?;
-        let full = std::path::Path::new(&root).join(&file_path);
+        let full = std::path::Path::new(&root).join(&rel);
         let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&bytes).to_string())
     } else {
-        let bytes = editor_git::read_file_at_revision(&git, &file_path, &revision).map_err(|e| e.to_string())?;
+        let bytes = editor_git::read_file_at_revision(&git, &rel, &revision).map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 }
@@ -1746,7 +1999,12 @@ fn git_repo_root(state: tauri::State<'_, Mutex<AppState>>) -> Result<Option<Stri
     let git = open_git_for_active(&state);
     match git {
         Ok(g) => {
-            let root = g.work_dir().to_string_lossy().to_string();
+            // `rev-parse --show-toplevel`, not `work_dir`: the work dir is
+            // the active file's parent, which may be a SUBDIRECTORY of the
+            // repo. The frontend strips this root to build repo-relative
+            // pathspecs — a subdirectory "root" would produce wrong paths
+            // (diff/stage of a different file at the top level).
+            let root = g.repo_root().map_err(|e| e.to_string())?;
             Ok(Some(root))
         }
         Err(_) => Ok(None),
@@ -1813,7 +2071,10 @@ fn run_subprocess(
     })
 }
 
-fn gh_exec_text(state: &tauri::State<'_, Mutex<AppState>>, args: &[&str]) -> Result<String, String> {
+fn gh_exec_output(
+    state: &tauri::State<'_, Mutex<AppState>>,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     let dir = {
         let s = state.lock().map_err(|e| e.to_string())?;
         let tab = s.active_tab()?;
@@ -1822,7 +2083,11 @@ fn gh_exec_text(state: &tauri::State<'_, Mutex<AppState>>, args: &[&str]) -> Res
         dir.to_path_buf()
     };
     let gh_bin = std::env::var("GH_BIN").unwrap_or_else(|_| "gh".to_string());
-    let out = run_subprocess(&gh_bin, &dir, args, std::time::Duration::from_secs(60))?;
+    run_subprocess(&gh_bin, &dir, args, std::time::Duration::from_secs(60))
+}
+
+fn gh_exec_text(state: &tauri::State<'_, Mutex<AppState>>, args: &[&str]) -> Result<String, String> {
+    let out = gh_exec_output(state, args)?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
@@ -1864,11 +2129,15 @@ struct GithubRemoteBranch {
 /// Check GitHub auth status via `gh auth status`.
 #[tauri::command]
 fn github_auth_status(state: tauri::State<'_, Mutex<AppState>>) -> Result<GithubAuthStatus, String> {
-    let text = gh_exec_text(&state, &["auth", "status"]);
-    match text {
-        Ok(t) => {
-            // Parse "Logged in to github.com as <user>" or similar.
-            let user = t
+    // `gh auth status` prints "Logged in to github.com as <user>" to STDERR
+    // (stdout stays empty on success) — scanning only stdout always yielded
+    // an authenticated status with a blank username.
+    let out = gh_exec_output(&state, &["auth", "status"]);
+    match out {
+        Ok(o) if o.status.success() => {
+            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            let user = text
                 .lines()
                 .find_map(|l| {
                     if l.contains("Logged in") {
@@ -1887,7 +2156,7 @@ fn github_auth_status(state: tauri::State<'_, Mutex<AppState>>) -> Result<Github
                 .unwrap_or_default();
             Ok(GithubAuthStatus { authenticated: true, user })
         }
-        Err(_) => Ok(GithubAuthStatus { authenticated: false, user: String::new() }),
+        _ => Ok(GithubAuthStatus { authenticated: false, user: String::new() }),
     }
 }
 
@@ -1994,32 +2263,10 @@ fn open_relative_file(
     if !path.starts_with(&canonical_base) {
         return Err("path traversal denied: resolved path is outside the base directory".to_string());
     }
-    let doc_id = DocumentId::new(path.to_string_lossy().as_ref());
-    let storage = editor_storage::MmapStorage::open(&path, doc_id)
-        .map_err(|e| e.to_string())?;
-    let byte_source = storage.byte_source();
     let file_name = path.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
-    let bytes = byte_source.as_bytes();
-    let trailing_newline = bytes.last() == Some(&b'\n');
-    let meta = editor_domain::DocumentMeta {
-        id: DocumentId::new(&file_name),
-        has_bom: bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
-        line_ending: detect_line_ending(bytes),
-        trailing_newline,
-        encoding: editor_domain::Encoding::Utf8,
-    };
-    let byte_len = byte_source.len();
-    const LAZY_THRESHOLD: usize = 20 * 1024 * 1024;
-    const CHUNK_SIZE: usize = 10 * 1024 * 1024;
-    let buffer = if byte_len > LAZY_THRESHOLD {
-        DocumentBuffer::open_lazy(byte_source, meta, MarkdownProfile::Gfm, CHUNK_SIZE)
-            .map_err(|e| e.to_string())?
-    } else {
-        DocumentBuffer::open_from_buffer(byte_source, meta, MarkdownProfile::Gfm)
-            .map_err(|e| e.to_string())?
-    };
+    let (buffer, _byte_len) = buffer_for_file(&path, path.to_string_lossy().as_ref(), &file_name)?;
 
     let mut s = state.lock().map_err(|e| e.to_string())?;
     // Same dedup as open_document: `path` is already canonicalized, so a
@@ -2040,6 +2287,32 @@ fn open_relative_file(
     let info = doc_info_from_tab(&tab);
     s.push_tab(tab);
     Ok(info)
+}
+
+/// Check that a URL uses a safe scheme (http, https, mailto) and has a
+/// non-empty host for http(s) — mirrors editor_platform::SystemUrlOpener's
+/// policy (§86). Rendered Markdown can carry `file:`/`javascript:` links that
+/// must never reach the OS handler.
+fn is_safe_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let after_scheme = lower.split("://").nth(1).unwrap_or("");
+        !after_scheme.is_empty()
+    } else if lower.starts_with("mailto:") {
+        url.len() > "mailto:".len()
+    } else {
+        false
+    }
+}
+
+/// Open a URL with the OS default handler (§86).
+#[tauri::command]
+fn open_url(url: String) -> Result<bool, String> {
+    if !is_safe_url(&url) {
+        return Err(format!("refusing to open URL with unsafe scheme: {url}"));
+    }
+    tauri_plugin_opener::open_url(&url, None::<&str>).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 // ── File tree commands ─────────────────────────────────────────────────────
@@ -2121,7 +2394,25 @@ fn copy_file(src_path: String, dest_path: String) -> Result<bool, String> {
         }
         copy_dir_recursive(&canonical_src, &canonical_dest).map_err(|e| e.to_string())?;
     } else {
-        std::fs::copy(src, dest).map_err(|e| e.to_string())?;
+        // `create_new` fails atomically when the destination exists — an
+        // exists() check plus fs::copy would clobber a file created in
+        // between. Permissions are copied explicitly (fs::copy did that).
+        let mut src_f = std::fs::File::open(src).map_err(|e| e.to_string())?;
+        let mut dest_f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("Destination already exists: {dest_path}")
+                } else {
+                    e.to_string()
+                }
+            })?;
+        std::io::copy(&mut src_f, &mut dest_f).map_err(|e| e.to_string())?;
+        if let Ok(perms) = src_f.metadata().map(|m| m.permissions()) {
+            let _ = dest_f.set_permissions(perms);
+        }
     }
     Ok(true)
 }
@@ -2143,21 +2434,68 @@ fn move_file(
     if dest.exists() {
         return Err(format!("Destination already exists: {}", dest_path));
     }
-    std::fs::rename(src, dest).map_err(|e| e.to_string())?;
+    validate_move_dest(src, dest)?;
+    // `rename` fails across filesystems (EXDEV). Fall back to copy+delete so
+    // moving a file to a folder on another drive still works.
+    if std::fs::rename(src, dest).is_err() {
+        if src.is_dir() {
+            copy_dir_recursive(src, dest).map_err(|e| e.to_string())?;
+            // If the source can't be removed, remove the copy so the move
+            // doesn't silently leave a duplicate behind.
+            if std::fs::remove_dir_all(src).is_err() {
+                let _ = std::fs::remove_dir_all(dest);
+                return Err("move failed: could not remove source".to_string());
+            }
+        } else {
+            std::fs::copy(src, dest).map_err(|e| e.to_string())?;
+            if std::fs::remove_file(src).is_err() {
+                let _ = std::fs::remove_file(dest);
+                return Err("move failed: could not remove source".to_string());
+            }
+        }
+    }
     let mut s = state.lock().map_err(|e| e.to_string())?;
     repoint_tabs_after_move(&mut s, src, dest);
     Ok(true)
 }
 
+/// Reject moving a directory into itself — the OS fails with an opaque error,
+/// so check canonical containment first. `dest` doesn't exist yet, so
+/// canonicalize its parent and re-attach the file name (same approach as
+/// `copy_file`).
+fn validate_move_dest(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let canonical_src = src.canonicalize().map_err(|e| e.to_string())?;
+    let canonical_dest = dest
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.join(dest.file_name().unwrap_or_default()))
+        .unwrap_or_else(|| dest.to_path_buf());
+    if canonical_dest.starts_with(&canonical_src) {
+        return Err("cannot move a directory into itself".to_string());
+    }
+    Ok(())
+}
+
 /// Repoint every open tab whose file path equals `src` — or lives under `src`
 /// when a directory was moved — to the corresponding location under `dest`.
+/// Called AFTER the rename, so `dest` exists and canonicalizes. Both sides are
+/// compared in canonical form: a tab may store `\\?\C:\...` while the caller's
+/// src/dest are plain (or carry `..` segments) — a raw comparison would leave
+/// the tab pointing at the old location, and the next save would silently
+/// recreate the moved-from path.
 fn repoint_tabs_after_move(state: &mut AppState, src: &std::path::Path, dest: &std::path::Path) {
+    let canonical_src = canonical_or_self(&src.to_path_buf());
+    let canonical_dest = canonical_or_self(&dest.to_path_buf());
     for tab in &mut state.tabs {
         let Some(fp) = &tab.file_path else { continue };
-        if fp == src {
-            tab.file_path = Some(dest.to_path_buf());
-        } else if let Ok(rest) = fp.strip_prefix(src) {
-            tab.file_path = Some(dest.join(rest));
+        let fp = canonical_or_self(fp);
+        if fp == canonical_src {
+            tab.file_path = Some(canonical_dest.clone());
+        } else if let Ok(rest) = fp.strip_prefix(&canonical_src) {
+            tab.file_path = Some(canonical_dest.join(rest));
         }
     }
 }
@@ -2168,9 +2506,14 @@ fn delete_file(
     state: tauri::State<'_, Mutex<AppState>>,
     path: String,
 ) -> Result<bool, String> {
+    // Resolve the canonical form BEFORE deletion — canonicalize fails on a
+    // path that no longer exists, and tabs may store the canonical
+    // (`\\?\C:\...`) form after a repoint. Comparing post-delete would
+    // silently keep those tabs attached and let autosave resurrect the file.
+    let canonical = canonical_or_self(&PathBuf::from(&path));
     let p = delete_path(&path)?;
     let mut s = state.lock().map_err(|e| e.to_string())?;
-    detach_tabs_for_deleted_path(&mut s, &p);
+    detach_tabs_for_deleted_path(&mut s, &p, &canonical);
     Ok(true)
 }
 
@@ -2194,11 +2537,17 @@ fn delete_path(path: &str) -> Result<PathBuf, String> {
 /// next save — including autosave — silently recreates a file the user just
 /// deleted. The buffer itself is untouched; the tab behaves like an unsaved
 /// document and will prompt for a new path on save.
-fn detach_tabs_for_deleted_path(state: &mut AppState, path: &std::path::Path) {
+///
+/// `canonical` must be captured while the target still exists — after
+/// deletion `canonicalize` fails and a `\\?\`-form tab path would never
+/// match the raw `path`.
+fn detach_tabs_for_deleted_path(state: &mut AppState, path: &std::path::Path, canonical: &PathBuf) {
     for tab in &mut state.tabs {
         let Some(fp) = &tab.file_path else { continue };
-        // starts_with covers `fp == path` too (a path is its own prefix).
-        if fp.starts_with(path) {
+        // Compare raw (caller's form) and canonicalized (post-repoint tabs)
+        // against both forms of the target — starts_with covers `fp == path`
+        // too (a path is its own prefix).
+        if fp.starts_with(path) || canonical_or_self(fp).starts_with(canonical) {
             tab.file_path = None;
         }
     }
@@ -2208,10 +2557,19 @@ fn detach_tabs_for_deleted_path(state: &mut AppState, path: &std::path::Path) {
 #[tauri::command]
 fn create_file(path: String) -> Result<bool, String> {
     let p = std::path::Path::new(&path);
-    if p.exists() {
-        return Err(format!("File already exists: {}", path));
-    }
-    std::fs::write(p, b"").map_err(|e| e.to_string())?;
+    // `create_new` fails atomically when the path exists — an exists() check
+    // plus fs::write would truncate a file created in between.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(p)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("File already exists: {path}")
+            } else {
+                e.to_string()
+            }
+        })?;
     Ok(true)
 }
 
@@ -2391,12 +2749,20 @@ fn parse_unified_diff(text: &str) -> Vec<GitHunkInfo> {
             new_line = new_start;
             current_hunk = Some(GitHunkInfo { old_start, new_start, lines: Vec::new() });
         } else if let Some(ref mut hunk) = current_hunk {
-            if line.starts_with("diff --git") || line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("index ") {
-                // File header — skip (we're parsing single file diff).
+            if line.starts_with("diff --git") {
+                // A new file begins: close the current hunk so this file's
+                // `---`/`+++` headers are skipped outside any hunk.
+                hunks.push(current_hunk.take().unwrap());
+                continue;
+            }
+            if line.starts_with("index ") {
+                // File header line — never valid hunk content.
                 continue;
             }
             let bytes = line.as_bytes();
             if bytes.is_empty() { continue; }
+            // Inside a hunk `--- x`/`+++ x` are NOT file headers: they are a
+            // deleted line whose text was `-- x` or an added `++ x`.
             match bytes[0] {
                 b' ' => {
                     let text_content = &line[1..];
@@ -2444,6 +2810,64 @@ fn parse_unified_diff(text: &str) -> Vec<GitHunkInfo> {
 
 // ── AST serialization for frontend rendering ────────────────────────────────
 
+/// Lossy UTF-8 decode that preserves byte positions: every valid sequence is
+/// copied verbatim and every invalid byte becomes a single `?`. Unlike
+/// `String::from_utf8_lossy` — which expands each bad byte into the 3-byte
+/// U+FFFD and shifts every later byte offset — this keeps parser spans
+/// (absolute byte offsets into the original) aligned with the decoded text,
+/// so `span_text` still extracts the right slice for documents containing
+/// invalid UTF-8.
+fn stable_lossy_text(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let n = utf8_seq_len(&bytes[i..]);
+        if n > 0 {
+            // The sequence was just validated — `from_utf8` cannot fail.
+            out.push_str(std::str::from_utf8(&bytes[i..i + n]).unwrap_or("?"));
+            i += n;
+        } else {
+            out.push('?');
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Length in bytes of a valid UTF-8 sequence at the start of `s`, or 0 when
+/// `s` does not begin with one (invalid lead byte, truncated tail, overlong
+/// encoding, surrogate, or out-of-range code point).
+fn utf8_seq_len(s: &[u8]) -> usize {
+    let b0 = s[0];
+    let need = match b0 {
+        0x00..=0x7F => return 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return 0, // 0x80..=0xC1 (continuation/overlong) and 0xF5..=0xFF
+    };
+    if s.len() < need {
+        return 0;
+    }
+    // The second byte narrows the valid range to exclude overlong
+    // encodings, UTF-16 surrogates, and code points above U+10FFFF.
+    let b1_ok = match b0 {
+        0xE0 => (0xA0..=0xBF).contains(&s[1]),
+        0xED => (0x80..=0x9F).contains(&s[1]),
+        0xF0 => (0x90..=0xBF).contains(&s[1]),
+        0xF4 => (0x80..=0x8F).contains(&s[1]),
+        _ => (0x80..=0xBF).contains(&s[1]),
+    };
+    if !b1_ok {
+        return 0;
+    }
+    if s[1..need].iter().all(|&b| (0x80..=0xBF).contains(&b)) {
+        need
+    } else {
+        0
+    }
+}
+
 fn span_text(span: editor_markdown::SourceSpan, text: &str) -> String {
     let s = span.start.0 as usize;
     let e = span.end.0 as usize;
@@ -2465,14 +2889,71 @@ fn span_text_relative(span: editor_markdown::SourceSpan, text: &str, base: u64) 
 /// bytes are available, not the full 120MB document.
 /// True when a line is a code-fence closing line: a run of 3+ identical
 /// backticks or tildes and nothing else (closing fences cannot have an info
-/// string; leading whitespace is allowed).
+/// string). CommonMark caps the leading indent at 3 spaces — a tab or 4+
+/// spaces means the parser kept the line as fence CONTENT, and dropping it
+/// here would lose bytes.
 fn is_closing_fence_line(line: &str) -> bool {
-    let t = line.trim();
+    let t = line.trim_end();
+    let mut indent = 0u32;
+    for &b in t.as_bytes() {
+        match b {
+            b' ' => indent += 1,
+            b'\t' => indent += 4, // a tab always reaches the 4-column code indent
+            _ => break,
+        }
+        if indent > 3 {
+            return false;
+        }
+    }
+    let t = t.trim_start();
     let Some(&c) = t.as_bytes().first() else { return false };
     if c != b'`' && c != b'~' {
         return false;
     }
     t.len() >= 3 && t.bytes().all(|b| b == c)
+}
+
+/// Split `s` into line segments WITH their endings, honoring all three
+/// line-ending forms the parser's `collect_lines` recognizes — LF, CRLF,
+/// and bare CR (classic Mac). `str::split_inclusive('\n')` and `str::lines`
+/// treat a `\r`-separated document as a single line, which desyncs the
+/// marker-stripped buffers these helpers rebuild: the parser emits child
+/// spans in coordinates where `\r` already ended the line.
+fn lines_inclusive(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut seg_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                out.push(&s[seg_start..=i]);
+                i += 1;
+                seg_start = i;
+            }
+            b'\r' => {
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    out.push(&s[seg_start..=i + 1]);
+                    i += 2;
+                } else {
+                    out.push(&s[seg_start..=i]);
+                    i += 1;
+                }
+                seg_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if seg_start < s.len() {
+        out.push(&s[seg_start..]);
+    }
+    out
+}
+
+/// Content lines without endings — `str::lines` equivalent that also splits
+/// on bare `\r`.
+fn content_lines(s: &str) -> Vec<&str> {
+    lines_inclusive(s).iter().map(|l| split_line_ending(l).0).collect()
 }
 
 /// Split a line (as yielded by `split_inclusive('\n')`) into content and line
@@ -2496,13 +2977,20 @@ fn split_line_ending(line: &str) -> (&str, &str) {
 /// extracting them from the document text would read the wrong bytes.
 fn de_mark_block_quote(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    for line in raw.split_inclusive('\n') {
+    for line in lines_inclusive(raw) {
         let (content, ending) = split_line_ending(line);
         let ind = content.bytes().take_while(|&b| b == b' ').count();
         let s = &content[ind.min(content.len())..];
-        let s = s.strip_prefix('>').unwrap_or(s);
-        let s = s.strip_prefix(' ').unwrap_or(s);
-        out.push_str(s);
+        // Mirror parse_block_quote: `>`-marked lines lose the marker and one
+        // optional space; lazy continuation lines (no `>`) keep their full
+        // text verbatim — stripping their indent would fabricate a setext
+        // underline or drop content bytes, misaligning every child span
+        // parsed against this buffer.
+        let out_line = match s.strip_prefix('>') {
+            Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+            None => content,
+        };
+        out.push_str(out_line);
         out.push_str(ending);
     }
     out
@@ -2515,7 +3003,7 @@ fn de_mark_block_quote(raw: &str) -> String {
 fn de_mark_list_item(raw: &str, ordered: bool) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut strip = 0usize;
-    for (k, line) in raw.split_inclusive('\n').enumerate() {
+    for (k, line) in lines_inclusive(raw).into_iter().enumerate() {
         let (content, ending) = split_line_ending(line);
         if k == 0 {
             let ind = content.bytes().take_while(|&b| b == b' ').count();
@@ -2533,7 +3021,17 @@ fn de_mark_list_item(raw: &str, ordered: bool) -> String {
                 strip += 4;
             }
         }
-        out.push_str(&content[strip.min(content.len())..]);
+        // Mirror parse_list: continuation lines strip the content indent but
+        // never more than their own leading indent — lazy continuation lines
+        // (`- a\nlazy`) carry less indent and must be kept verbatim, not
+        // truncated by `strip` bytes of real content.
+        let line_ind = if k == 0 {
+            0
+        } else {
+            content.bytes().take_while(|&b| b == b' ').count()
+        };
+        let strip_n = if k == 0 { strip } else { strip.min(line_ind) };
+        out.push_str(&content[strip_n.min(content.len())..]);
         out.push_str(ending);
     }
     out
@@ -2574,7 +3072,7 @@ fn block_to_ast_relative(block: &editor_markdown::Block, text: &str, base: u64) 
         Block::CodeBlock(cb) => {
             let raw = span_text_relative(cb.meta.span, text, base);
             let content = if cb.fenced {
-                let lines: Vec<&str> = raw.lines().collect();
+                let lines = content_lines(&raw);
                 if lines.len() >= 2 {
                     // Drop the closing line only when it is actually a closing
                     // fence — an *unclosed* fence would otherwise silently lose
@@ -2589,7 +3087,7 @@ fn block_to_ast_relative(block: &editor_markdown::Block, text: &str, base: u64) 
                     raw
                 }
             } else {
-                raw.lines().map(|l| {
+                content_lines(&raw).iter().map(|l| {
                     if l.starts_with("    ") { l[4..].to_string() }
                     else if l.starts_with('\t') { l[1..].to_string() }
                     else { l.to_string() }
@@ -2708,7 +3206,7 @@ fn block_to_ast(block: &editor_markdown::Block, text: &str) -> Option<AstNode> {
                 // Strip the opening fence line — and the closing one only when
                 // it is actually a closing fence (unclosed fences keep all
                 // remaining lines as content).
-                let lines: Vec<&str> = raw.lines().collect();
+                let lines = content_lines(&raw);
                 if lines.len() >= 2 {
                     let body_end = if is_closing_fence_line(lines[lines.len() - 1]) {
                         lines.len() - 1
@@ -2721,7 +3219,7 @@ fn block_to_ast(block: &editor_markdown::Block, text: &str) -> Option<AstNode> {
                 }
             } else {
                 // Dedent indented code (4 spaces or 1 tab).
-                raw.lines().map(|l| {
+                content_lines(&raw).iter().map(|l| {
                     if l.starts_with("    ") { l[4..].to_string() }
                     else if l.starts_with('\t') { l[1..].to_string() }
                     else { l.to_string() }
@@ -2952,6 +3450,7 @@ pub fn run() {
             github_pull_requests,
             github_remote_branches,
             open_relative_file,
+            open_url,
             list_directory,
             get_parent_dir,
             copy_file,
@@ -3227,6 +3726,44 @@ mod tests {
         assert_eq!(hunks[0].lines.len(), 3);
     }
 
+    /// Inside a hunk, `--- x`/`+++ x` are content lines: a deleted file line
+    /// `-- x` and an added `++ x`. They must not be swallowed as file headers.
+    #[test]
+    fn test_parse_unified_diff_dashed_content_lines() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n--- deleted text\n+++ added text\n";
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines.len(), 2);
+        assert_eq!(hunks[0].lines[0].kind, "delete");
+        assert_eq!(hunks[0].lines[0].text, "-- deleted text");
+        assert_eq!(hunks[0].lines[0].old_no, Some(1));
+        assert_eq!(hunks[0].lines[1].kind, "insert");
+        assert_eq!(hunks[0].lines[1].text, "++ added text");
+        assert_eq!(hunks[0].lines[1].new_no, Some(1));
+    }
+
+    /// A `diff --git` line ends the previous file's hunk — the next file's
+    /// `---`/`+++` headers must not leak into it as fake delete/insert lines.
+    #[test]
+    fn test_parse_unified_diff_multi_file_headers_not_content() {
+        let diff = concat!(
+            "diff --git a/f1 b/f1\n",
+            "--- a/f1\n+++ b/f1\n@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git a/f2 b/f2\n",
+            "index 111..222 100644\n",
+            "--- a/f2\n+++ b/f2\n@@ -1 +1 @@\n-x\n+y\n"
+        );
+        let hunks = parse_unified_diff(diff);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].lines.len(), 2);
+        assert_eq!(hunks[0].lines[0].text, "a");
+        // f2's `--- a/f2`/`+++ b/f2`/`index` headers must not appear as lines.
+        assert_eq!(hunks[1].lines.len(), 2);
+        assert_eq!(hunks[1].lines[0].text, "x");
+        assert_eq!(hunks[1].lines[0].kind, "delete");
+        assert_eq!(hunks[1].lines[1].kind, "insert");
+    }
+
     /// root_pathspec should prepend the top-level literal pathspec magic.
     #[test]
     fn test_root_pathspec_basic() {
@@ -3239,8 +3776,17 @@ mod tests {
     /// root_pathspec should not double-prefix paths that already carry magic.
     #[test]
     fn test_root_pathspec_already_prefixed() {
-        assert_eq!(root_pathspec(":/src/main.rs"), ":/src/main.rs");
+        assert_eq!(root_pathspec(":(top,literal)src/main.rs"), ":(top,literal)src/main.rs");
         assert_eq!(root_pathspec(":(top)src/main.rs"), ":(top)src/main.rs");
+    }
+
+    /// A repo file literally named `:foo` is legal — the bare `:` is not
+    /// pathspec magic (only `:(`…`)` is), so it must be wrapped to match
+    /// literally instead of being passed through for git to misparse.
+    #[test]
+    fn test_root_pathspec_colon_prefixed_filename() {
+        assert_eq!(root_pathspec(":foo"), ":(top,literal):foo");
+        assert_eq!(root_pathspec(":/weird name"), ":(top,literal):/weird name");
     }
 
     /// root_pathspec should handle empty path.
@@ -3398,14 +3944,18 @@ mod tests {
     /// buffer would duplicate it on render and dirty regen.
     #[test]
     fn test_de_mark_list_item() {
-        assert_eq!(de_mark_list_item("- hello\n- world\n", false), "hello\nworld\n");
-        assert_eq!(de_mark_list_item("- [ ] todo\n- [x] done\n", false), "todo\ndone\n");
+        assert_eq!(de_mark_list_item("- hello\n", false), "hello\n");
+        assert_eq!(de_mark_list_item("- [ ] todo\n", false), "todo\n");
         assert_eq!(de_mark_list_item("- [x] done\n", false), "done\n");
         // Ordered markers.
-        assert_eq!(de_mark_list_item("1. one\n2. two\n", true), "one\ntwo\n");
-        assert_eq!(de_mark_list_item("3) three\n4) four\n", true), "three\nfour\n");
-        // Continuation lines keep their content (indentation reduced by marker width).
+        assert_eq!(de_mark_list_item("1. one\n", true), "one\n");
+        assert_eq!(de_mark_list_item("3) three\n", true), "three\n");
+        // Indented continuation lines lose the content indent.
         assert_eq!(de_mark_list_item("- a\n  cont\n", false), "a\ncont\n");
+        assert_eq!(de_mark_list_item("1. one\n   cont\n", true), "one\ncont\n");
+        // Lazy continuation lines carry less indent than the marker width and
+        // must be kept verbatim — a fixed strip would eat real content bytes.
+        assert_eq!(de_mark_list_item("- a\nlazy\n", false), "a\nlazy\n");
     }
 
     /// move_file should rename/move a file.
@@ -3496,20 +4046,24 @@ mod tests {
         s.push_tab(t4);
 
         // File delete: only the exact file detaches.
-        detach_tabs_for_deleted_path(&mut s, std::path::Path::new("/repo/dir/a.md"));
+        let target = PathBuf::from("/repo/dir/a.md");
+        let canonical = canonical_or_self(&target);
+        detach_tabs_for_deleted_path(&mut s, &target, &canonical);
         assert_eq!(s.tabs[0].file_path, None);
         assert_eq!(s.tabs[1].file_path.as_deref(), Some(std::path::Path::new("/repo/dir/sub/b.md")));
         assert_eq!(s.tabs[2].file_path.as_deref(), Some(std::path::Path::new("/repo/other/c.md")));
 
         // Directory delete: every tab under it detaches; siblings keep paths.
-        detach_tabs_for_deleted_path(&mut s, std::path::Path::new("/repo/dir"));
+        let target = PathBuf::from("/repo/dir");
+        let canonical = canonical_or_self(&target);
+        detach_tabs_for_deleted_path(&mut s, &target, &canonical);
         assert_eq!(s.tabs[1].file_path, None);
         assert_eq!(s.tabs[2].file_path.as_deref(), Some(std::path::Path::new("/repo/other/c.md")));
         // A prefix-similar path (/repo/dirX) must NOT detach.
         let mut t5 = blank();
         t5.file_path = Some(PathBuf::from("/repo/dirX/d.md"));
         s.push_tab(t5);
-        detach_tabs_for_deleted_path(&mut s, std::path::Path::new("/repo/dir"));
+        detach_tabs_for_deleted_path(&mut s, &target, &canonical);
         assert_eq!(s.tabs[4].file_path.as_deref(), Some(std::path::Path::new("/repo/dirX/d.md")));
     }
 
@@ -3836,6 +4390,166 @@ mod tests {
         assert_eq!(tab.buffer.serialize(), b"a:1;b:2;c:3");
     }
 
+    /// The caret anchor after replace-all must live in NEW-document
+    /// coordinates: anchoring to the last match's original offset leaves a
+    /// stored selection past EOF when the replacement shrank the document —
+    /// the next insert-at-caret edit would then be rejected by apply()'s
+    /// bounds check. Anchoring to the first match start is stable (nothing
+    /// before it was edited) in both coordinate systems.
+    #[test]
+    fn replace_all_selection_stays_in_bounds_after_shrink() {
+        let mut state = AppState::default();
+        state.push_tab(DocumentTab {
+            id: 1,
+            buffer: DocumentBuffer::open(
+                b"foo foo foo foo foo foo foo foo".to_vec(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("untitled.md"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: None,
+        });
+        let tab = state.active_tab_mut().expect("pushed tab");
+
+        let text = String::from_utf8_lossy(&tab.buffer.serialize()).to_string();
+        let found = find_matches_in_text(&text, "foo", false, false);
+        let edits: Vec<TextEdit> = found
+            .matches
+            .iter()
+            .rev()
+            .map(|m| TextEdit::replace(ByteRange::new(ByteOffset(m.start), ByteOffset(m.end)), b"x"))
+            .collect();
+        let anchor = ByteOffset(found.matches.first().unwrap().start);
+        tab.buffer
+            .apply(EditTransaction::new(
+                edits,
+                editor_domain::Selection::caret(anchor),
+                editor_domain::Selection::caret(anchor),
+            ))
+            .unwrap();
+
+        let len = tab.buffer.len();
+        let sel = tab.buffer.selection().primary();
+        assert!(sel.focus.0 <= len, "stored selection {sel:?} past EOF (len {len})");
+        // Old anchor (last match start = 28) would have exceeded len (=15).
+        assert_eq!(found.matches.last().unwrap().start, 28);
+        assert_eq!(len, 15);
+    }
+
+    /// Absolute paths must relativize against the repo root before becoming
+    /// pathspecs: a `:(top,literal)`-wrapped absolute path never matches, and
+    /// a verbatim `\\?\` path is unusable as-is. Regression: `git diff_file`
+    /// on a tab repointed after a move returned an empty diff.
+    #[test]
+    fn repo_relative_path_normalizes_absolute_and_relative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_bin = std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string());
+        let ok = std::process::Command::new(&git_bin)
+            .current_dir(dir.path())
+            .args(["init", "-q"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return; // no git on PATH — skip
+        }
+        let git = editor_git::GitCli::open(dir.path()).expect("open");
+
+        // Relative paths pass through (backslashes normalized).
+        assert_eq!(
+            repo_relative_path(&git, "sub\\a.md").unwrap(),
+            "sub/a.md"
+        );
+        // `:(magic)` pathspecs stay untouched.
+        assert_eq!(
+            repo_relative_path(&git, ":(top,literal)x.md").unwrap(),
+            ":(top,literal)x.md"
+        );
+
+        // Absolute path inside the repo becomes relative — in both the plain
+        // and the canonical (`\\?\` on Windows) form.
+        let abs_plain = dir.path().join("sub").join("f.md");
+        let abs_canon = canonical_or_self(&abs_plain);
+        std::fs::create_dir_all(abs_plain.parent().unwrap()).unwrap();
+        std::fs::write(&abs_plain, b"x").unwrap();
+        assert_eq!(repo_relative_path(&git, &abs_plain.to_string_lossy()).unwrap(), "sub/f.md");
+        let canon_str = abs_canon.to_string_lossy().to_string();
+        assert_eq!(repo_relative_path(&git, &canon_str).unwrap(), "sub/f.md");
+
+        // Absolute path outside the repo is rejected, not silently matched.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let outside_path = outside.path().join("o.md").to_string_lossy().to_string();
+        assert!(repo_relative_path(&git, &outside_path).is_err());
+    }
+
+    /// match_window must pad the line range so regex anchors see real
+    /// document context: one byte before (the previous '\n') and one extra
+    /// line after.
+    #[test]
+    fn match_window_pads_anchors() {
+        // "ab\ncd\nef\n" -> line starts [0, 3, 6, 9]
+        let ls: &[u64] = &[0, 3, 6, 9];
+        // Range on the middle line [3,5): window starts at the '\n' (2) and
+        // covers through the NEXT line's end (9), not just 6.
+        assert_eq!(match_window(ls, 9, 3, 5), (2, 9));
+        // First line: can't pad left of 0; right pad covers one more line.
+        assert_eq!(match_window(ls, 9, 0, 2), (0, 6));
+        // Last line / EOF: window end is the document end.
+        assert_eq!(match_window(ls, 9, 6, 8), (5, 9));
+        // Range exactly at a line start still pads left.
+        assert_eq!(match_window(ls, 9, 3, 3), (2, 9));
+    }
+
+    /// With the padded window, `^x` anchored patterns must NOT verify a
+    /// stale mid-document range — in the full document `^` only matches at
+    /// byte 0.
+    #[test]
+    fn anchored_regex_rejects_stale_mid_document_range() {
+        // Document "zz\nxa" — "^x" only legitimately matches at 0. A stale
+        // range claiming [2,3) ("xa" at a line start) must fail.
+        let text = "zz\nxa";
+        let ls: &[u64] = &[0, 3];
+        let (ws, we) = match_window(ls, 5, 3, 4);
+        let win = &text[ws as usize..we as usize];
+        let s = (3 - ws) as usize;
+        let e = (4 - ws) as usize;
+        assert!(!range_still_matches(win, s, e, "^x", false, true).unwrap());
+        // Multiline ^x DOES legitimately match at a line start.
+        assert!(range_still_matches(win, s, e, "(?m)^x", false, true).unwrap());
+        // And a real document-start match still verifies.
+        let (ws, we) = match_window(&[0, 2], 4, 0, 1);
+        let win = &"xa\ny"[ws as usize..we as usize];
+        assert!(range_still_matches(win, 0 - ws as usize, 1 - ws as usize, "^x", false, true).unwrap());
+    }
+
+    /// `x$` must not verify a stale range ending just before a window's
+    /// trailing newline — `$` fires before a final '\n' too.
+    #[test]
+    fn dollar_anchor_rejects_stale_pre_newline_range() {
+        // "ax\nby\n" — "x$" legitimately matches only at EOF (not present
+        // here at all in a full-text search). A stale range [1,2) ending
+        // before the first '\n' must fail.
+        let text = "ax\nby\n";
+        let ls: &[u64] = &[0, 3, 6];
+        let (ws, we) = match_window(ls, 6, 1, 2);
+        let win = &text[ws as usize..we as usize];
+        let s = (1 - ws) as usize;
+        let e = (2 - ws) as usize;
+        assert!(!range_still_matches(win, s, e, "x$", false, true).unwrap());
+        // A match truly at document end still verifies.
+        let text2 = "q\nax";
+        let ls2: &[u64] = &[0, 2];
+        let (ws, we) = match_window(ls2, 4, 3, 4);
+        let win = &text2[ws as usize..we as usize];
+        assert!(range_still_matches(win, (3 - ws) as usize, (4 - ws) as usize, "x$", false, true).unwrap());
+    }
+
     // -----------------------------------------------------------------
     // De-marked child coordinates (block quote / list item children)
     // -----------------------------------------------------------------
@@ -3888,5 +4602,370 @@ mod tests {
             panic!("expected HtmlBlock child")
         };
         assert!(content.contains("<div>hi</div>"), "content was {:?}", content);
+    }
+
+    /// A line of 3+ backticks indented by 4+ spaces is fence CONTENT, not a
+    /// closing fence (CommonMark caps closers at 3 spaces of indent). In an
+    /// unclosed fence ending on such a line, block_to_ast must not mistake it
+    /// for the closer and drop it.
+    #[test]
+    fn block_to_ast_unclosed_fence_keeps_indented_fake_closer() {
+        let src = "```\ncode\n    ```\n";
+        let doc = editor_markdown::parse_with(src.as_bytes(), MarkdownProfile::Gfm).unwrap();
+        let block = &doc.blocks[0];
+        let node = block_to_ast(block, src).unwrap();
+        let AstNode::CodeBlock { content, fenced, .. } = node else {
+            panic!("expected CodeBlock")
+        };
+        assert!(fenced);
+        assert_eq!(content, "code\n    ```");
+    }
+
+    /// The valid closer (up to 3 spaces) is still dropped correctly.
+    #[test]
+    fn block_to_ast_fence_drops_real_closer() {
+        let src = "```\ncode\n   ```\n";
+        let doc = editor_markdown::parse_with(src.as_bytes(), MarkdownProfile::Gfm).unwrap();
+        let node = block_to_ast(&doc.blocks[0], src).unwrap();
+        let AstNode::CodeBlock { content, .. } = node else {
+            panic!("expected CodeBlock")
+        };
+        assert_eq!(content, "code");
+    }
+
+    /// After a working-tree-rewriting git op (checkout/pull/merge/stash/
+    /// reset --hard), clean buffers must reload from disk, dirty buffers
+    /// must keep the user's unsaved edits, and tabs whose file was deleted
+    /// must detach — otherwise autosave silently resurrects removed files.
+    #[test]
+    fn resync_tabs_after_worktree_change_reloads_detaches_and_preserves_dirty() {
+        let dir = std::env::temp_dir().join("womd_test_resync");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f_reload = dir.join("reload.md");
+        let f_dirty = dir.join("dirty.md");
+        let f_gone = dir.join("gone.md"); // deliberately absent on disk
+        std::fs::write(&f_reload, b"new content").unwrap();
+        std::fs::write(&f_dirty, b"disk content").unwrap();
+
+        let mk = |id: u64, path: Option<PathBuf>| DocumentTab {
+            id,
+            buffer: DocumentBuffer::open(
+                b"old".to_vec(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("t"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: path,
+        };
+
+        let mut s = AppState::default();
+        s.push_tab(mk(1, Some(f_reload.clone())));
+        let mut dirty = mk(2, Some(f_dirty.clone()));
+        dirty
+            .buffer
+            .apply(EditTransaction::single(
+                TextEdit::replace(ByteRange::new(ByteOffset(0), ByteOffset(3)), b"edited"),
+                editor_domain::Selection::caret(ByteOffset(0)),
+                editor_domain::Selection::caret(ByteOffset(0)),
+            ))
+            .unwrap();
+        assert!(dirty.buffer.is_dirty());
+        s.push_tab(dirty);
+        s.push_tab(mk(3, Some(f_gone.clone())));
+        s.push_tab(mk(4, Some(PathBuf::from("/outside/repo/x.md"))));
+
+        let changed = resync_tabs_after_worktree_change(&mut s, &dir.to_string_lossy());
+        assert_eq!(changed, 2); // one reload + one detach
+        assert_eq!(s.tabs[0].buffer.serialize(), b"new content".to_vec());
+        // Dirty buffer keeps the user's unsaved edits, path untouched.
+        assert_eq!(s.tabs[1].buffer.serialize(), b"edited".to_vec());
+        assert!(s.tabs[1].file_path.is_some());
+        // Deleted file: tab detached so a later save can't resurrect it.
+        assert_eq!(s.tabs[2].file_path, None);
+        // A file outside the repo root is untouched.
+        assert!(s.tabs[3].file_path.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `de_mark_block_quote` must mirror the parser: `>`-marked lines lose the
+    /// marker, lazy continuation lines keep their bytes verbatim. If a lazy
+    /// line's indent were stripped, a `    ---` continuation would fabricate a
+    /// setext underline in the child buffer and every child span parsed against
+    /// it would read shifted bytes.
+    #[test]
+    fn de_mark_block_quote_keeps_lazy_line_verbatim() {
+        let raw = "> a\n    code\n> b\n";
+        let de = de_mark_block_quote(raw);
+        assert_eq!(de, "a\n    code\nb\n");
+    }
+
+    /// `de_mark_list_item` must mirror parse_list's `min(strip, line_indent)`
+    /// for continuation lines: a lazy line has less indent than `strip`, so a
+    /// fixed strip would delete real content bytes (`lazy` -> `zy`) and
+    /// misalign all child spans.
+    #[test]
+    fn de_mark_list_item_keeps_lazy_line_verbatim() {
+        let raw = "- a\nlazy\n";
+        let de = de_mark_list_item(raw, false);
+        assert_eq!(de, "a\nlazy\n");
+    }
+
+    /// A properly-indented continuation line still loses its content indent.
+    #[test]
+    fn de_mark_list_item_strips_indented_continuation() {
+        let raw = "- a\n    b\n";
+        let de = de_mark_list_item(raw, false);
+        assert_eq!(de, "a\n  b\n");
+    }
+
+    /// End-to-end: a quote containing a lazy indented line must produce a
+    /// single paragraph child whose text carries the line's indent, not a
+    /// fabricated h2 / code block.
+    #[test]
+    fn block_to_ast_quote_lazy_indented_line_stays_paragraph() {
+        let src = "> a\n    ---\n";
+        let doc = editor_markdown::parse_with(src.as_bytes(), MarkdownProfile::Gfm).unwrap();
+        let quote = doc.blocks.iter().find(|b| matches!(b, editor_markdown::Block::BlockQuote(_)))
+            .expect("quote block");
+        let node = block_to_ast(quote, src).unwrap();
+        let AstNode::BlockQuote { children } = node else { panic!("expected BlockQuote") };
+        assert_eq!(children.len(), 1, "lazy line must join the quote's paragraph");
+        assert!(matches!(&children[0], AstNode::Paragraph { .. }), "expected Paragraph child");
+    }
+
+    /// open_url must only reach the OS handler for http/https/mailto —
+    /// rendered Markdown can carry `file:`/`javascript:`/`data:` links that
+    /// must never execute or open local files.
+    #[test]
+    fn open_url_scheme_policy() {
+        assert!(is_safe_url("https://example.com"));
+        assert!(is_safe_url("http://localhost:8080/x"));
+        assert!(is_safe_url("mailto:user@example.com"));
+        assert!(!is_safe_url("file:///etc/passwd"));
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("data:text/html,<script>"));
+        assert!(!is_safe_url("ftp://example.com"));
+        assert!(!is_safe_url("http://"));
+        assert!(!is_safe_url("mailto:"));
+        assert!(!is_safe_url(" https://example.com"));
+        assert!(!is_safe_url("other.md"));
+    }
+
+    /// End-to-end: `- a\nlazy` item's child paragraph text must read `a\nlazy`
+    /// through the de-marked buffer — a fixed-strip de-mark would read `zy`.
+    #[test]
+    fn block_to_ast_list_lazy_line_reads_correct_text() {
+        let src = "- a\nlazy\n";
+        let doc = editor_markdown::parse_with(src.as_bytes(), MarkdownProfile::Gfm).unwrap();
+        let list = doc.blocks.iter().find(|b| matches!(b, editor_markdown::Block::List(_)))
+            .expect("list block");
+        let node = block_to_ast(list, src).unwrap();
+        let AstNode::List { items, .. } = node else { panic!("expected List") };
+        assert!(matches!(&items[0].children[0], AstNode::Paragraph { .. }), "expected Paragraph child");
+        let AstNode::Paragraph { children } = &items[0].children[0] else { unreachable!() };
+        let AstNode::Text { text } = &children[0] else { panic!("expected Text") };
+        assert_eq!(text, "a\nlazy");
+    }
+
+    /// Moving a directory into its own subtree must be rejected up front —
+    /// the OS error is opaque, and a partial move would corrupt the tree.
+    #[test]
+    fn validate_move_dest_rejects_move_into_self() {
+        let dir = std::env::temp_dir().join("womd_test_move_self");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // dir -> dir/sub is a move into itself.
+        assert!(validate_move_dest(&dir, &dir.join("sub")).is_err());
+        // dir -> dir itself counts too (a path is its own prefix).
+        assert!(validate_move_dest(&dir, &dir).is_err());
+        // Moving to a sibling directory is fine.
+        let sibling = std::env::temp_dir().join("womd_test_move_sibling");
+        assert!(validate_move_dest(&dir, &sibling).is_ok());
+        // Files are never containment-checked.
+        let f = dir.join("f.md");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(validate_move_dest(&f, &dir.join("sub")).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The move fallback relies on `copy_dir_recursive` — nested structure
+    /// must arrive byte-identical.
+    #[test]
+    fn copy_dir_recursive_copies_nested_structure() {
+        let src = std::env::temp_dir().join("womd_test_copy_src");
+        let dest = std::env::temp_dir().join("womd_test_copy_dest");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(src.join("sub/deep")).unwrap();
+        std::fs::write(src.join("a.md"), b"aaa").unwrap();
+        std::fs::write(src.join("sub/b.md"), b"bbb").unwrap();
+        std::fs::write(src.join("sub/deep/c.md"), b"ccc").unwrap();
+
+        copy_dir_recursive(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("a.md")).unwrap(), b"aaa");
+        assert_eq!(std::fs::read(dest.join("sub/b.md")).unwrap(), b"bbb");
+        assert_eq!(std::fs::read(dest.join("sub/deep/c.md")).unwrap(), b"ccc");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// A tab whose stored path is canonical (`\\?\C:\...` — produced by
+    /// repoint_tabs_after_move) must still detach when the file is deleted,
+    /// even though canonicalize on the deleted path can no longer succeed.
+    /// The caller must pass the canonical form captured BEFORE deletion.
+    #[test]
+    fn test_detach_tabs_canonical_path_after_delete() {
+        let dir = std::env::temp_dir().join("womd_test_detach_canonical");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("sub/f.md");
+        std::fs::write(&file, b"x").unwrap();
+
+        // Tab stores the canonical form (as a post-move repoint would leave).
+        let canonical_file = canonical_or_self(&file);
+        let mut s = AppState::default();
+        let t = DocumentTab {
+            id: 1,
+            buffer: DocumentBuffer::open(
+                b"x".to_vec(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("t"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: Some(canonical_file.clone()),
+        };
+        s.push_tab(t);
+
+        // Caller captures canonical BEFORE the delete (mirroring
+        // delete_file / git_remove_untracked).
+        let canonical_target = canonical_or_self(&dir.join("sub"));
+        std::fs::remove_dir_all(dir.join("sub")).unwrap();
+
+        // Post-delete canonicalize can no longer resolve — detach must rely
+        // on the pre-captured form.
+        detach_tabs_for_deleted_path(&mut s, &dir.join("sub"), &canonical_target);
+        assert_eq!(s.tabs[0].file_path, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `stable_lossy_text` must keep every byte offset addressable: a bad
+    /// byte maps to exactly one `?`, so parser spans stay aligned with the
+    /// decoded string — unlike `from_utf8_lossy`, which inflates each bad
+    /// byte into the 3-byte U+FFFD and shifts every later offset.
+    #[test]
+    fn stable_lossy_text_preserves_byte_offsets() {
+        // "a\xFFb é \xC3\n" — an isolated bad byte, a real 2-byte char, and a
+        // truncated 2-byte lead at the end.
+        let bytes = b"a\xFFb \xC3\xA9 \xC3\n";
+        let text = stable_lossy_text(bytes);
+        // 1:1 byte mapping: same length, and each bad byte is a single `?`.
+        assert_eq!(text.len(), bytes.len());
+        assert_eq!(text, "a?b \u{E9} ?\n");
+        // The valid 2-byte sequence keeps its byte range, so a parser span
+        // pointing at it still resolves to the same character.
+        assert_eq!(&text[4..6], "\u{E9}");
+        // `from_utf8_lossy` would have produced a DIFFERENT length — the bug
+        // this helper exists to prevent.
+        assert_ne!(String::from_utf8_lossy(bytes).len(), bytes.len());
+    }
+
+    /// Invalid UTF-8 inside the document must not shift AST extraction for
+    /// later inline nodes: `from_utf8_lossy` would move every span after the
+    /// bad byte and produce empty/wrong text.
+    #[test]
+    fn block_to_ast_survives_invalid_utf8_before_inline() {
+        let src: &[u8] = b"bad \xFF byte *em* text\n";
+        let doc = editor_markdown::parse(src, editor_domain::MarkdownProfile::Gfm).unwrap();
+        let stable = stable_lossy_text(src);
+        let node = block_to_ast(&doc.blocks[0], &stable).expect("paragraph AST");
+        let AstNode::Paragraph { children } = node else {
+            panic!("expected paragraph");
+        };
+        let em = children.iter().find_map(|n| match n {
+            AstNode::Emphasis { children } => Some(children),
+            _ => None,
+        }).expect("emphasis node must survive invalid UTF-8 before it");
+        assert!(matches!(&em[..], [AstNode::Text { text }] if text == "em"));
+    }
+
+    /// A bare-CR (classic Mac) block quote: the parser's de-marked buffer
+    /// splits `> a\r> b` into two child lines — `de_mark_block_quote` must
+    /// produce the same buffer or every child span lands on wrong bytes
+    /// (`split_inclusive('\n')` treated the whole quote as one line and kept
+    /// the second `>` marker in the text).
+    #[test]
+    fn block_to_ast_bare_cr_block_quote_extracts_children() {
+        let src: &[u8] = b"> a\r> b\r";
+        let doc = editor_markdown::parse(src, editor_domain::MarkdownProfile::Gfm).unwrap();
+        let stable = stable_lossy_text(src);
+        let node = block_to_ast(&doc.blocks[0], &stable).expect("quote AST");
+        let AstNode::BlockQuote { children } = node else {
+            panic!("expected block quote");
+        };
+        let texts: Vec<&str> = children.iter().filter_map(|n| match n {
+            AstNode::Paragraph { children } => children.iter().find_map(|i| match i {
+                AstNode::Text { text } => Some(text.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        }).collect();
+        assert_eq!(texts, vec!["a\rb"], "child paragraph text must match the parser's de-marked buffer");
+    }
+
+    /// Fenced code with bare-CR line endings must still strip the opener and
+    /// the closer — `.lines()` does not split on lone `\r`, so the content
+    /// used to come back including the fence markers.
+    #[test]
+    fn block_to_ast_bare_cr_fence_strips_markers() {
+        let src: &[u8] = b"```\rbody\r```\r";
+        let doc = editor_markdown::parse(src, editor_domain::MarkdownProfile::Gfm).unwrap();
+        let stable = stable_lossy_text(src);
+        let node = block_to_ast(&doc.blocks[0], &stable).expect("code AST");
+        let AstNode::CodeBlock { content, fenced, .. } = node else {
+            panic!("expected code block");
+        };
+        assert!(fenced);
+        assert_eq!(content, "body");
+    }
+
+    /// `utf8_seq_len` rejects overlong encodings, surrogates, out-of-range
+    /// code points, and truncated tails — each bad byte degrades to `?`.
+    #[test]
+    fn utf8_seq_len_edge_cases() {
+        assert_eq!(utf8_seq_len(b"a"), 1);
+        assert_eq!(utf8_seq_len("é".as_bytes()), 2);
+        assert_eq!(utf8_seq_len("€".as_bytes()), 3);
+        assert_eq!(utf8_seq_len("😀".as_bytes()), 4);
+        // Truncated tails.
+        assert_eq!(utf8_seq_len(&[0xC3]), 0);
+        assert_eq!(utf8_seq_len(&[0xE2, 0x82]), 0);
+        // Overlong encodings.
+        assert_eq!(utf8_seq_len(&[0xC0, 0x80]), 0); // overlong '/'
+        assert_eq!(utf8_seq_len(&[0xE0, 0x80, 0x80]), 0);
+        // UTF-16 surrogates.
+        assert_eq!(utf8_seq_len(&[0xED, 0xA0, 0x80]), 0);
+        // Out of range (> U+10FFFF).
+        assert_eq!(utf8_seq_len(&[0xF4, 0x90, 0x80, 0x80]), 0);
+        // Bare continuation / invalid leads.
+        assert_eq!(utf8_seq_len(&[0x80]), 0);
+        assert_eq!(utf8_seq_len(&[0xFF]), 0);
     }
 }

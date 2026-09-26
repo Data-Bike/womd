@@ -30,6 +30,7 @@ import { ref, computed, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import FileTreeItem from './FileTreeItem.vue';
+import { createDirectoryLoader } from '../lib/directoryLoader.js';
 
 const props = defineProps({
   visible: Boolean,
@@ -69,19 +70,13 @@ const filteredEntries = computed(() => {
   return walk(entries.value);
 });
 
-async function loadEntries(dir) {
-  if (!dir) { entries.value = []; return; }
-  loading.value = true;
-  try {
-    const list = await invoke('list_directory', { dirPath: dir });
-    entries.value = list.map(e => ({ ...e, children: null, expanded: false }));
-  } catch (e) {
-    console.error('loadEntries:', e);
-    entries.value = [];
-  } finally {
-    loading.value = false;
-  }
-}
+// Out-of-order guard lives in the testable helper: a slow list_directory
+// for the previous root must not overwrite the newer root's entries, and a
+// stale request must not clear the newer request's loading flag.
+const loadEntries = createDirectoryLoader(invoke, {
+  setEntries: (v) => { entries.value = v; },
+  setLoading: (v) => { loading.value = v; },
+});
 
 watch(() => props.root, loadEntries, { immediate: true });
 

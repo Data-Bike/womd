@@ -1,5 +1,5 @@
 <template>
-  <div id="toolbar">
+  <div id="toolbar" @mousedown="onToolbarMouseDown">
     <button id="btn-new" title="New document" @click="$emit('new')">New</button>
     <button id="btn-open" title="Open file" @click="$emit('open')">Open</button>
     <button id="btn-save" title="Save" @click="$emit('save')">Save</button>
@@ -64,5 +64,14 @@ function onHeading() {
   const level = parseInt(headingModel.value, 10);
   headingModel.value = '0';
   emit('heading', level);
+}
+
+function onToolbarMouseDown(e) {
+  // Buttons must not steal DOM focus from a block-edit <textarea>: its
+  // blur handler commits the edit and unmounts it, so the click would
+  // apply formatting to a textarea that no longer exists. <select> is
+  // exempt — preventing its mousedown would block the dropdown (its blur
+  // is kept alive via relatedTarget in MarkdownEditor instead).
+  if (e.target.tagName !== 'SELECT') e.preventDefault();
 }
 </script>

@@ -266,11 +266,44 @@ impl PieceTable {
         ));
         let mut new_starts: Vec<u64> = Vec::new();
         for (i, &b) in inserted_bytes.iter().enumerate() {
-            if b == b'\n' {
+            // `\n` always ends a line. `\r` ends a line only when the next
+            // byte is not `\n` — inside `\r\n` the break belongs to the `\n`.
+            // The next byte may sit just past the inserted window.
+            let is_break_end = b == b'\n'
+                || (b == b'\r' && {
+                    inserted_bytes.get(i + 1).copied().or_else(|| {
+                        self.extract_bytes(ByteRange::new(
+                            ByteOffset(inserted_end),
+                            ByteOffset((inserted_end + 1).min(self.total_len)),
+                        ))
+                        .first()
+                        .copied()
+                    }) != Some(b'\n')
+                });
+            if is_break_end {
                 new_starts.push(old_start.saturating_add(i as u64).saturating_add(1));
             }
         }
 
+        // CRLF pairing across the left edit boundary: a bare `\r` at
+        // `old_start - 1` used to end a line at `old_start`. If the byte now
+        // at `old_start` is `\n` (inserted `\n` after `\r`, or a deletion
+        // that joined `\r` to a `\n` after it), the two form ONE terminator
+        // ending at `\n` — the kept start at `old_start` points mid-line.
+        if old_start > 0
+            && kept.last() == Some(&old_start)
+            && self
+                .extract_bytes(ByteRange::new(ByteOffset(old_start - 1), ByteOffset(old_start)))
+                .first()
+                == Some(&b'\r')
+            && old_start < self.total_len
+            && self
+                .extract_bytes(ByteRange::new(ByteOffset(old_start), ByteOffset(old_start + 1)))
+                .first()
+                == Some(&b'\n')
+        {
+            kept.pop();
+        }
         kept.append(&mut new_starts);
         kept.append(&mut tail);
         kept.sort_unstable();
@@ -281,25 +314,40 @@ impl PieceTable {
         // newline) — re-derive it from the byte preceding `old_start`.
         if old_start > 0
             && old_start < self.total_len
-            && self
+            && matches!(
+                self
+                    .extract_bytes(ByteRange::new(ByteOffset(old_start - 1), ByteOffset(old_start)))
+                    .first(),
+                Some(&b'\n') | Some(&b'\r')
+            )
+            // ...unless the break is a `\r` that now pairs with the `\n` at
+            // `old_start` — the CRLF fixup above already dropped that start.
+            && !(self
                 .extract_bytes(ByteRange::new(ByteOffset(old_start - 1), ByteOffset(old_start)))
                 .first()
-                == Some(&b'\n')
+                == Some(&b'\r')
+                && self
+                    .extract_bytes(ByteRange::new(ByteOffset(old_start), ByteOffset(old_start + 1)))
+                    .first()
+                    == Some(&b'\n'))
             && kept.binary_search(&old_start).is_err()
         {
             kept.push(old_start);
             kept.sort_unstable();
         }
-        // Mirror `compute_line_starts`: a document ending in `\n` has no line
-        // start at `total` — the newline does not open an extra empty line.
+        // Mirror `compute_line_starts`: a document ending in a line break
+        // (`\n` or trailing `\r`) has no line start at `total` — the break
+        // does not open an extra empty line.
         if self.total_len > 0
-            && self
-                .extract_bytes(ByteRange::new(
-                    ByteOffset(self.total_len - 1),
-                    ByteOffset(self.total_len),
-                ))
-                .first()
-                == Some(&b'\n')
+            && matches!(
+                self
+                    .extract_bytes(ByteRange::new(
+                        ByteOffset(self.total_len - 1),
+                        ByteOffset(self.total_len),
+                    ))
+                    .first(),
+                Some(&b'\n') | Some(&b'\r')
+            )
         {
             kept.retain(|&v| v != self.total_len);
         }
@@ -310,12 +358,17 @@ impl PieceTable {
 fn compute_line_starts(bytes: &[u8]) -> Vec<u64> {
     let mut starts = vec![0u64];
     for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
+        // A line break ends at `\n` or at a `\r` not followed by `\n` (bare
+        // CR — classic Mac line ending). Inside `\r\n` only the `\n` counts.
+        let is_break_end = b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n'));
+        if is_break_end {
             starts.push((i + 1) as u64);
         }
     }
-    // Remove a trailing empty line start if the file ends with a newline (no extra line).
-    if bytes.last() == Some(&b'\n') {
+    // Remove a trailing empty line start if the file ends with a line break
+    // (no extra line). A trailing `\r` is a bare CR — `bytes.get(len)` is
+    // never `\n` — so the same single check covers `\n`, `\r\n`, and `\r`.
+    if matches!(bytes.last(), Some(&b'\n') | Some(&b'\r')) {
         starts.pop();
     }
     starts
@@ -369,8 +422,19 @@ mod tests {
     /// over the same bytes — across a battery of edits at every position.
     #[test]
     fn line_starts_incremental_matches_fresh_index() {
-        let docs: Vec<&[u8]> = vec![b"", b"a", b"a\n", b"a\nb", b"a\nb\n", b"\n", b"\n\n", b"a\n\nb\n"];
-        let edits: Vec<&[u8]> = vec![b"x", b"x\n", b"\nx", b"\n", b""];
+        let docs: Vec<&[u8]> = vec![
+            b"", b"a", b"a\n", b"a\nb", b"a\nb\n", b"\n", b"\n\n", b"a\n\nb\n",
+            // Bare-CR (classic Mac) and CRLF families — the index must count
+            // `\r` not followed by `\n` as a break too.
+            b"a\rb", b"a\r", b"a\rb\rc", b"a\r\nb", b"a\r\nb\r\nc", b"\r", b"\r\n",
+            b"a\r\n\rb", b"\ra", b"\r\na",
+        ];
+        let edits: Vec<&[u8]> = vec![
+            b"x", b"x\n", b"\nx", b"\n", b"",
+            // Insertions that create, complete, or break CRLF pairs at the
+            // edit boundaries.
+            b"\r", b"\r\n", b"x\r", b"\rx", b"x\ry", b"\n\r",
+        ];
         for doc in &docs {
             let len = doc.len() as u64;
             for pos in 0..=len {
@@ -391,20 +455,23 @@ mod tests {
             // Also check replacements of each byte range.
             for start in 0..len {
                 for end in start..len {
-                    let mut table = PieceTable::from_bytes(doc.to_vec());
-                    table.replace(
-                        ByteRange::new(ByteOffset(start), ByteOffset(end + 1)),
-                        b"z\n",
-                    );
-                    let fresh = PieceTable::from_bytes(table.to_bytes());
-                    assert_eq!(
-                        table.line_starts(),
-                        fresh.line_starts(),
-                        "doc={:?} replace [{},{})",
-                        String::from_utf8_lossy(doc),
-                        start,
-                        end + 1
-                    );
+                    for rep in [&b"z\n"[..], &b"\r"[..], &b"z\r\n"[..]] {
+                        let mut table = PieceTable::from_bytes(doc.to_vec());
+                        table.replace(
+                            ByteRange::new(ByteOffset(start), ByteOffset(end + 1)),
+                            rep,
+                        );
+                        let fresh = PieceTable::from_bytes(table.to_bytes());
+                        assert_eq!(
+                            table.line_starts(),
+                            fresh.line_starts(),
+                            "doc={:?} replace [{},{}) with {:?}",
+                            String::from_utf8_lossy(doc),
+                            start,
+                            end + 1,
+                            String::from_utf8_lossy(rep)
+                        );
+                    }
                 }
             }
         }

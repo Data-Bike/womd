@@ -1,4 +1,6 @@
 /target
 test_large.md
+/test-data/
 crates/editor-ui/.updater_private_key
 crates/editor-ui/.updater_private_key.pub
+crates/editor-ui/e2e/shots/

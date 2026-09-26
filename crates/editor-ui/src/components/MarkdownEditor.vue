@@ -27,6 +27,11 @@
       class="source-view"
     >
       <div v-if="sourceLoading" class="md-block-placeholder">Loading source...</div>
+      <div v-else-if="sourceTooLarge" class="md-block-placeholder" style="padding: 24px;">
+        Source view is unavailable for files larger than {{ sourceTooLargeMb }} MB —
+        the whole document would have to be materialized into the editor.
+        Switch back to Rendered view (which loads blocks lazily) to keep editing.
+      </div>
       <textarea
         v-else
         ref="sourceTextarea"
@@ -36,6 +41,9 @@
         @input="onSourceInput"
         @scroll="syncSourceScrollToGutter"
         @keydown="onSourceKeydown"
+        @keyup="updateCursorFromSource"
+        @click="updateCursorFromSource"
+        @focus="updateCursorFromSource"
       />
     </div>
     <div
@@ -68,7 +76,7 @@
               class="md-block-textarea"
               spellcheck="false"
               @input="onTextareaInput"
-              @blur="exitEdit(false)"
+              @blur="onTextareaBlur"
               @keydown="onKeydown"
               @keyup="updateCursorFromTextarea"
               @click="updateCursorFromTextarea"
@@ -89,7 +97,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { renderBlockHtml } from '../render.js';
 import * as textEditing from '../lib/textEditing.js';
 import { byteOffsetToTextareaIndex } from '../lib/byteOffset.js';
-import { contentChanged, restoreLineEndings } from '../lib/lineEndings.js';
+import { contentChanged, normalizeForTextarea, restoreLineEndings } from '../lib/lineEndings.js';
 
 // ---------------------------------------------------------------------------
 // Overview
@@ -115,7 +123,7 @@ const props = defineProps({
   viewMode: { type: String, default: 'rendered' }, // 'rendered' | 'source'
 });
 
-const emit = defineEmits(['dirty', 'cursor', 'blockCount', 'searchStatus']);
+const emit = defineEmits(['dirty', 'cursor', 'blockCount', 'searchStatus', 'navigate']);
 
 const currentViewMode = ref(props.viewMode);
 watch(() => props.viewMode, (v) => { currentViewMode.value = v; });
@@ -152,6 +160,13 @@ const AVG_CHARS_PER_LINE = 45;
 const RENDER_BUFFER = 800; // px of overscan above/below the viewport
 
 let lastDocId = null;
+// Monotonic generation counter, bumped every time loadDocument rebuilds or
+// clears block state (also on doc change and view switch). Async results
+// captured under an older generation — block data, line numbers, chunk
+// parse syncs — must be discarded: they belong to a document that is no
+// longer current and would otherwise be written into the NEW document's
+// cache at the same indices, showing one document's content inside another.
+let docGeneration = 0;
 let anchorAfterEdit = -1;
 let ignoreScroll = 0;
 let loadingVisible = false;
@@ -195,14 +210,35 @@ function syncSourceScrollToGutter() {
 
 function onSourceInput() {
   emit('dirty', true);
+  updateCursorFromSource();
+}
+
+// The block textarea reports cursor position via updateCursorFromTextarea,
+// but the source-view textarea had no tracking — the status bar froze at
+// whatever position the last block edit left behind.
+function updateCursorFromSource() {
+  const ta = sourceTextarea.value;
+  if (!ta) return;
+  emit('cursor', posToLineCol(ta.value, ta.selectionStart));
 }
 
 // See onKeydown above: Ctrl+S is handled once, globally, by App.vue.
 function onSourceKeydown() {}
 
 async function saveSource() {
+  // Nothing is loaded into the textarea for an oversized document — writing
+  // sourceText (empty) back over [0, totalLen) would destroy the file.
+  // Report success: there is no pending edit to lose, and a false here would
+  // abort the outer Ctrl+S file save for large documents too.
+  if (sourceTooLarge.value) return true;
+  const gen = docGeneration;
   try {
-    const end = totalLen.value || (await invoke('get_parsed_offset'))[1];
+    // Length captured at load — a stale `totalLen` from a previous document
+    // would otherwise replace only a prefix and orphan the tail bytes.
+    const end = sourceDocLen.value || (await invoke('get_parsed_offset'))[1];
+    // A tab switch between the length probe and the full-range replace would
+    // overwrite the *other* document's [0, end) with this one's text.
+    if (gen !== docGeneration) return false;
     // replace_text's Rust parameter is a single struct named `args`; Tauri's
     // IPC looks the payload up by parameter name, so the fields must be
     // nested under an `args` key (unlike insert_text's two scalar params,
@@ -210,12 +246,19 @@ async function saveSource() {
     // The textarea normalizes CRLF to LF — restore the document's original
     // line ending or a source-view save would rewrite the entire file.
     const newText = restoreLineEndings(sourceOriginal.value, sourceText.value);
-    await invoke('replace_text', { args: { start: 0, end, newText } });
+    const res = await invoke('replace_text', { args: { start: 0, end, newText } });
+    if (gen !== docGeneration) return false;
     sourceOriginal.value = newText;
-    emit('dirty', true);
+    // The backend no-op-guards byte-identical replaces (no undo step, not
+    // dirty) — mirror that here or the UI would show a phantom "modified"
+    // for a document the user never changed.
+    if (res?.changed) emit('dirty', true);
     await loadDocument();
+    return true;
   } catch (e) {
     console.error('saveSource:', e);
+    alert('Failed to apply the source-view edit: ' + e);
+    return false;
   }
 }
 
@@ -454,14 +497,40 @@ async function fetchLineNumbers(count) {
 // Document loading
 // ---------------------------------------------------------------------------
 
+// Beyond this size the source view is refused: it would materialize the
+// entire document into a textarea (a lazy document can exceed RAM), and a
+// full-document textarea is unusable UX anyway. Rendered view stays
+// available — it loads only the blocks on screen.
+const SOURCE_VIEW_MAX_BYTES = 64 * 1024 * 1024;
+const sourceTooLarge = ref(false);
+const sourceTooLargeMb = Math.round(SOURCE_VIEW_MAX_BYTES / 1048576);
+// Document length captured at source-load time — `totalLen` is only updated
+// by the rendered view's loadDocument, so it can be stale (belonging to a
+// previous document) when source view saves.
+const sourceDocLen = ref(0);
+
 async function loadSourceView() {
   if (currentViewMode.value !== 'source') return;
   sourceLoading.value = true;
+  const gen = docGeneration;
   try {
-    sourceText.value = await invoke('get_document_text');
-    sourceOriginal.value = sourceText.value;
+    const [, total] = await invoke('get_parsed_offset');
+    if (gen !== docGeneration) return;
+    sourceDocLen.value = total;
+    totalLen.value = total;
+    sourceTooLarge.value = total > SOURCE_VIEW_MAX_BYTES;
+    if (sourceTooLarge.value) {
+      sourceText.value = '';
+      sourceOriginal.value = '';
+      return;
+    }
+    const text = await invoke('get_document_text');
+    if (gen !== docGeneration) return;
+    sourceText.value = text;
+    sourceOriginal.value = text;
   } catch (e) {
     console.error('loadSourceView:', e);
+    if (gen !== docGeneration) return;
     sourceText.value = '';
     sourceOriginal.value = '';
   } finally {
@@ -470,8 +539,10 @@ async function loadSourceView() {
 }
 
 async function loadDocument() {
+  const gen = ++docGeneration;
   if (currentViewMode.value === 'source') {
     await loadSourceView();
+    await refreshSearch();
     return;
   }
   if (!props.doc?.id) {
@@ -504,6 +575,7 @@ async function loadDocument() {
   try {
     const rawMeta = await invoke('get_syntax_tree_meta');
     const [off, total] = await invoke('get_parsed_offset');
+    if (gen !== docGeneration) return; // a newer load won while we awaited
     parsedOffset.value = off;
     totalLen.value = total;
     hasMoreToParse.value = off < total;
@@ -511,15 +583,18 @@ async function loadDocument() {
     heights = new Array(meta.length).fill(0);
     measuredLineSum = 0; measuredPxSum = 0; measuredIndices = new Set();
     startLines = await fetchLineNumbers(meta.length);
+    if (gen !== docGeneration) return;
     rebuildOffsets(0);
     scrollTop.value = isDocChange ? 0 : savedScroll;
     await updateVisibleAndLoad();
+    if (gen !== docGeneration) return;
     // Wait for the first real height measurement before restoring scroll so
     // the browser doesn't clamp to an underestimated totalHeight.
     await new Promise(r => requestAnimationFrame(r));
     await nextTick();
     measureHeights();
     await nextTick();
+    if (gen !== docGeneration) return;
     let target = isDocChange ? 0 : savedScroll;
     if (!isDocChange && anchorIndex >= 0 && anchorIndex < meta.length) {
       target = Math.max(0, offsets[anchorIndex] + anchorOffset - savedClient / 2);
@@ -528,9 +603,53 @@ async function loadDocument() {
   } catch (e) {
     console.error('loadDocument:', e);
   }
+  await refreshSearch();
 }
 
-watch(() => [props.doc?.id, currentViewMode.value], loadDocument);
+// Set while a rejected pending-edit commit reverts the view mode — the
+// reverted assignment re-fires this watcher, and without the flag the
+// retry would alert-loop.
+let viewRevertPending = false;
+watch(() => [props.doc?.id, currentViewMode.value], async (newV, oldV) => {
+  if (viewRevertPending) {
+    // The revert echo: the document didn't change and the previous view's
+    // state is fully intact — nothing to commit or reload.
+    viewRevertPending = false;
+    return;
+  }
+  // A pending edit belongs to the previous view — commit it before
+  // loadDocument resets editing state (it would otherwise be dropped). Only
+  // for a same-document view switch: on a doc change the backend's active
+  // tab is already different, so writing now would corrupt THAT document —
+  // the caller must have committed the edit before switching.
+  if (newV[0] && newV[0] === lastDocId) {
+    try {
+      if (editingIndex.value >= 0) {
+        const ok = await exitEdit();
+        if (ok === false) {
+          // Commit rejected — the session stays open. Revert to the view
+          // that still shows it instead of letting loadDocument wipe the
+          // user's uncommitted text.
+          viewRevertPending = true;
+          currentViewMode.value = oldV?.[1] ?? 'rendered';
+          return;
+        }
+      } else if (oldV?.[1] === 'source' && contentChanged(sourceOriginal.value, sourceText.value)) {
+        // Leaving source view with uncommitted textarea edits — persist
+        // them before the rendered view rebuilds its block state.
+        const ok = await saveSource();
+        if (ok === false) {
+          viewRevertPending = true;
+          currentViewMode.value = oldV?.[1] ?? 'source';
+          return;
+        }
+      }
+    } catch (e) {
+      console.error('watch pending-edit commit:', e);
+    }
+  }
+  await loadDocument();
+});
 
 // ---------------------------------------------------------------------------
 // Scrolling — rendering of already-cached blocks is instant (driven by the
@@ -585,6 +704,7 @@ async function updateVisibleAndLoad() {
   // until the user scrolled again. Snapshot scrollTop so the finally-block
   // can detect the move and re-run for the settled viewport.
   const entryScrollTop = scrollTop.value;
+  const gen = docGeneration;
   try {
     const { start, end } = visibleRange.value;
     const toLoad = [];
@@ -597,20 +717,26 @@ async function updateVisibleAndLoad() {
       toLoad.forEach(i => loadingSet.add(i));
       try {
         const results = await Promise.all(toLoad.map(loadBlockData));
-        for (const data of results) {
-          if (data) cacheSet(data.index, data);
+        // A doc switch mid-flight means `cache` was rebuilt for another
+        // document — writing these entries would show the OLD document's
+        // content at the NEW document's block indices.
+        if (gen === docGeneration) {
+          for (const data of results) {
+            if (data) cacheSet(data.index, data);
+          }
+          dataVersion.value++;
         }
       } finally {
         toLoad.forEach(i => loadingSet.delete(i));
       }
-      dataVersion.value++;
     }
     nextTick(() => requestAnimationFrame(measureHeights));
   } finally {
     loadingVisible = false;
     // The user scrolled while we were loading — re-run once for the settled
-    // range. Bounded: re-runs only when scrollTop actually moved.
-    if (scrollTop.value !== entryScrollTop) {
+    // range. Bounded: re-runs only when scrollTop actually moved. Stale
+    // generations must not re-run: the newer load already scheduled its own.
+    if (scrollTop.value !== entryScrollTop && gen === docGeneration) {
       updateVisibleAndLoad();
     }
   }
@@ -675,13 +801,16 @@ async function maybeParseNextChunk() {
   const parsedEnd = totalHeight.value - (hasMoreToParse.value ? clientHeight.value * 2 : 0);
   if (scrollTop.value < parsedEnd) return;
   chunkParsing.value = true;
+  const gen = docGeneration;
   try {
     const [newOffset, total] = await invoke('parse_next_chunk');
+    if (gen !== docGeneration) return;
     parsedOffset.value = newOffset;
     totalLen.value = total;
     hasMoreToParse.value = newOffset < total;
     const rawMeta = await invoke('get_syntax_tree_meta');
     const newStartLines = await fetchLineNumbers(rawMeta.length);
+    if (gen !== docGeneration) return;
     syncBlockState(rawMeta, newStartLines);
     await updateVisibleAndLoad();
   } catch (e) {
@@ -699,12 +828,25 @@ let mouseDownX = 0;
 let mouseDownY = 0;
 
 function onBlockMouseDown(index, e) {
+  // A right-click must not collapse the current text selection — otherwise
+  // context-menu formatting (Bold etc.) always sees an empty selection and
+  // silently does nothing. The contextmenu event itself still fires.
+  if (e.button === 2) e.preventDefault();
   mouseDownX = e.clientX;
   mouseDownY = e.clientY;
 }
 
 function onBlockClick(index, e) {
-  if (e.target.closest('a')) return;
+  // Links must not follow the default navigation — a relative `other.md`
+  // would try to load inside the editor window (and an external URL would
+  // navigate the whole app away from the document). Intercept: relative
+  // links open as editor tabs, http(s)/mailto open in the system browser.
+  const link = e.target.closest('a');
+  if (link) {
+    e.preventDefault();
+    handleLinkClick(link.getAttribute('href'));
+    return;
+  }
   const dx = Math.abs(e.clientX - mouseDownX);
   const dy = Math.abs(e.clientY - mouseDownY);
   if (dx > 3 || dy > 3) return; // was a drag-selection, not a click
@@ -714,34 +856,92 @@ function onBlockClick(index, e) {
   enterEdit(index);
 }
 
-async function enterEdit(index) {
-  if (editingIndex.value === index) return;
-  if (editingIndex.value >= 0) {
-    await exitEdit(true);
+async function handleLinkClick(href) {
+  if (!href || href === '#') return;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) {
+    // Absolute URL — the backend validates the scheme (http/https/mailto
+    // only; render.js already replaced javascript:/data: with '#').
+    try {
+      await invoke('open_url', { url: href });
+    } catch (err) {
+      console.error('open_url:', err);
+    }
+    return;
   }
-  if (index < 0 || index >= meta.length) return;
+  // Relative link (`other.md`, `dir/page.md#section`): strip fragment/query,
+  // URL-decode, commit the pending block edit (it belongs to the CURRENT tab
+  // — after open_relative_file switches the backend's active tab it would be
+  // applied to the wrong document), then let the backend resolve + open it.
+  const target = href.split('#')[0].split('?')[0];
+  if (!target) return;
+  let path;
+  try {
+    path = decodeURIComponent(target);
+  } catch {
+    path = target;
+  }
+  try {
+    // A rejected commit keeps the session open — navigating away would
+    // discard the uncommitted text.
+    if (editingIndex.value >= 0 && await exitEdit() === false) return;
+    await invoke('open_relative_file', { relativePath: path });
+    emit('navigate');
+  } catch (err) {
+    console.error('open_relative_file:', err);
+  }
+}
+
+let enterEditSeq = 0;
+// `focus: false` is used by find navigation: the match is selected inside
+// the block's textarea, but DOM focus must stay in the find input — the
+// FindBar refocus runs on nextTick while enterEdit's focus lands later and
+// would win, so a second Enter meant "next match" would instead type a
+// newline over the selected match and silently corrupt the document.
+async function enterEdit(index, { focus = true } = {}) {
+  if (editingIndex.value === index) return;
+  // A slow loadBlockData must not win over a newer enterEdit — the stale
+  // resolution would overwrite editSource mid-typing and silently drop the
+  // user's input.
+  const seq = ++enterEditSeq;
+  const gen = docGeneration;
+  if (editingIndex.value >= 0) {
+    await exitEdit();
+    if (seq !== enterEditSeq) return;
+    // exitEdit keeps the session open when the commit is rejected (stale
+    // block) so the user doesn't lose their text — don't overwrite it by
+    // entering a different block.
+    if (editingIndex.value >= 0) return;
+  }
+  if (index < 0 || index >= meta.length || gen !== docGeneration) return;
 
   let data = cache.get(index);
   if (!data) {
     loadingSet.add(index);
     try {
       data = await loadBlockData(index);
-      if (data) cacheSet(index, data);
+      if (data && gen === docGeneration) cacheSet(index, data);
     } finally {
       loadingSet.delete(index);
     }
   }
-  if (!data) return;
+  if (!data || seq !== enterEditSeq || gen !== docGeneration) return;
 
   const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
   editingIndex.value = index;
-  editSource.value = data.source || '';
-  editOriginal.value = editSource.value;
+  // The block span ends with its line separator, but that separator is not
+  // content: rendered as text it becomes a phantom empty last line that the
+  // initial caret lands on (it is placed at value.length), and line-level
+  // formats then hit the empty line — "H2" on `para\n` produced `para\n## `
+  // (a stray empty heading) instead of `## para`. Edit without the trailing
+  // break; exitEdit re-appends the original separator on commit.
+  editSource.value = normalizeForTextarea(data.source || '').replace(/\n$/, '');
+  editOriginal.value = data.source || '';
+  exitEditRejected = false;
   nextTick(() => {
     const el = textareaEl;
     if (el) {
       autoSize(el);
-      el.focus({ preventScroll: true });
+      if (focus) el.focus({ preventScroll: true });
       el.selectionStart = el.value.length;
       el.selectionEnd = el.value.length;
       updateCursorFromTextarea();
@@ -750,26 +950,61 @@ async function enterEdit(index) {
   });
 }
 
-async function exitEdit(force) {
-  if (editingIndex.value < 0) return;
+// Returns true when no edit session remains open afterwards (nothing
+// pending, or the commit succeeded); false when a rejected commit keeps the
+// session open — callers that would reset editing state (view switch,
+// undo, tab switch) must abort instead of discarding the user's text.
+// A block-to-block click fires blur AND click — both call exitEdit, and the
+// second interleaves at the first commit's awaits, re-sending replace_block
+// with pre-commit meta → spurious "block moved" rejection, alert, and a stuck
+// edit session. Serialize the commit: concurrent callers share one in-flight
+// exitEdit instead of racing it.
+let exitEditFlight = null;
+// After a rejected commit the session stays open so no text is lost, but
+// the document won't un-stale by itself — a click-away (blur commit + the
+// click's own exitEdit) used to fire the same doomed commit twice, showing
+// the failure alert twice for one gesture. Disarm retrying until the user
+// actually types again (onTextareaInput re-arms it).
+let exitEditRejected = false;
+async function exitEdit() {
+  if (editingIndex.value < 0) return true;
+  if (exitEditRejected) return false; // session kept, commit still stale
+  if (exitEditFlight) return exitEditFlight;
+  const p = exitEditOnce();
+  exitEditFlight = p;
+  try { return await p; } finally { if (exitEditFlight === p) exitEditFlight = null; }
+}
+
+async function exitEditOnce() {
+  if (editingIndex.value < 0) return true;
   const index = editingIndex.value;
   const old = editOriginal.value;
   // The textarea API normalizes every line break to `\n` — a CRLF block would
   // otherwise always look "changed" and the commit would rewrite the whole
   // block to LF. Compare normalized content; restore the original ending on
   // commit so the edit diff stays minimal.
-  const changed = contentChanged(old, editSource.value);
+  // `old` still carries the block's trailing line separator that enterEdit
+  // strips out of the editable text — compare with it removed on both
+  // sides, or every session looks "changed" and re-commits identical bytes.
+  const stripTail = (s) => normalizeForTextarea(s).replace(/\n$/, '');
+  const changed = stripTail(old) !== stripTail(editSource.value);
 
-  // Replace ONLY when content actually changed: `force` means "commit any
-  // pending edit", not "always rewrite the block". A no-change replace_block
-  // still records an undo step and marks the backend dirty — so clicking
-  // between blocks (enterEdit -> exitEdit(true)) used to flip is_dirty on a
+  // Replace ONLY when content actually changed — a no-change replace_block
+  // still records an undo step and marks the backend dirty, so clicking
+  // between blocks (enterEdit -> exitEdit()) used to flip is_dirty on a
   // document the user never modified.
   if (changed) {
+    const gen = docGeneration;
+    // Re-append the block's trailing line separator (stripped at edit
+    // entry) unless the user ended the text with a break themselves —
+    // dropping it would merge this block's last line into the next one.
+    let newSource = restoreLineEndings(old, editSource.value);
+    const tailSep = old.match(/(\r\n|\r|\n)$/)?.[0];
+    if (tailSep && newSource && !/[\r\n]$/.test(newSource)) newSource += tailSep;
     try {
       await invoke('replace_block', {
         blockIndex: index,
-        newSource: restoreLineEndings(old, editSource.value),
+        newSource,
         // Pin the block identity: lazy chunk parsing may have merged/split
         // the tail block since get_blocks, shifting indices — the backend
         // rejects a stale index instead of overwriting another block.
@@ -778,14 +1013,40 @@ async function exitEdit(force) {
       });
       const rawMeta = await invoke('get_syntax_tree_meta');
       const newStartLines = await fetchLineNumbers(rawMeta.length);
-      anchorAfterEdit = index;
+      // `index` was captured in the OLD document generation — after a doc
+      // switch it must not anchor the NEW document's scroll position. (The
+      // meta sync itself is safe: it reflects whichever tab is active now.)
+      if (gen === docGeneration) anchorAfterEdit = index;
       syncBlockState(rawMeta, newStartLines);
       const data = await invoke('get_block_data', { blockIndex: index });
       if (data) cacheSet(index, data);
       dataVersion.value++;
       emit('dirty', true);
+      await refreshSearch();
     } catch (e) {
+      // A rejected commit (e.g. stale block index after chunk reparse) must
+      // NOT drop the edit session — clearing editingIndex would discard the
+      // user's text silently. Keep the textarea open so they can retry or
+      // copy the content out.
+      exitEditRejected = true;
       console.error('exitEdit replace:', e);
+      // A bare alert() used to trap the user: meta still holds the stale
+      // coordinates, so every retry re-rejects — and since tab switches,
+      // closes, view switches and undo all commit first, there was no way
+      // out of the session at all. Offer a real choice: keep the uncommitted
+      // text, or discard it and resync against the changed document.
+      const keep = confirm(
+        'Failed to apply the edit — the document changed underneath.\n\n' +
+        'OK — keep this editor open with your uncommitted text.\n' +
+        'Cancel — discard the edit and reload the document.\n\n' + e);
+      if (keep) return false;
+      editingIndex.value = -1;
+      editingHeight.value = 0;
+      editSource.value = '';
+      editOriginal.value = '';
+      textareaEl = null;
+      nextTick(() => loadDocument());
+      return true;
     }
   }
 
@@ -806,6 +1067,7 @@ async function exitEdit(force) {
       // as soon as it happens, without a blind fixed-delay guess.
     });
   });
+  return true;
 }
 
 // Ctrl+S is intentionally not handled here: App.vue's global keydown handler
@@ -819,14 +1081,27 @@ function onKeydown(e) {
   if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Escape') {
     e.preventDefault();
-    exitEdit(false);
+    exitEdit();
   } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
-    exitEdit(false);
+    exitEdit();
   }
 }
 
+function onTextareaBlur(e) {
+  // Toolbar buttons / menus are mousedown-prevented so they never steal
+  // focus. The heading <select> can't be (it would suppress the dropdown),
+  // so its focus grab arrives here — keep the edit session alive or the
+  // change handler would apply the heading to a textarea that no longer
+  // exists. Any other blur target commits as usual.
+  if (e.relatedTarget?.id === 'sel-heading') return;
+  exitEdit();
+}
+
 function onTextareaInput(e) {
+  // Fresh user input re-arms the commit after a rejected one — the next
+  // exit may legitimately differ from what was refused before.
+  exitEditRejected = false;
   const el = e.target || textareaEl;
   autoSize(el);
   updateCursorFromTextarea();
@@ -930,11 +1205,13 @@ function sourceLink() {
 
 async function sourceImage() {
   const ta = sourceTextarea.value;
+  const gen = docGeneration;
   const start = ta ? ta.selectionStart : 0;
   const end = ta ? ta.selectionEnd : 0;
   const dataUrl = await pickImageDataUrl();
-  if (!dataUrl) return;
-  if (ta) {
+  // The dialog may outlive this document (tab switch) or this textarea.
+  if (!dataUrl || gen !== docGeneration) return;
+  if (ta && ta.isConnected && ta === sourceTextarea.value) {
     ta.selectionStart = start;
     ta.selectionEnd = end;
   }
@@ -942,7 +1219,7 @@ async function sourceImage() {
 }
 
 function sourceTable() {
-  withSourceText((value, start, end) => textEditing.insertText(value, start, end, textEditing.makeTable()));
+  withSourceText((value, start) => textEditing.insertBlockSnippet(value, start, textEditing.makeTable()));
 }
 
 function findBlockFromSelection() {
@@ -969,6 +1246,7 @@ async function getBlockSource(index) {
 }
 
 async function replaceBlockSource(index, newSource) {
+  const gen = docGeneration;
   try {
     const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
     const result = await invoke('replace_block', {
@@ -977,22 +1255,34 @@ async function replaceBlockSource(index, newSource) {
       expectedStart: meta[index] ? meta[index].start : null,
       expectedEnd: meta[index] ? meta[index].end : null,
     });
+    // A tab switch in-flight reruns loadDocument for the new doc — applying
+    // this chain's meta/cache/anchor here would overwrite its state with a
+    // mix of the old document's coordinates.
+    if (gen !== docGeneration) return true;
     // `changed` is false for byte-identical no-ops — don't mark clean docs dirty.
     if (result?.changed) emit('dirty', true);
     const rawMeta = await invoke('get_syntax_tree_meta');
+    if (gen !== docGeneration) return true;
     const newStartLines = await fetchLineNumbers(rawMeta.length);
+    if (gen !== docGeneration) return true;
     anchorAfterEdit = index;
     syncBlockState(rawMeta, newStartLines);
     const data = await invoke('get_block_data', { blockIndex: index });
+    if (gen !== docGeneration) return true;
     if (data) cacheSet(index, data);
     dataVersion.value++;
+    await refreshSearch();
     await updateVisibleAndLoad();
     nextTick(() => requestAnimationFrame(() => {
       measureHeights();
       restoreScroll(savedScroll);
     }));
   } catch (e) {
+    // Same rule as exitEdit: a rejected replace (e.g. stale block span after
+    // a chunk reparse) must be visible — silently doing nothing leaves the
+    // user convinced the formatting was applied.
     console.error('replaceBlockSource:', e);
+    alert('Could not apply the formatting — the document may have changed underneath. Please try again.\n\n' + e);
   }
 }
 
@@ -1090,10 +1380,14 @@ async function pickImageDataUrl() {
 
 async function insertImageInTextarea(ta) {
   if (!ta) return;
+  const gen = docGeneration;
   const start = ta.selectionStart;
   const end = ta.selectionEnd;
   const dataUrl = await pickImageDataUrl();
-  if (!dataUrl) return;
+  // The dialog may outlive the edit session (tab switch, Escape) — a stale
+  // textarea would insert into unmounted state, or clobber a selection the
+  // user made while the dialog was open.
+  if (!dataUrl || gen !== docGeneration || !ta.isConnected) return;
   ta.selectionStart = start;
   ta.selectionEnd = end;
   applyToTextarea(ta, (value, s, e) => textEditing.makeImage(value, s, e, dataUrl));
@@ -1101,21 +1395,41 @@ async function insertImageInTextarea(ta) {
 
 function insertTableInTextarea(ta) {
   if (!ta) return;
-  applyToTextarea(ta, (value, start, end) => textEditing.insertText(value, start, end, textEditing.makeTable()));
+  applyToTextarea(ta, (value, start) => textEditing.insertBlockSnippet(value, start, textEditing.makeTable()));
+}
+
+// Append a self-contained block at EOF. Dropping `---`/table rows directly
+// onto the line after the last paragraph does NOT start a new block — `---`
+// re-parses as a setext heading underline (turning the last line into a
+// heading!) and table rows merge into the paragraph. The separator blank
+// line is derived from the last block's source, which also fixes the EOL.
+async function appendBlockText(blockText) {
+  const gen = docGeneration;
+  let text = blockText;
+  const lastIdx = meta.length - 1;
+  if (lastIdx >= 0) {
+    const src = await getBlockSource(lastIdx);
+    if (gen !== docGeneration) return;
+    const eol = src.includes('\r\n') ? '\r\n' : '\n';
+    const sep = src.endsWith('\n') ? eol : eol + eol;
+    text = sep + blockText.replace(/\n/g, eol);
+  }
+  await invoke('insert_text', { position: totalLen.value || 0, text });
+  if (gen !== docGeneration) return; // switched docs mid-insert — don't flag the new doc dirty
+  await loadDocument();
+  emit('dirty', true);
 }
 
 async function insertThematicBreak() {
   if (currentViewMode.value === 'source') {
-    withSourceText((value, start) => textEditing.insertAtLineStart(value, start, '---\n'));
+    withSourceText((value, start) => textEditing.insertBlockSnippet(value, start, '---\n'));
     return;
   }
   const ta = getActiveTextarea();
   if (ta) {
-    applyToTextarea(ta, (value, start) => textEditing.insertAtLineStart(value, start, '---\n'));
+    applyToTextarea(ta, (value, start) => textEditing.insertBlockSnippet(value, start, '---\n'));
   } else {
-    await invoke('insert_text', { position: totalLen.value || 0, text: '---\n' });
-    await loadDocument();
-    emit('dirty', true);
+    await appendBlockText('---\n');
   }
 }
 
@@ -1128,9 +1442,7 @@ async function insertCodeBlock() {
   if (ta) {
     applyToTextarea(ta, textEditing.wrapCodeBlock);
   } else {
-    await invoke('insert_text', { position: totalLen.value || 0, text: '```\n\n```\n' });
-    await loadDocument();
-    emit('dirty', true);
+    await appendBlockText('```\n\n```\n');
   }
 }
 
@@ -1141,9 +1453,7 @@ async function insertTable() {
     insertTableInTextarea(ta);
     return;
   }
-  await invoke('insert_text', { position: totalLen.value || 0, text: textEditing.makeTable() });
-  await loadDocument();
-  emit('dirty', true);
+  await appendBlockText(textEditing.makeTable());
 }
 
 function isImagePath(path) {
@@ -1192,7 +1502,9 @@ async function insertImageAtRendered(clientY, imageText) {
   const text = atEnd
     ? `\n${imageText}\n`
     : `\n${imageText}\n\n`;
+  const gen = docGeneration;
   await invoke('insert_text', { position, text });
+  if (gen !== docGeneration) return; // a tab switch already reloaded; don't flag the new doc dirty
   await loadDocument();
   emit('dirty', true);
 }
@@ -1208,6 +1520,7 @@ async function insertImageFromDrop(clientX, clientY, paths) {
   const imagePaths = paths.filter(isImagePath);
   if (!imagePaths.length) return;
 
+  const gen = docGeneration;
   const dataUrls = [];
   for (const path of imagePaths) {
     try {
@@ -1216,7 +1529,9 @@ async function insertImageFromDrop(clientX, clientY, paths) {
       console.error('read_image_file:', e);
     }
   }
-  if (!dataUrls.length) return;
+  // Image reads can be slow (large files) — a tab switch in the meantime must
+  // not let the drop land in the newly active document.
+  if (!dataUrls.length || gen !== docGeneration) return;
   const imageText = dataUrls.map((u) => `![alt text](${u})`).join('\n');
 
   if (currentViewMode.value === 'source') {
@@ -1263,14 +1578,18 @@ async function insertImage() {
     await insertImageInTextarea(ta);
     return;
   }
+  const gen = docGeneration;
   const dataUrl = await pickImageDataUrl();
-  if (!dataUrl) return;
+  // The file dialog can stay open across a tab switch — inserting then would
+  // land the image in a different document than the one it was picked for.
+  if (!dataUrl || gen !== docGeneration) return;
   const position = positionForRenderedInsert();
   const atEnd = position >= (totalLen.value || 0);
   const text = atEnd
     ? `\n![alt text](${dataUrl})\n`
     : `\n![alt text](${dataUrl})\n\n`;
   await invoke('insert_text', { position, text });
+  if (gen !== docGeneration) return; // the switch already reloaded; don't flag the new doc dirty
   await loadDocument();
   emit('dirty', true);
 }
@@ -1327,10 +1646,34 @@ async function applyLineFormat(prefix) {
   // checks and preserve it when rewriting, or `> \r` artifacts appear.
   const body = (line) => (line.endsWith('\r') ? line.slice(0, -1) : line);
   const tail = (line) => (line.endsWith('\r') ? '\r' : '');
-  const allPrefixed = lines.every(line => body(line).startsWith(prefix) || body(line) === '');
+  // Same rule as toggleLinePrefix: for a list prefix, "already prefixed"
+  // means the marker equals `prefix` exactly — a task/bullet marker of a
+  // different kind is swapped, not skipped.
+  const listSwap = textEditing.isListPrefix(prefix);
+  const markerMatch = (b) => b.match(textEditing.LIST_MARKER_RE);
+  const allPrefixed = lines.every(line => {
+    const b = body(line);
+    if (!b) return true;
+    if (!listSwap) return b.startsWith(prefix);
+    const m = markerMatch(b);
+    return !!m && m[0].slice(m[1].length) === prefix;
+  });
   const newSource = allPrefixed
-    ? lines.map(line => (body(line).startsWith(prefix) ? body(line).slice(prefix.length) : body(line)) + tail(line)).join('\n')
-    : lines.map(line => (body(line) ? prefix + body(line) : '') + tail(line)).join('\n');
+    ? lines.map(line => {
+        const b = body(line);
+        if (!listSwap) return (b.startsWith(prefix) ? b.slice(prefix.length) : b) + tail(line);
+        const m = markerMatch(b);
+        return (m ? m[1] + b.slice(m[0].length) : b) + tail(line);
+      }).join('\n')
+    : lines.map(line => {
+        const b = body(line);
+        if (!b) return tail(line);
+        // Swap an existing marker instead of stacking ("- item" + "1. "
+        // -> "1. item", not "1. - item").
+        const m = listSwap && markerMatch(b);
+        if (m) return m[1] + prefix + b.slice(m[0].length) + tail(line);
+        return prefix + b + tail(line);
+      }).join('\n');
   await replaceBlockSource(found.index, newSource);
 }
 
@@ -1347,8 +1690,10 @@ async function applyHeading(level) {
   if (!source) return;
   const stripped = source
     .replace(/^#{1,6}\s+/, '')
-    .replace(/^={2,}\s*$\n?/m, '')
-    .replace(/^-{2,}\s*$\n?/m, '');
+    // Setext underlines are `=`/`-` runs of ANY length (CommonMark: one or
+    // more) — requiring 2+ left a stray `=`/`-` line behind in the new heading.
+    .replace(/^=+\s*$\n?/m, '')
+    .replace(/^-+\s*$\n?/m, '');
   const prefix = level > 0 ? '#'.repeat(level) + ' ' : '';
   await replaceBlockSource(found.index, prefix + stripped);
 }
@@ -1417,6 +1762,7 @@ onUpdated(() => {
 
 onUnmounted(() => {
   if (visibleUpdateRaf) cancelAnimationFrame(visibleUpdateRaf);
+  if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = 0; }
   if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
   if (blockResizeObserver) { blockResizeObserver.disconnect(); blockResizeObserver = null; }
   if (unlistenDragDrop) { unlistenDragDrop(); unlistenDragDrop = null; }
@@ -1426,7 +1772,7 @@ function save() {
   if (currentViewMode.value === 'source') {
     return saveSource();
   }
-  return exitEdit(false);
+  return exitEdit();
 }
 
 function setViewMode(mode) {
@@ -1552,7 +1898,8 @@ async function navigateToMatch(index) {
   if (currentViewMode.value === 'source') {
     const ta = sourceTextarea.value;
     if (!ta) return;
-    ta.focus();
+    // No ta.focus() — same reasoning as the rendered-view path below: the
+    // find input must keep DOM focus so Enter stays "next match".
     ta.selectionStart = byteOffsetToTextareaIndex(sourceText.value, m.start);
     ta.selectionEnd = byteOffsetToTextareaIndex(sourceText.value, m.end);
     scrollMatchIntoView(ta, ta.selectionStart);
@@ -1571,7 +1918,7 @@ async function navigateToMatch(index) {
     // reactively but no textarea ever mounts, and navigation silently does
     // nothing.
     await ensureBlockVisible(blockIndex);
-    await enterEdit(blockIndex);
+    await enterEdit(blockIndex, { focus: false });
     await nextTick();
     if (!textareaEl && editingIndex.value === blockIndex) {
       // Block offsets above/around this index may still be estimates (never
@@ -1596,7 +1943,9 @@ async function navigateToMatch(index) {
   if (!ta) return;
   const blockStart = meta[blockIndex]?.start ?? 0;
   const rawSource = editOriginal.value;
-  ta.focus();
+  // Deliberately no ta.focus(): the selection is shown in the (unfocused)
+  // textarea while the find input keeps DOM focus, so Enter/Shift+Enter keep
+  // cycling matches. The user clicks the block when they actually want to type.
   ta.selectionStart = byteOffsetToTextareaIndex(rawSource, m.start - blockStart);
   ta.selectionEnd = byteOffsetToTextareaIndex(rawSource, m.end - blockStart);
   scrollMatchIntoView(ta, ta.selectionStart);
@@ -1619,6 +1968,21 @@ async function performSearch(query, options, requestId) {
     searchStatus.value = { count: searchMatches.length, index, valid: true, truncated: !!result.truncated };
   } catch (e) {
     console.error('search_document:', e);
+  }
+}
+
+// Re-run the active search after any document mutation (block commit,
+// undo/redo via loadDocument, formatting, inserts). Matches are byte
+// offsets into the buffer, so every edit shifts them — Next/Prev through
+// stale offsets selects the wrong range, and a replace sends coordinates
+// the backend can only reject. The current index is preserved (clamped)
+// so Enter keeps cycling near the same spot instead of restarting at 1.
+async function refreshSearch() {
+  if (!searchQuery) return;
+  const idx = searchStatus.value.index;
+  await performSearch(searchQuery, searchOptions, ++searchRequestId);
+  if (idx >= 0 && searchMatches.length) {
+    searchStatus.value = { ...searchStatus.value, index: Math.min(idx, searchMatches.length - 1) };
   }
 }
 
@@ -1650,7 +2014,9 @@ function searchPrev() { return searchStep(-1); }
 /** Replace the currently-selected match on the backend, then re-search and advance to the next match. */
 async function searchReplaceCurrent(replacement) {
   if (searchStatus.value.index < 0 || !searchMatches.length) return;
-  if (editingIndex.value >= 0) await exitEdit(false); // commit any in-progress block edit first
+  // Commit any in-progress block edit first — a rejected commit keeps the
+  // session open, so don't let loadDocument wipe it.
+  if (editingIndex.value >= 0 && await exitEdit() === false) return;
   const m = searchMatches[searchStatus.value.index];
   const wasIndex = searchStatus.value.index;
   try {
@@ -1667,8 +2033,9 @@ async function searchReplaceCurrent(replacement) {
     // The backend reports `changed: false` for byte-identical no-op
     // replacements — emitting dirty on those would mark a clean document dirty.
     if (result?.changed) emit('dirty', true);
+    // loadDocument re-runs the search (refreshSearch) and clamps the index —
+    // the match list below is already post-replacement.
     await loadDocument();
-    await performSearch(searchQuery, searchOptions, ++searchRequestId);
     if (searchMatches.length) {
       const nextIndex = Math.min(wasIndex, searchMatches.length - 1);
       searchStatus.value = { ...searchStatus.value, index: nextIndex };
@@ -1682,7 +2049,7 @@ async function searchReplaceCurrent(replacement) {
 /** Replace every match in one backend transaction (single undo step). */
 async function searchReplaceAll(replacement) {
   if (!searchQuery) return;
-  if (editingIndex.value >= 0) await exitEdit(false);
+  if (editingIndex.value >= 0 && await exitEdit() === false) return;
   try {
     const result = await invoke('replace_all_in_document', {
       args: {
@@ -1693,8 +2060,9 @@ async function searchReplaceAll(replacement) {
       },
     });
     if (result.count > 0) emit('dirty', true);
+    // loadDocument re-runs the search (refreshSearch) — no explicit
+    // re-search needed here.
     await loadDocument();
-    await performSearch(searchQuery, searchOptions, ++searchRequestId);
   } catch (e) {
     console.error('searchReplaceAll:', e);
   }

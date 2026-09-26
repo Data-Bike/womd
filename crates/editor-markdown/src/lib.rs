@@ -1239,6 +1239,19 @@ mod tests {
         assert_roundtrip(b"# Title\r\n\r\nParagraph with **bold**.\r\n\r\n- item\r\n- [ ] task\r\n");
     }
 
+    /// Bare `\r` (classic Mac line ending) is a line terminator too — a
+    /// CR-only file must split into real blocks, not collapse into one
+    /// giant line. Round-trip still byte-identical.
+    #[test]
+    fn bare_cr_splits_blocks() {
+        let doc = parse(b"# Title\r\r- item\r- two", MarkdownProfile::Gfm).expect("parse");
+        // heading, blank-ish separation, list — not one fused paragraph
+        assert!(doc.blocks.len() >= 2, "bare-CR doc parsed as a single block: {:?}", doc.blocks.len());
+        assert_roundtrip(b"# Title\r\r- item\r- two");
+        // Mixed families keep working.
+        assert_roundtrip(b"a\rb\r\nc\nd");
+    }
+
     /// Deeper nesting (emphasis inside strong inside strikethrough, code inside
     /// emphasis) — every level's span must be document-absolute after rebasing.
     #[test]

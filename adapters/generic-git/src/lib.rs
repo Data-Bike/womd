@@ -131,35 +131,57 @@ impl RepositoryHostAdapter for GenericGitAdapter {
         Err(AdapterError::NotSupported)
     }
     fn remote_branches(&self) -> Result<Vec<RemoteBranch>, AdapterError> {
-        let text = self.git_text(&["branch", "-r", "--list"])?;
+        // `for-each-ref` output format is stable (unlike `git branch` porcelain)
+        // and carries the object name, so each branch reports its real sha.
+        // Format: "<sha> <short-name> [<symref-target>]". Ref names cannot
+        // contain spaces, so a line with a third field is a symref — e.g.
+        // `refs/remotes/origin/HEAD` (local bookkeeping, not a real branch).
+        let text = self.git_text(&[
+            "for-each-ref",
+            "--format=%(objectname) %(refname:short) %(symref)",
+            "refs/remotes",
+        ])?;
         let mut branches = Vec::new();
         for line in text.lines() {
-            let name = line.trim().to_string();
-            if !name.is_empty() && !name.contains(" -> ") {
-                branches.push(RemoteBranch { name, sha: String::new() });
+            let Some((sha, name)) = line.trim().split_once(' ') else {
+                continue;
+            };
+            if sha.is_empty() || name.is_empty() || name.contains(' ') {
+                continue; // malformed line or symref entry (HEAD)
             }
+            branches.push(RemoteBranch { name: name.to_string(), sha: sha.to_string() });
         }
         Ok(branches)
     }
     fn open_remote_url(&self, _target: RemoteUrlTarget) {}
 }
 
-/// Extract a repository name from a remote URL.
-/// Handles HTTPS (`https://host/owner/repo.git`),
-/// SSH (`git@host:owner/repo.git`), and bare names.
+/// Extract `owner/repo` from a remote URL — the same `nameWithOwner` shape the
+/// GitHub adapter reports. Handles HTTPS (`https://host/owner/repo.git`),
+/// scp-style SSH (`git@host:owner/repo.git`), `ssh://`, `file://` and local
+/// paths (which keep as much of the path as is meaningful).
 fn extract_repo_name(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
-    // SSH style: git@github.com:owner/repo.git (no "://" in the URL)
-    if !url.contains("://") {
-        if let Some(idx) = url.rfind(':') {
-            return url[idx + 1..].trim_end_matches(".git").to_string();
-        }
+    if url.is_empty() {
+        return String::new();
     }
-    // HTTPS style: https://host/owner/repo.git
-    url.rsplit('/')
-        .next()
-        .map(|s| s.trim_end_matches(".git").to_string())
-        .unwrap_or_default()
+    let path = if let Some(idx) = url.find("://") {
+        // scheme://host/owner/repo — drop everything through the first '/' of
+        // the authority. `file:///p/a/t/h` has an empty authority, so the
+        // first '/' keeps the whole local path.
+        let rest = &url[idx + 3..];
+        match rest.find('/') {
+            Some(slash) => &rest[slash + 1..],
+            None => rest, // "host" only, no path
+        }
+    } else if let Some(idx) = url.find(':') {
+        // scp-style SSH "user@host:owner/repo" — but a bare Windows drive
+        // "C:\repo" has its ':' at index 1 and is a local path, not SSH.
+        if idx > 1 { &url[idx + 1..] } else { url }
+    } else {
+        url
+    };
+    path.trim_matches(['/', '\\']).trim_end_matches(".git").to_string()
 }
 
 #[cfg(test)]
@@ -221,5 +243,82 @@ mod tests {
             adapter.create_pull_request("t", "b"),
             Err(AdapterError::NotSupported)
         ));
+    }
+
+    #[test]
+    fn extract_repo_name_shapes() {
+        // Same nameWithOwner shape as the GitHub adapter across URL styles.
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/repo.git"),
+            "owner/repo"
+        );
+        assert_eq!(extract_repo_name("git@github.com:owner/repo.git"), "owner/repo");
+        assert_eq!(
+            extract_repo_name("ssh://git@github.com/owner/repo.git"),
+            "owner/repo"
+        );
+        // Host with no owner segment falls back to the bare repo name.
+        assert_eq!(extract_repo_name("https://example.com/repo.git"), "repo");
+        // Trailing slashes and a missing .git suffix are tolerated.
+        assert_eq!(extract_repo_name("https://h/o/repo/"), "o/repo");
+        assert_eq!(extract_repo_name("https://h/o/repo"), "o/repo");
+        // Local file remotes keep a meaningful path instead of going blank.
+        assert_eq!(extract_repo_name("file:///home/u/repo.git"), "home/u/repo");
+        assert!(!extract_repo_name("C:\\repos\\x.git").is_empty());
+        assert_eq!(extract_repo_name(""), "");
+        assert_eq!(extract_repo_name("   "), "");
+    }
+
+    /// A real clone registers `refs/remotes/origin/HEAD` (a symref to the
+    /// default branch). It must be filtered out, and real branches must
+    /// carry their object name — `git branch -r` never populated `sha`.
+    #[test]
+    fn remote_branches_skips_head_symref_and_reports_sha() {
+        if !git_available() {
+            return;
+        }
+        let origin = make_repo();
+        let clone_dir = tempfile::tempdir().expect("clone tempdir");
+        let git = std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string());
+        let out = Command::new(&git)
+            .args([
+                "clone",
+                "-q",
+                origin.path().to_str().expect("utf8 path"),
+                clone_dir.path().to_str().expect("utf8 path"),
+            ])
+            .output()
+            .expect("clone");
+        assert!(out.status.success(), "clone failed: {:?}", out);
+        // The clone has the HEAD symref bookkeeping ref.
+        let has_head = Command::new(&git)
+            .current_dir(clone_dir.path())
+            .args(["rev-parse", "--verify", "refs/remotes/origin/HEAD"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(has_head, "clone should have refs/remotes/origin/HEAD");
+
+        let adapter = GenericGitAdapter::new(clone_dir.path());
+        let branches = adapter.remote_branches().expect("remote_branches");
+        assert!(!branches.is_empty());
+        for b in &branches {
+            assert!(!b.name.ends_with("/HEAD"), "symref leaked: {}", b.name);
+            assert!(b.name.starts_with("origin/"));
+            assert_eq!(b.sha.len(), 40, "sha must be a full object name");
+            assert!(b.sha.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        // The reported sha matches the real remote-tracking ref.
+        let expected = Command::new(&git)
+            .current_dir(clone_dir.path())
+            .args(["rev-parse", "refs/remotes/origin/HEAD"])
+            .output()
+            .expect("rev-parse");
+        let expected_sha = String::from_utf8_lossy(&expected.stdout).trim().to_string();
+        let head_branch = branches
+            .iter()
+            .find(|b| !b.name.ends_with("/HEAD"))
+            .expect("at least one real branch");
+        assert_eq!(head_branch.sha, expected_sha);
     }
 }

@@ -139,13 +139,35 @@ fn temp_name_for(path: &Path) -> String {
     format!("{base}.womd-tmp-{}", std::process::id())
 }
 
+/// Create a fresh temp file next to `path`, refusing to follow a pre-existing
+/// file or symlink at the predictable temp path (`create_new`, not `create`)
+/// — same TOCTOU hardening as the git patch temp file: an attacker who can
+/// drop a `.womd-tmp-<pid>` symlink in the directory must not be able to
+/// redirect the save into an arbitrary location. A stale temp file from a
+/// crashed save is preserved rather than silently overwritten.
+fn create_temp_file(path: &Path) -> StorageResult<(File, std::path::PathBuf)> {
+    for attempt in 0..16u32 {
+        let mut tmp_path = path.to_path_buf();
+        let name = if attempt == 0 {
+            temp_name_for(path)
+        } else {
+            format!("{}.{}", temp_name_for(path), attempt)
+        };
+        tmp_path.set_file_name(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp_path) {
+            Ok(file) => return Ok((file, tmp_path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(StorageError::Io(e.to_string())),
+        }
+    }
+    Err(StorageError::Io("could not allocate a unique temp file name".to_string()))
+}
+
 pub fn atomic_save(path: &Path, bytes: &[u8]) -> StorageResult<()> {
-    let mut tmp_path = path.to_path_buf();
-    tmp_path.set_file_name(temp_name_for(path));
+    let (mut file, tmp_path) = create_temp_file(path)?;
 
     let result = (|| -> StorageResult<()> {
         {
-            let mut file = File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
             file.write_all(bytes).map_err(|e| StorageError::Io(e.to_string()))?;
             // fsync the temp file BEFORE the rename — `File::sync_all` works
             // cross-platform (fsync on POSIX, FlushFileBuffers on Windows). Without
@@ -172,6 +194,58 @@ pub fn atomic_save(path: &Path, bytes: &[u8]) -> StorageResult<()> {
     Ok(())
 }
 
+/// Like `atomic_save`, but pulls bytes through `read_chunk` in bounded
+/// pieces, so the whole document never has to fit in memory at once —
+/// a lazy mmap-backed buffer can exceed RAM (Invariant 6).
+pub fn atomic_save_chunked(
+    path: &Path,
+    total_len: u64,
+    read_chunk: impl Fn(u64, u64) -> Vec<u8>,
+) -> StorageResult<()> {
+    const CHUNK: u64 = 8 * 1024 * 1024;
+    atomic_save_chunked_with(path, total_len, CHUNK, read_chunk)
+}
+
+/// The chunk-size-parameterized core of `atomic_save_chunked` — split out so
+/// tests can exercise multi-chunk stitching without writing >8 MB files.
+fn atomic_save_chunked_with(
+    path: &Path,
+    total_len: u64,
+    chunk_size: u64,
+    read_chunk: impl Fn(u64, u64) -> Vec<u8>,
+) -> StorageResult<()> {
+    if chunk_size == 0 {
+        return Err(StorageError::OutOfRange);
+    }
+    let (mut file, tmp_path) = create_temp_file(path)?;
+
+    let result = (|| -> StorageResult<()> {
+        let mut pos = 0u64;
+        while pos < total_len {
+            let end = pos.saturating_add(chunk_size).min(total_len);
+            let data = read_chunk(pos, end);
+            if data.len() as u64 != end - pos {
+                return Err(StorageError::OutOfRange);
+            }
+            file.write_all(&data).map_err(|e| StorageError::Io(e.to_string()))?;
+            pos = end;
+        }
+        file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Streaming save for partial editing (§57): stitch `original segment | edit segment | …`
 /// from a list of `(source_range, replacement)` patches into a temp file, then atomic
 /// rename. Only the patched regions differ from the original; unchanged regions are copied
@@ -181,9 +255,6 @@ pub fn streaming_save(
     source: &[u8],
     patches: &[(ByteRange, Vec<u8>)],
 ) -> StorageResult<()> {
-    let mut tmp_path = path.to_path_buf();
-    tmp_path.set_file_name(temp_name_for(path));
-
     // Validate patches: sorted, non-overlapping, and within the source bounds.
     // A malformed patch would otherwise panic on `source[s..e]` or silently
     // write a corrupted file.
@@ -198,8 +269,8 @@ pub fn streaming_save(
         prev_end = range.end.0;
     }
 
+    let (mut file, tmp_path) = create_temp_file(path)?;
     let result = (|| -> StorageResult<()> {
-        let mut file = File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
         let mut cursor: u64 = 0;
         for (range, replacement) in patches {
             // Copy unchanged bytes from cursor to the patch start.
@@ -395,5 +466,86 @@ mod tests {
         File::open(&path).unwrap().read_to_end(&mut read_back).unwrap();
         assert_eq!(read_back, b"# Title\n\nHello great world.\n");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Chunked atomic save must stitch every piece back in order — this is
+    /// what lets a >RAM lazy buffer be saved without materializing it.
+    #[test]
+    fn atomic_save_chunked_stitches_all_chunks() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("womd_chunked_save_test.md");
+        let content: Vec<u8> = (0..10_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let calls = std::cell::Cell::new(0usize);
+        atomic_save_chunked_with(&path, content.len() as u64, 1_000, |s, e| {
+            calls.set(calls.get() + 1);
+            content[s as usize..e as usize].to_vec()
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+        // 40 000 bytes / 1 000-byte chunks = exactly 40 reads.
+        assert_eq!(calls.get(), 40);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A non-aligned tail: the last chunk must be truncated to the declared
+    /// length, not padded to a full chunk.
+    #[test]
+    fn atomic_save_chunked_partial_tail() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("womd_chunked_tail_test.md");
+        let content = b"12345";
+        atomic_save_chunked_with(&path, content.len() as u64, 4, |s, e| {
+            content[s as usize..e as usize].to_vec()
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"12345".to_vec());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A read_chunk that returns the wrong byte count must fail the save and
+    /// remove the temp file — a shorted read would silently truncate the
+    /// document.
+    #[test]
+    fn atomic_save_chunked_rejects_short_read() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("womd_chunked_short_test.md");
+        let tmp = path.with_file_name(temp_name_for(&path));
+        let result = atomic_save_chunked_with(&path, 10, 4, |_s, _e| vec![b'x']); // always 1 byte
+        assert!(matches!(result, Err(StorageError::OutOfRange)));
+        assert!(!tmp.exists());
+        assert!(!path.exists());
+    }
+
+    /// Empty document still produces a valid (empty) file via the chunked path.
+    #[test]
+    fn atomic_save_chunked_empty_document() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("womd_chunked_empty_test.md");
+        atomic_save_chunked_with(&path, 0, 4, |_s, _e| panic!("no reads for empty doc"))
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), Vec::<u8>::new());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A pre-existing file at the predictable temp path must NOT be
+    /// overwritten or followed — `create_new` refuses it and the save picks a
+    /// suffixed name instead. The stale file's contents survive untouched.
+    #[test]
+    fn atomic_save_refuses_to_clobber_existing_temp() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("womd_atomic_clobber_test.md");
+        let stale = path.with_file_name(temp_name_for(&path));
+        std::fs::write(&stale, b"precious stale data").unwrap();
+
+        atomic_save(&path, b"new doc").unwrap();
+
+        // The save landed on the real target…
+        assert_eq!(std::fs::read(&path).unwrap(), b"new doc".to_vec());
+        // …and the pre-existing temp file was left exactly as it was.
+        assert_eq!(std::fs::read(&stale).unwrap(), b"precious stale data".to_vec());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&stale);
+        let _ = std::fs::remove_file(path.with_file_name(format!("{}.1", temp_name_for(&path))));
     }
 }

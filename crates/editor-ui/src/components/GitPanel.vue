@@ -262,7 +262,18 @@ const props = defineProps({
   visible: Boolean,
   activeFile: String,
   width: { type: Number, default: 380 },
+  // Called before every worktree-mutating action (checkout, stash, discard,
+  // pull, ...) so the host can commit the pending editor block edit — the
+  // backend resyncs buffers from disk after the op and the pending text,
+  // which lives only in the textarea, would be lost. Returning false aborts
+  // the git action.
+  onBeforeWorktreeOp: { type: Function, default: null },
 });
+
+async function beforeWorktreeOp() {
+  if (typeof props.onBeforeWorktreeOp !== 'function') return true;
+  return (await props.onBeforeWorktreeOp()) !== false;
+}
 
 const tabs = [
   { key: 'changes', label: 'Changes' },
@@ -329,18 +340,32 @@ function lineNo(line) {
   return line.new_no ?? '';
 }
 
+let refreshSeq = 0;
 async function refreshAll() {
   if (!props.visible || !props.activeFile) return;
+  // Switching activeFile mid-refresh would otherwise leave the panel showing
+  // a MIX of the old and new repos' state — apply results atomically, only
+  // if this run is still the newest one.
+  const seq = ++refreshSeq;
   try {
-    repoRoot.value = (await invoke('git_repo_root')) || '';
-    status.value = await invoke('get_git_status');
-    branches.value = await invoke('git_branches');
-    log.value = await invoke('git_log');
-    history.value = await invoke('git_file_history');
+    const root = (await invoke('git_repo_root')) || '';
+    const st = await invoke('get_git_status');
+    const br = await invoke('git_branches');
+    const lg = await invoke('git_log');
+    const hist = await invoke('git_file_history');
+    const sh = await invoke('git_stash_list');
+    const tg = await invoke('git_tags');
+    const rm = await invoke('git_remotes');
+    if (seq !== refreshSeq) return;
+    repoRoot.value = root;
+    status.value = st;
+    branches.value = br;
+    log.value = lg;
+    history.value = hist;
     diff.value = [];
-    stash.value = await invoke('git_stash_list');
-    tags.value = await invoke('git_tags');
-    remotes.value = await invoke('git_remotes');
+    stash.value = sh;
+    tags.value = tg;
+    remotes.value = rm;
   } catch (e) {
     console.error('refreshAll:', e);
   }
@@ -371,11 +396,13 @@ async function unstage(path) {
 }
 async function discard(path) {
   if (!confirm(`Discard changes to ${path}?`)) return;
+  if (!(await beforeWorktreeOp())) return;
   try { await invoke('git_discard_file', { filePath: path }); await refreshAll(); }
   catch (e) { alert('Discard failed: ' + e); }
 }
 async function removeUntracked(path) {
   if (!confirm(`Delete untracked file ${path}?`)) return;
+  if (!(await beforeWorktreeOp())) return;
   try { await invoke('git_remove_untracked', { filePath: path }); await refreshAll(); }
   catch (e) { alert('Remove failed: ' + e); }
 }
@@ -387,6 +414,7 @@ async function doCommit() {
 
 async function checkoutBranch(name) {
   if (!confirm(`Checkout branch "${name}"?`)) return;
+  if (!(await beforeWorktreeOp())) return;
   try { await invoke('git_checkout', { branch: name }); await refreshAll(); }
   catch (e) { alert('Checkout failed: ' + e); }
 }
@@ -403,6 +431,7 @@ async function createBranch() {
 
 async function checkoutCommit(sha) {
   if (!confirm(`Checkout commit ${sha.substring(0,8)}? This detaches HEAD.`)) return;
+  if (!(await beforeWorktreeOp())) return;
   try { await invoke('git_checkout', { branch: sha }); await refreshAll(); }
   catch (e) { alert('Checkout failed: ' + e); }
 }
@@ -487,14 +516,17 @@ async function loadDiff() {
 }
 
 async function stashPush() {
+  if (!(await beforeWorktreeOp())) return;
   try { await invoke('git_stash_push', { message: stashMessage.value || null }); stashMessage.value = ''; await refreshAll(); }
   catch (e) { alert('Stash push failed: ' + e); }
 }
 async function stashPop(index) {
+  if (!(await beforeWorktreeOp())) return;
   try { await invoke('git_stash_pop', { index }); await refreshAll(); }
   catch (e) { alert('Stash pop failed: ' + e); }
 }
 async function stashApply(index) {
+  if (!(await beforeWorktreeOp())) return;
   try { await invoke('git_stash_apply', { index }); await refreshAll(); }
   catch (e) { alert('Stash apply failed: ' + e); }
 }
@@ -525,12 +557,17 @@ async function fetchRemote(remote) {
   catch (e) { alert('Fetch failed: ' + e); }
 }
 async function pullRemote(remote) {
-  const branch = status.value?.branch || 'main';
+  const branch = status.value?.branch;
+  // Detached HEAD reports branch === 'HEAD' — pulling/pushing "HEAD" as a
+  // remote refspec is not what the user means.
+  if (!branch || branch === 'HEAD') { alert('Cannot pull: HEAD is detached'); return; }
+  if (!(await beforeWorktreeOp())) return;
   try { await invoke('git_pull_from_remote', { remote, branch }); await refreshAll(); }
   catch (e) { alert('Pull failed: ' + e); }
 }
 async function pushRemote(remote) {
-  const branch = status.value?.branch || 'main';
+  const branch = status.value?.branch;
+  if (!branch || branch === 'HEAD') { alert('Cannot push: HEAD is detached'); return; }
   try { await invoke('git_push_to_remote', { remote, branch, force: false }); await refreshAll(); }
   catch (e) { alert('Push failed: ' + e); }
 }

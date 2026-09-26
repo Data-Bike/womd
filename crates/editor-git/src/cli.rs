@@ -155,9 +155,14 @@ impl VersionControl for GitCli {
                 continue;
             }
             if rec.starts_with(b"## ") {
-                // Branch record: "## main...origin/main [ahead 1]"
+                // Branch record: "## main...origin/main [ahead 1]"; a detached
+                // HEAD comes through as "## HEAD (no branch)" — normalize to
+                // plain "HEAD" (a valid commit-ish) instead of leaking the
+                // parenthesized label into pull/merge refs where it fails
+                // validation or, worse, prints raw in the UI.
                 let rest = String::from_utf8_lossy(&rec[3..]);
                 let head = rest.split("...").next().unwrap_or("").trim();
+                let head = if head == "HEAD" || head.starts_with("HEAD ") { "HEAD" } else { head };
                 status.head_branch = Some(head.to_string());
                 // Note: ahead/behind is NOT a dirty state — `dirty` means the
                 // working tree has uncommitted changes.
@@ -457,7 +462,9 @@ fn validate_commit_ref(s: &str) -> GitResult<()> {
 /// Validate a git "name" argument (branch/tag/remote names and similar
 /// positional args). Rejects empty strings, leading dashes (which git would
 /// parse as options — `checkout -f` would silently discard local changes), and
-/// control/whitespace characters that can't appear in a ref name anyway.
+/// characters `git check-ref-format` forbids — most critically `*` and `?`,
+/// which turn a `push <branch>:<branch>` refspec into a glob that force-pushes
+/// or fetches EVERY ref, and `:`/whitespace, which change the refspec shape.
 fn validate_name_arg(s: &str, what: &str) -> GitResult<()> {
     if s.is_empty() {
         return Err(GitError::Other(format!("empty {what}")));
@@ -465,7 +472,12 @@ fn validate_name_arg(s: &str, what: &str) -> GitResult<()> {
     if s.starts_with('-') {
         return Err(GitError::Other(format!("invalid {what}: {s:?}")));
     }
-    if s.chars().any(|c| c.is_control() || c == ' ') {
+    if s.contains("..") || s.contains("@{") {
+        return Err(GitError::Other(format!("invalid characters in {what}: {s:?}")));
+    }
+    if s.chars().any(|c| c.is_control() || c == ' '
+        || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\' | '{' | '}' | '"' | '\''))
+    {
         return Err(GitError::Other(format!("invalid characters in {what}: {s:?}")));
     }
     Ok(())
@@ -477,9 +489,12 @@ fn validate_name_arg(s: &str, what: &str) -> GitResult<()> {
 /// names contain metacharacters. A caller-supplied `:`-prefixed magic
 /// pathspec is passed through unchanged.
 fn literal_pathspec(path: &str) -> String {
-    // Pass through caller-supplied magic pathspecs and absolute paths
-    // (git accepts absolute paths literally after `--`).
-    if path.starts_with(':') || Path::new(path).is_absolute() {
+    // Pass through caller-supplied `:(magic)` pathspecs and absolute paths
+    // (git accepts absolute paths literally after `--`). A bare `:`-prefixed
+    // name is NOT magic — only `:(`, `:/`, `:!`, `:^` forms are — so a real
+    // file named `:foo` must be wrapped in `:(top,literal)` to match, not
+    // passed through for git to reject as unsupported magic.
+    if path.starts_with(":(") || Path::new(path).is_absolute() {
         path.to_string()
     } else {
         format!(":(top,literal){path}")
@@ -2059,6 +2074,19 @@ mod tests {
         assert!(branch == "HEAD" || branch.is_empty(), "should be detached HEAD after checking out tag, got: {}", branch);
     }
 
+    #[test]
+    fn status_detached_head_normalizes_branch() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        repo.create_tag("v1.0", None).expect("create tag");
+        repo.checkout(Revision::Tag("v1.0".to_string())).expect("checkout tag");
+        // `git status -b` reports "## HEAD (no branch)" when detached — the UI
+        // must see a plain "HEAD" commit-ish, not the parenthesized label
+        // (which would fail ref validation if passed to pull/merge).
+        let st = repo.status().expect("status");
+        assert_eq!(st.head_branch.as_deref(), Some("HEAD"));
+    }
+
     // ── Reset: comprehensive ────────────────────────────────────────────────
 
     #[test]
@@ -2900,5 +2928,49 @@ mod tests {
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].path, "new.md");
         assert_eq!(diffs[0].old_path, Some("old.md".to_string()));
+    }
+
+    /// Refname-illegal characters must be rejected before they reach a git
+    /// argv — `*`/`?` in a `push <b>:<b>` refspec glob-expand to EVERY ref
+    /// (a `push --force origin *` would force-push all branches), and `:`
+    /// changes the refspec shape entirely.
+    #[test]
+    fn validate_name_arg_rejects_glob_and_refspec_chars() {
+        for bad in ["*", "?", "a:b", "a~1", "a^2", "a[b", "a\\b", "a..b", "a@{b}", "-x", "a b", ""] {
+            assert!(
+                validate_name_arg(bad, "branch name").is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        for good in ["main", "feature/x", "release-1.0", "v2.0", "dependabot/npm+x"] {
+            assert!(
+                validate_name_arg(good, "branch name").is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    /// `push_to_remote` builds `<branch>:<branch>` — a glob or colon in the
+    /// name must fail validation instead of smuggling a mass-push refspec.
+    #[test]
+    fn push_to_remote_rejects_glob_branch() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        assert!(repo.push_to_remote("origin", "*", false).is_err());
+        assert!(repo.push_to_remote("origin", "a:b", false).is_err());
+        assert!(repo.push_to_remote("origin", "main?", true).is_err());
+        assert!(repo.push_to_remote("*", "main", false).is_err());
+    }
+
+    /// A repo file literally named `:foo` is legal — the bare `:` prefix is
+    /// not pathspec magic (only `:(`…`)` is), so `literal_pathspec` must wrap
+    /// it rather than pass it through for git to reject as bad magic.
+    #[test]
+    fn literal_pathspec_wraps_colon_prefixed_filename() {
+        assert_eq!(literal_pathspec(":foo"), ":(top,literal):foo");
+        assert_eq!(literal_pathspec(":/x"), ":(top,literal):/x");
+        // Caller-constructed magic still passes through unchanged.
+        assert_eq!(literal_pathspec(":(top,literal)a.md"), ":(top,literal)a.md");
+        assert_eq!(literal_pathspec(":(top)a.md"), ":(top)a.md");
     }
 }

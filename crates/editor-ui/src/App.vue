@@ -16,8 +16,8 @@
       @find="findText"
       @find-next="findNext"
       @find-replace="findReplace"
-      @view-rendered="viewMode = 'rendered'"
-      @view-source="viewMode = 'source'"
+      @view-rendered="setViewMode('rendered')"
+      @view-source="setViewMode('source')"
       @toggle-tree="toggleTree"
       @toggle-git="toggleGit"
       @heading="applyHeading"
@@ -62,8 +62,8 @@
       @code-block="insertCodeBlock"
       @table="insertTable"
       @image="insertImage"
-      @view-rendered="viewMode = 'rendered'"
-      @view-source="viewMode = 'source'"
+      @view-rendered="setViewMode('rendered')"
+      @view-source="setViewMode('source')"
       @toggle-tree="toggleTree"
       @toggle-git="toggleGit"
       @settings="settingsOpen = true"
@@ -134,6 +134,7 @@
         @cursor="cursorPos = $event"
         @block-count="blockCount = $event"
         @search-status="findStatus = $event"
+        @navigate="onEditorNavigate"
       />
       <div v-else id="editor-container" class="welcome">
         <div class="md-block-placeholder" style="padding:24px;color:var(--fg-muted);text-align:center">
@@ -152,6 +153,7 @@
         :visible="gitVisible"
         :active-file="activeFilePath"
         :width="gitWidth"
+        :on-before-worktree-op="commitEditorPending"
       />
     </div>
 
@@ -174,6 +176,7 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { open, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { listen } from '@tauri-apps/api/event';
 import { check } from '@tauri-apps/plugin-updater';
 import MarkdownEditor from './components/MarkdownEditor.vue';
 import ToolBar from './components/ToolBar.vue';
@@ -187,6 +190,7 @@ import HelpModal from './components/HelpModal.vue';
 import MenuBar from './components/MenuBar.vue';
 import ContextMenu from './components/ContextMenu.vue';
 import FindBar from './components/FindBar.vue';
+import { detectLineEndingSampled } from './lib/lineEndings.js';
 
 const tabs = ref([]);
 const activeTabId = ref(0);
@@ -232,9 +236,14 @@ function parentDir(p) {
   return parts.join(sep);
 }
 
+let refreshTabsSeq = 0;
 async function refreshTabs() {
+  const seq = ++refreshTabsSeq;
   try {
     const list = await invoke('get_tabs');
+    // A newer refresh (e.g. rapid tab switch) supersedes this response —
+    // applying the older list would briefly resurrect stale tab state.
+    if (seq !== refreshTabsSeq) return;
     tabs.value = list.tabs.map(t => ({
       id: t.id,
       name: t.file_name,
@@ -267,6 +276,11 @@ function onDirty() {
 
 async function newDoc() {
   try {
+    // Commit any pending block edit first — it belongs to the CURRENT tab;
+    // after the switch its index/span would belong to a different document.
+    // A false result means the commit was rejected and the edit session is
+    // still open — switching now would silently discard it.
+    if (await editorRef.value?.save?.() === false) return;
     await invoke('new_document');
     await refreshTabs();
   } catch (e) {
@@ -288,11 +302,22 @@ async function openFileDialog() {
 async function openFile(path) {
   if (!path) return;
   try {
+    if (await editorRef.value?.save?.() === false) return;
     await invoke('open_document', { path });
     await refreshTabs();
   } catch (e) {
     console.error('openFile:', e);
     alert('Failed to open: ' + e);
+  }
+}
+
+// The editor opened a different file itself (relative Markdown link click) —
+// the backend already switched its active tab, we just resync ours.
+async function onEditorNavigate() {
+  try {
+    await refreshTabs();
+  } catch (e) {
+    console.error('onEditorNavigate:', e);
   }
 }
 
@@ -309,7 +334,9 @@ async function saveFile() {
   if (!activeDoc.value) return;
   try {
     if (editorRef.value?.save) {
-      await editorRef.value.save();
+      // A rejected pending-edit commit must abort the save: the user expects
+      // the file to contain the text they just typed.
+      if (await editorRef.value.save() === false) return;
     }
     let path = activeFilePath.value || null;
     if (!path) {
@@ -334,7 +361,7 @@ async function saveFileAs() {
     const path = await pickSavePath();
     if (!path) return;
     if (editorRef.value?.save) {
-      await editorRef.value.save();
+      if (await editorRef.value.save() === false) return;
     }
     await invoke('save_document', { path });
     const t = activeTab.value;
@@ -348,6 +375,11 @@ async function saveFileAs() {
 
 async function undo() {
   try {
+    // A pending block edit isn't in the undo history yet — commit it first
+    // so undo/redo operates on real transactions instead of discarding it.
+    // If the commit was rejected, keep the session instead of wiping it
+    // via loadDocument.
+    if (await editorRef.value?.save?.() === false) return;
     await invoke('undo');
     await editorRef.value?.loadDocument?.();
     await refreshTabs();
@@ -358,6 +390,7 @@ async function undo() {
 
 async function redo() {
   try {
+    if (await editorRef.value?.save?.() === false) return;
     await invoke('redo');
     await editorRef.value?.loadDocument?.();
     await refreshTabs();
@@ -368,6 +401,11 @@ async function redo() {
 
 async function switchTab(tabId) {
   try {
+    // Commit the pending block edit while its tab is still active — after
+    // the switch the block index would point into a different document. A
+    // rejected commit keeps the session open: stay on this tab so the user
+    // keeps their uncommitted text.
+    if (await editorRef.value?.save?.() === false) return;
     await invoke('switch_tab', { tabId });
     await refreshTabs();
   } catch (e) {
@@ -376,6 +414,18 @@ async function switchTab(tabId) {
 }
 
 async function closeTab(tabId) {
+  // Commit the pending block edit BEFORE the dirty check: (a) it belongs to
+  // the currently-active tab — commit while that tab is still active — and
+  // (b) a document whose only changes are uncommitted textarea edits reads
+  // clean, so the confirm must run after the commit marks it dirty.
+  try {
+    const committed = await editorRef.value?.save?.();
+    // A rejected commit keeps the edit session alive — closing the ACTIVE
+    // tab would discard that uncommitted text without any confirmation.
+    if (committed === false && tabId === activeTabId.value) return;
+  } catch (e) {
+    console.error('closeTab pending-edit commit:', e);
+  }
   const tab = tabs.value.find(t => t.id === tabId);
   // Closing a dirty tab discards its unsaved buffer for good — the backend
   // drops the DocumentBuffer on close_tab — so confirm first (autosave may
@@ -424,8 +474,26 @@ function toggleTree() {
 function toggleGit() {
   gitVisible.value = !gitVisible.value;
 }
+
+// Worktree-mutating git actions (checkout/merge/stash/discard/...) must
+// commit the pending block edit BEFORE the backend resyncs buffers — the
+// pending text lives only in the textarea and would be lost otherwise.
+// Returns false when the commit was rejected and the op must be aborted.
+async function commitEditorPending() {
+  const committed = await editorRef.value?.save?.();
+  return committed !== false;
+}
+async function setViewMode(mode) {
+  if (mode === viewMode.value) return;
+  // Commit any pending block/source edit BEFORE switching views — the
+  // editor's watcher would otherwise try to commit into the new view, and
+  // a rejected commit must abort the switch so the session isn't wiped.
+  if (await editorRef.value?.save?.() === false) return;
+  viewMode.value = mode;
+}
+
 function toggleView() {
-  viewMode.value = viewMode.value === 'rendered' ? 'source' : 'rendered';
+  setViewMode(viewMode.value === 'rendered' ? 'source' : 'rendered');
 }
 
 function onAppContextMenu(e) {
@@ -565,13 +633,18 @@ function onGlobalKeydown(e) {
   if (!mod || e.altKey) return;
   const key = e.key.toLowerCase();
 
+  // Inside a plain <input> (FindBar fields, dialogs), Ctrl+Z/Y belong to the
+  // field's own native undo stack — intercepting them would run a DOCUMENT
+  // undo behind the user's back.
+  const inPlainInput = document.activeElement && document.activeElement.tagName === 'INPUT';
+
   // Shortcuts that must win even while typing in a document textarea.
   switch (key) {
     case 'n': e.preventDefault(); newDoc(); return;
     case 'o': e.preventDefault(); openFileDialog(); return;
     case 's': e.preventDefault(); (e.shiftKey ? saveFileAs() : saveFile()); return;
-    case 'z': e.preventDefault(); (e.shiftKey ? redo() : undo()); return;
-    case 'y': e.preventDefault(); redo(); return;
+    case 'z': if (!inPlainInput) { e.preventDefault(); (e.shiftKey ? redo() : undo()); } return;
+    case 'y': if (!inPlainInput) { e.preventDefault(); redo(); } return;
     case 'f': e.preventDefault(); findText(); return;
     case 'h': e.preventDefault(); findReplace(); return;
   }
@@ -586,27 +659,28 @@ function onGlobalKeydown(e) {
 
 
 
-function detectLineEnding(text) {
-  if (text.includes('\r\n')) return 'CRLF';
-  if (text.includes('\r')) return 'CR';
-  return 'LF';
-}
-
+let lineEndingSeq = 0;
 async function updateLineEnding() {
   if (!activeDoc.value) {
     lineEnding.value = 'LF';
     return;
   }
+  const seq = ++lineEndingSeq;
   try {
     const [, total] = await invoke('get_parsed_offset');
     if (total > 100_000) {
-      lineEnding.value = 'LF';
+      if (seq === lineEndingSeq) lineEnding.value = 'LF';
       return;
     }
     const text = await invoke('get_document_text');
-    lineEnding.value = detectLineEnding(text.substring(0, 4096));
+    // A tab switch mid-flight would otherwise label this document with the
+    // previous document's (or a mix of both) line-ending detection.
+    if (seq !== lineEndingSeq) return;
+    // The 4096-char prefix may cut a '\r\n' pair in half; the sampled helper
+    // drops the dangling '\r' instead of misreading it as a bare CR.
+    lineEnding.value = detectLineEndingSampled(text);
   } catch (e) {
-    lineEnding.value = 'LF';
+    if (seq === lineEndingSeq) lineEnding.value = 'LF';
   }
 }
 
@@ -652,6 +726,9 @@ function scheduleAutosave() {
   if (!autosave.value) return;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   autosaveTimer = setTimeout(async () => {
+    // Re-check inside the callback too: the user may have toggled autosave
+    // off during the 30s window — a stale timer must not save anyway.
+    if (!autosave.value) return;
     if (activeIsDirty.value && activeFilePath.value) {
       try { await saveFile(); } catch (e) { console.error('autosave:', e); }
     }
@@ -679,8 +756,30 @@ async function checkForUpdate() {
   }
 }
 
+let unlistenWorktree = null;
+
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown);
+  // Git commands (checkout/pull/merge/stash/reset --hard/...) rewrite files
+  // on disk; the backend resyncs open buffers and fires worktree-changed —
+  // reload the visible document so it doesn't keep showing stale blocks.
+  unlistenWorktree = await listen('worktree-changed', async () => {
+    try {
+      // Do NOT commit a pending block edit here — the backend already
+      // replaced the buffer, so its index/span belong to another snapshot.
+      // The edit is unrecoverable; at least tell the user before the
+      // textarea disappears instead of silently vanishing their text.
+      const openEdit = editorRef.value?.editingBlockIndex;
+      const editingIdx = openEdit?.value ?? openEdit;
+      if (typeof editingIdx === 'number' && editingIdx >= 0) {
+        alert('The document changed on disk (git operation). The uncommitted edit in the open block could not be applied to the new content.');
+      }
+      await editorRef.value?.loadDocument?.();
+      await refreshTabs();
+    } catch (e) {
+      console.error('worktree-changed:', e);
+    }
+  });
   await refreshTabs();
   if (!tabs.value.length) {
     try {
@@ -697,5 +796,6 @@ onUnmounted(() => {
   if (autosaveTimer) clearTimeout(autosaveTimer);
   if (resizeHandler) window.removeEventListener('resize', resizeHandler);
   window.removeEventListener('keydown', onGlobalKeydown);
+  if (unlistenWorktree) unlistenWorktree();
 });
 </script>
