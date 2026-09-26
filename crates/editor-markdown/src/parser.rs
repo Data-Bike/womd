@@ -235,43 +235,46 @@ fn try_atx_heading(bytes: &[u8], line: Line, stripped: &[u8], refs: &Refs) -> Op
             return None;
         }
     }
-    let rest = trim_start_bytes(&stripped[hashes..]);
-    // Closing hashes.
+    // Heading content sits after the opening hashes + following whitespace and
+    // before the optional closing-hash run. `content` is a subslice of
+    // `stripped`, so the inline parser must be bounded to exactly that region —
+    // otherwise the parsed Text nodes absorb the space after `#` and the
+    // closing `##` run, and dirty regeneration would emit them twice.
+    let after_hashes = &stripped[hashes..];
+    let rest = trim_start_bytes(after_hashes);
     let mut close = 0usize;
-    let mut content_end = rest.len();
-    // Count trailing hashes preceded by space.
-    if !rest.is_empty() {
-        let trimmed = trim_end_bytes(rest);
-        let trailing = &rest[trimmed.len()..];
-        if !trailing.is_empty() && !trimmed.ends_with(b" #") && trimmed.ends_with(b"#") {
-            // only count closing hashes if they are all trailing after a space
-        }
-        // Count trailing run of '#' (with only spaces before).
-        let mut t = rest.len();
-        while t > 0 && rest[t - 1] == b'#' {
+    let mut content = trim_end_bytes(rest);
+    {
+        // Count a trailing run of '#' separated from content by space/tab.
+        let mut t = content.len();
+        while t > 0 && content[t - 1] == b'#' {
             t -= 1;
         }
-        // require at least one space before the closing run
-        if t < rest.len() && t > 0 && (rest[t - 1] == b' ' || rest[t - 1] == b'\t') {
-            close = rest.len() - t;
-            content_end = t - 1; // drop the space before closing hashes
-        } else if t == 0 {
-            // all hashes, no content
-            close = rest.len();
-            content_end = 0;
+        if t < content.len() {
+            if t == 0 {
+                // All hashes, no content.
+                close = content.len();
+                content = &content[..0];
+            } else if content[t - 1] == b' ' || content[t - 1] == b'\t' {
+                close = content.len() - t;
+                content = trim_end_bytes(&content[..t - 1]);
+            }
         }
     }
-    let _ = content_end;
     let ind = leading_indent(line_content(bytes, line));
-    let content_offset = line.start + ind as u64 + hashes as u64;
-    let inlines = parse_inlines(bytes, content_offset, line.content_end, refs);
+    // Offset of `content` inside `stripped` (rest is a suffix of after_hashes,
+    // content a prefix of rest).
+    let content_rel = hashes + (after_hashes.len() - rest.len());
+    let content_start = line.start + ind as u64 + content_rel as u64;
+    let content_end = content_start + content.len() as u64;
+    let inlines = parse_inlines(bytes, content_start, content_end, refs);
     let span = SourceSpan::new(ByteOffset(line.start), ByteOffset(line.end));
     Some(Heading {
         meta: NodeMeta { span, dirty: false },
         level: hashes as u8,
         style: HeadingStyle::Atx,
         atx_open_hashes: hashes as u8,
-        atx_close_hashes: close as u8,
+        atx_close_hashes: close.min(u8::MAX as usize) as u8,
         setext_underline_len: 0,
         inlines,
     })
@@ -329,9 +332,16 @@ fn parse_fenced_code(
         let c = line_content(bytes, lines[j]);
         let ind = leading_indent(c);
         let s = &c[ind.min(c.len())..];
-        if s.starts_with(&vec![fence_char; fence_len as usize])
-            && s.iter().take_while(|&&b| b == fence_char).count() >= fence_len as usize
-            && s[fence_len as usize..].iter().all(|&b| b == b' ' || b == b'\t')
+        // Closing fence: a run of >= fence_len identical markers, indented at
+        // most 3 spaces, followed only by whitespace. The run length must be
+        // measured first — slicing at `fence_len` would include the extra
+        // markers of a longer run and reject a valid closer (CommonMark: a
+        // longer run still closes). A 4+ space indent is code content, not a
+        // closer.
+        let run = s.iter().take_while(|&&b| b == fence_char).count();
+        if ind <= 3
+            && run >= fence_len as usize
+            && s[run..].iter().all(|&b| b == b' ' || b == b'\t')
         {
             break;
         }
@@ -386,19 +396,149 @@ fn parse_indented_code(bytes: &[u8], lines: &[Line], idx: usize, base_indent: u3
     (Block::CodeBlock(CodeBlock { meta: NodeMeta { span, dirty: false }, fenced: false, fence_char: 0, fence_len: 0, info_string: String::new() }), j)
 }
 
+/// ATX-heading-like: 1–6 `#` followed by space/tab/EOL. `#x` is NOT a
+/// heading — CommonMark requires whitespace after the run.
+fn is_atx_like(s: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < s.len() && i < 6 && s[i] == b'#' {
+        i += 1;
+    }
+    i > 0 && (i == s.len() || s[i] == b' ' || s[i] == b'\t')
+}
+
+/// Does `s` start a block that interrupts a paragraph — i.e. can a
+/// `>`-less / unindented line never be a lazy continuation? Setext
+/// underlines are deliberately NOT here: they are paragraph continuations.
+/// Exported for editor-core's lazy-chunk boundary detection, which applies
+/// the same rule when deciding whether a line continues the previous block.
+pub fn line_starts_new_block(s: &[u8]) -> bool {
+    parse_fence_open(s).is_some()
+        || is_atx_like(s)
+        || list_marker(s).is_some()
+        || (is_thematic_break(s) && !is_setext_underline(s))
+        || (s.starts_with(b"<") && looks_like_html_block(s))
+}
+
+/// Whether the de-marked content line `s` leaves the deepest open block as a
+/// paragraph — i.e. whether a following unmarked line could lazily continue
+/// it. Containers (`>`, list markers) defer the answer to their inner
+/// content; leaf blocks (fences, headings, thematic breaks, HTML, table
+/// delimiter rows, setext underlines) close it.
+fn deepest_is_paragraph(s: &[u8], depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let ind = leading_indent(s);
+    let c = &s[ind.min(s.len())..];
+    if c.is_empty() {
+        return false;
+    }
+    // Indented code is a leaf block — its lines can't lazily continue a
+    // paragraph that came before them.
+    if ind >= 4 {
+        return false;
+    }
+    if c.first() == Some(&b'>') {
+        let inner = &c[1..];
+        let inner = if inner.first() == Some(&b' ') { &inner[1..] } else { inner };
+        return deepest_is_paragraph(inner, depth + 1);
+    }
+    if let Some(mk) = list_marker(c) {
+        let ml = if mk.ordered { count_digits(c) + 1 } else { 1 };
+        let inner = &c[ml.min(c.len())..];
+        let ws = inner.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        let inner = &inner[ws.min(inner.len())..];
+        let inner = if inner.starts_with(b"[ ] ") || inner.starts_with(b"[x] ") || inner.starts_with(b"[X] ") {
+            &inner[4.min(inner.len())..]
+        } else {
+            inner
+        };
+        return deepest_is_paragraph(inner, depth + 1);
+    }
+    if is_atx_like(c) {
+        return false;
+    }
+    if parse_fence_open(c).is_some()
+        || is_thematic_break(c)
+        || is_setext_underline(c)
+        || parse_delim_row(c).is_some()
+        || c.first() == Some(&b'|')
+        || (c.starts_with(b"<") && looks_like_html_block(c))
+    {
+        return false;
+    }
+    true
+}
+
+/// Advance a running fence state over one de-marked content line. Returns
+/// true when the line is INSIDE (or closes/opens) a fenced code block —
+/// i.e. it is never paragraph content regardless of how it looks. An open
+/// fence swallows every following line until a matching closer.
+fn track_fence(state: &mut Option<(u8, usize)>, line: &[u8]) -> bool {
+    if let Some((ch, len)) = *state {
+        let ind = leading_indent(line);
+        let t = trim_bytes(line);
+        // Closer: <=3 indent, only fence chars of the opener's kind, >= len.
+        if ind <= 3 && t.len() >= len && t.iter().all(|&b| b == ch) {
+            *state = None;
+        }
+        return true;
+    }
+    if let Some((ch, len, _info)) = parse_fence_open(line) {
+        *state = Some((ch, usize::from(len)));
+        return true;
+    }
+    false
+}
+
 fn parse_block_quote(bytes: &[u8], lines: &[Line], idx: usize, profile: &MarkdownProfile, refs: &Refs) -> (Block, usize) {
     let start = lines[idx].start;
     let mut j = idx;
     let mut inner_end = start;
+    // `para_open`: the deepest de-marked block is still a paragraph — only
+    // then can an unmarked line lazily continue the quote. `fence` tracks an
+    // open fenced code block inside the de-marked content — its body looks
+    // like paragraph text but can never be lazily continued.
+    let mut para_open = false;
+    let mut fence: Option<(u8, usize)> = None;
     while j < lines.len() {
         let c = line_content(bytes, lines[j]);
         let ind = leading_indent(c);
         let s = &c[ind.min(c.len())..];
         if s.first() != Some(&b'>') {
-            if is_blank(c) || ind >= 4 {
+            if is_blank(c) {
                 break;
             }
-            break;
+            // A 4+-indented unmarked line can only join the quote as a lazy
+            // paragraph continuation (indented code never interrupts a
+            // paragraph); without an open paragraph it ends the quote and is
+            // indented code outside. Under-indented lines join only an open
+            // paragraph and only when they don't start a new block (setext
+            // underlines DO continue — `> a\n---` is an h2 inside).
+            if ind >= 4 {
+                if !para_open {
+                    break;
+                }
+            } else if !para_open || line_starts_new_block(s) {
+                break;
+            }
+            if ind < 4 {
+                para_open = !track_fence(&mut fence, s) && deepest_is_paragraph(s, 0);
+            }
+            inner_end = lines[j].end;
+            j += 1;
+            continue;
+        }
+        // `>`-marked line: update para_open from its de-marked content. A
+        // blank de-marked line (`>` alone) closes the inner paragraph;
+        // inside an open fence every line is fence content; a 4+-indented
+        // line leaves para_open unchanged (para continuation or code leaf).
+        let after_gt = &s[1..];
+        let after_sp = if after_gt.first() == Some(&b' ') { &after_gt[1..] } else { after_gt };
+        if track_fence(&mut fence, after_sp) || is_blank(after_sp) {
+            para_open = false;
+        } else if leading_indent(after_sp) < 4 {
+            para_open = deepest_is_paragraph(after_sp, 0);
         }
         inner_end = lines[j].end;
         j += 1;
@@ -413,11 +553,17 @@ fn parse_block_quote(bytes: &[u8], lines: &[Line], idx: usize, profile: &Markdow
         let c = line_content(bytes, lines[k]);
         let ind = leading_indent(c);
         let s = &c[ind.min(c.len())..];
-        // Strip leading `>`.
-        let after_gt = if s.first() == Some(&b'>') { &s[1..] } else { s };
-        // Strip one optional space after `>`.
-        let after_space = if after_gt.first() == Some(&b' ') { &after_gt[1..] } else { after_gt };
-        de_marked.extend_from_slice(after_space);
+        let out_line = if s.first() == Some(&b'>') {
+            // Strip leading `>` and one optional space after it.
+            let after_gt = &s[1..];
+            if after_gt.first() == Some(&b' ') { &after_gt[1..] } else { after_gt }
+        } else {
+            // Lazy continuation line: keep verbatim including its indent —
+            // the indent is content (`> a\n    ---` is paragraph text inside
+            // the quote; stripping it would fabricate a setext underline).
+            c
+        };
+        de_marked.extend_from_slice(out_line);
         // Preserve line ending from the original line.
         de_marked.extend_from_slice(&bytes[lines[k].content_end as usize..lines[k].end as usize]);
     }
@@ -506,10 +652,25 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
             let marker_len = if nm.ordered { count_digits(s) + 1 } else { 1 };
             let after_marker = &s[marker_len.min(s.len())..];
             let content_indent = marker_len + after_marker.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+            // The first line's content (after marker + checkbox) decides the
+            // initial lazy-continuation state: only an open paragraph can be
+            // lazily continued by an under-indented line.
+            let first_content = trim_start_bytes(after_marker);
+            let first_content = if task_like(first_content) {
+                trim_start_bytes(&first_content[4.min(first_content.len())..])
+            } else {
+                first_content
+            };
+            let mut fence: Option<(u8, usize)> = None;
+            let mut para_open = !track_fence(&mut fence, first_content)
+                && !is_blank(first_content)
+                && deepest_is_paragraph(first_content, 0);
+            let mut prev_blank = false;
             let mut k = j + 1;
             while k < lines.len() {
                 let nc = line_content(bytes, lines[k]);
                 if is_blank(nc) {
+                    prev_blank = true;
                     k += 1;
                     continue;
                 }
@@ -522,8 +683,34 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
                             break;
                         }
                     }
+                    // Lazy continuation: `- a\nlazy` keeps `lazy` inside the
+                    // item's paragraph — but only an OPEN paragraph can be
+                    // continued (a fence/table/etc. swallows nothing), the
+                    // line must directly follow content (no blank between),
+                    // and it must not start a new block itself. A 4+-indented
+                    // line can never start a block while under-indented for
+                    // the item — it's always paragraph continuation.
+                    if !prev_blank && para_open && (nind >= 4 || !line_starts_new_block(ns2)) {
+                        if nind < 4 {
+                            para_open = !track_fence(&mut fence, ns2)
+                                && deepest_is_paragraph(ns2, 0);
+                        }
+                        prev_blank = false;
+                        k += 1;
+                        continue;
+                    }
                     break;
                 }
+                // Indented continuation line: track para_open from its
+                // de-marked content (list items may contain blocks of their
+                // own — after a leaf block a later unmarked line can no
+                // longer lazily continue).
+                let strip = (ind as usize) + content_indent;
+                let dc = &nc[strip.min(nc.len())..];
+                para_open = !track_fence(&mut fence, dc)
+                    && !is_blank(dc)
+                    && deepest_is_paragraph(dc, 0);
+                prev_blank = false;
                 k += 1;
             }
             let item_end_line = if k > j { k - 1 } else { j };
@@ -552,11 +739,18 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
                 let lc = line_content(bytes, lines[line_idx]);
                 if line_idx == j {
                     // First line: skip marker + trailing spaces after marker.
-                    let skip = (ind as usize) + marker_len + after_marker.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                    let mut skip = (ind as usize) + marker_len + after_marker.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                    // A task checkbox is re-emitted from `item.task` — keep it out
+                    // of the children's buffer or it would render/serialize twice.
+                    if task.is_some() {
+                        skip += 4; // "[ ] " / "[x] " / "[X] "
+                    }
                     de_marked.extend_from_slice(&lc[skip.min(lc.len())..]);
                 } else {
-                    // Continuation: strip content_indent (clamped to line length).
-                    let strip = (ind as usize) + content_indent;
+                    // Continuation: strip content_indent, but never more than
+                    // the line's own indent — lazy continuation lines carry
+                    // less indent and must be kept verbatim, not truncated.
+                    let strip = ((ind as usize) + content_indent).min(leading_indent(lc));
                     de_marked.extend_from_slice(&lc[strip.min(lc.len())..]);
                 }
                 de_marked.extend_from_slice(&bytes[lines[line_idx].content_end as usize..lines[line_idx].end as usize]);
@@ -587,6 +781,11 @@ fn count_digits(s: &[u8]) -> usize {
     s.iter().take_while(|b| b.is_ascii_digit()).count()
 }
 
+/// Task-list checkbox prefix: `[ ] `, `[x] `, or `[X] `.
+fn task_like(s: &[u8]) -> bool {
+    s.starts_with(b"[ ] ") || s.starts_with(b"[x] ") || s.starts_with(b"[X] ")
+}
+
 fn try_link_reference_def(bytes: &[u8], lines: &[Line], idx: usize) -> Option<(LinkReferenceDefinition, usize)> {
     let c = line_content(bytes, lines[idx]);
     let s = &c[leading_indent(c).min(c.len())..];
@@ -598,13 +797,30 @@ fn try_link_reference_def(bytes: &[u8], lines: &[Line], idx: usize) -> Option<(L
         return None;
     }
     let label = String::from_utf8_lossy(&s[1..close]).trim().to_string();
+    if label.is_empty() {
+        // CommonMark requires a non-empty label; `[]:` is a paragraph.
+        return None;
+    }
     let rest = trim_start_bytes(&s[close + 2..]);
-    // destination
-    let dest_end = rest
-        .iter()
-        .position(|&b| b == b' ' || b == b'\t')
-        .unwrap_or(rest.len());
-    let destination = String::from_utf8_lossy(&rest[..dest_end]).to_string();
+    // destination: either `<...>` (may contain spaces) or a bare token that
+    // runs to the next whitespace.
+    let (destination, dest_end) = if rest.first() == Some(&b'<') {
+        match rest.iter().position(|&b| b == b'>') {
+            Some(gt) => (String::from_utf8_lossy(&rest[1..gt]).to_string(), gt + 1),
+            // Unclosed `<` — fall back to token parsing so the definition
+            // still round-trips rather than being dropped.
+            None => (
+                String::from_utf8_lossy(rest).to_string(),
+                rest.len(),
+            ),
+        }
+    } else {
+        let end = rest
+            .iter()
+            .position(|&b| b == b' ' || b == b'\t')
+            .unwrap_or(rest.len());
+        (String::from_utf8_lossy(&rest[..end]).to_string(), end)
+    };
     let title = if dest_end < rest.len() {
         let t = trim_bytes(&rest[dest_end..]);
         if t.is_empty() {
@@ -660,15 +876,19 @@ fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Bl
         }
         let ind = leading_indent(c);
         let s = &c[ind.min(c.len())..];
-        // Setext underline?
-        if j > idx && is_setext_underline(s) {
+        // Setext underline? Up to 3 leading spaces allowed — a 4+-indented
+        // `---`/`===` line is paragraph continuation text (indented code
+        // can't interrupt a paragraph), not an underline.
+        if j > idx && ind < 4 && is_setext_underline(s) {
             setext_level = Some(if s[0] == b'=' { 1 } else { 2 });
-            setext_underline_len = s.iter().filter(|&&b| b == b'=' || b == b'-').count() as u8;
+            setext_underline_len = s.iter().filter(|&&b| b == b'=' || b == b'-').count().min(u8::MAX as usize) as u8;
             j += 1;
             break;
         }
-        // Stop if a new block starts (fence, atx, thematic, block quote, list, html).
-        if j > idx {
+        // Stop if a new block starts (fence, atx, thematic, block quote, list,
+        // html). Block starts need indent < 4 too — `    ---`/`    # h`
+        // continue the paragraph rather than starting a block.
+        if j > idx && ind < 4 {
             if is_thematic_break(s) || parse_fence_open(s).is_some() || try_atx_heading(bytes, lines[j], s, refs).is_some() || s.first() == Some(&b'>') || list_marker(s).is_some() || (s.starts_with(b"<") && looks_like_html_block(s)) {
                 break;
             }
@@ -839,7 +1059,10 @@ fn split_table_cells(s: &[u8]) -> Vec<(u64, u64)> {
     // Push the final cell only if it has content or there was a previous cell.
     // (Avoids a spurious empty cell after a trailing pipe.)
     if start < end_limit || cells.is_empty() {
-        cells.push((start as u64, end_limit as u64));
+        // Clamp: for a degenerate row like "|" the leading pipe consumed
+        // `start` past `end_limit` — an inverted span would panic downstream
+        // when used as a `bytes[start..end]` slice.
+        cells.push((start.min(end_limit) as u64, end_limit as u64));
     }
     cells
 }
@@ -898,9 +1121,11 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
         // Escape.
         if b == b'\\' && i + 1 < region.len() && is_ascii_punct(region[i + 1]) {
             flush_text(&mut out, text_start, i);
-            // Represent escaped punct as a Text node containing the escaped char (verbatim).
+            // Text nodes store raw source bytes — keep the backslash so dirty
+            // regeneration emits `\*`, not a bare `*` (which would silently
+            // change emphasis semantics).
             let span = SourceSpan::new(abs(i), abs(i + 2));
-            out.push(Inline::Text(NodeMeta { span, dirty: false }, (region[i + 1] as char).to_string()));
+            out.push(Inline::Text(NodeMeta { span, dirty: false }, String::from_utf8_lossy(&region[i..i + 2]).to_string()));
             i += 2;
             text_start = i;
             continue;
@@ -958,12 +1183,21 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
             while region.get(i + n) == Some(&b) {
                 n += 1;
             }
-            if let Some(em) = try_emphasis(&region, i, n, b, start, refs) {
-                flush_text(&mut out, text_start, i);
-                out.push(em.node);
-                i = em.end;
-                text_start = i;
-                continue;
+            // Left-flanking: a delimiter run can't open emphasis when the byte
+            // after the run is whitespace (`a * b` keeps a literal `*`).
+            let next_ok = region.get(i + n).map_or(false, |&nb| !nb.is_ascii_whitespace());
+            // `_` cannot open inside a word (`snake_case` stays literal);
+            // `*` may open intraword (`a*b*` is valid emphasis).
+            let prev_ok = i == 0 || region[i - 1].is_ascii_whitespace() || is_ascii_punct(region[i - 1]);
+            let can_open = next_ok && (b == b'*' || prev_ok);
+            if can_open {
+                if let Some(em) = try_emphasis(&region, i, n, b, start, refs) {
+                    flush_text(&mut out, text_start, i);
+                    out.push(em.node);
+                    i = em.end;
+                    text_start = i;
+                    continue;
+                }
             }
         }
 
@@ -1067,13 +1301,77 @@ struct Parsed {
     end: usize,
 }
 
+/// Scan `after` (the region following an opening delimiter run) for a run of
+/// `ch` that may close it. A closer must be right-flanking (preceded by a
+/// non-whitespace byte) — otherwise `a *b c*` would close the opener on a run
+/// that is actually a later opener. Runs that could open a NESTED emphasis
+/// are tracked as `depth`, so `*a *b* c*` pairs its outer delimiters instead
+/// of closing on the inner run. `_` delimiters additionally cannot be
+/// intraword: a closing `_` must be followed by whitespace, punctuation, or
+/// the end of the region (`_foo_bar` is not emphasis).
+fn find_delim_close(after: &[u8], ch: u8, need: usize) -> Option<usize> {
+    let strict = ch == b'_';
+    // Pending inner opener runs (lengths). A closer run first satisfies the
+    // most recent inner opener(s); any leftover length may then close us —
+    // e.g. in `**bold *em***` the `***` run gives 1 char to the inner `*`
+    // close and the remaining `**` to the outer strong.
+    let mut stack: Vec<usize> = Vec::new();
+    let mut p = 0usize;
+    while p < after.len() {
+        if after[p] != ch {
+            p += 1;
+            continue;
+        }
+        let mut k = 0usize;
+        while after.get(p + k) == Some(&ch) {
+            k += 1;
+        }
+        // p == 0 means the run directly follows the opening run — the byte
+        // before it is the opener's last delimiter (non-whitespace).
+        let prev_non_ws = p == 0 || !after[p - 1].is_ascii_whitespace();
+        let next = after.get(p + k).copied();
+        let left_flank = next.map_or(false, |b| !b.is_ascii_whitespace());
+        let closer_ok = prev_non_ws
+            && (!strict || next.map_or(true, |b| b.is_ascii_whitespace() || is_ascii_punct(b)));
+        if closer_ok {
+            let mut rem = k;
+            while let Some(&top) = stack.last() {
+                if top <= rem {
+                    rem -= top;
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+            if rem >= need && stack.is_empty() {
+                // The inner closers consumed `k - rem` leading chars of the
+                // run; the outer close starts at the remaining `rem` chars.
+                return Some(p + (k - rem));
+            }
+            p += k;
+            continue;
+        }
+        // `_` openers can't be intraword either (roughly: the byte before the
+        // run must be whitespace or punctuation).
+        let open_ok = !strict
+            || p == 0
+            || after[p - 1].is_ascii_whitespace()
+            || is_ascii_punct(after[p - 1]);
+        if left_flank && open_ok {
+            stack.push(k);
+        }
+        p += k;
+    }
+    None
+}
+
 fn try_emphasis(region: &[u8], i: usize, n: usize, ch: u8, base: u64, refs: &Refs) -> Option<Parsed> {
     // Strong if n >= 2 and a closing run of >=2 exists; else emphasis if n >= 1.
     let kind = if ch == b'*' { EmphasisKind::Asterisk } else { EmphasisKind::Underscore };
     let after = &region[i + n..];
     // Try strong (consume 2 delimiters).
     if n >= 2 {
-        if let Some(close) = find_str(after, &[ch, ch]) {
+        if let Some(close) = find_delim_close(after, ch, 2) {
             let inner_start = i + 2;
             let inner_end = i + 2 + close;
             let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + (inner_end + 2) as u64));
@@ -1084,8 +1382,7 @@ fn try_emphasis(region: &[u8], i: usize, n: usize, ch: u8, base: u64, refs: &Ref
         }
     }
     // Emphasis with 1 delimiter.
-    if let Some(close) = find_str(after, &[ch]) {
-        // avoid matching the same run for underscore word-boundary nuance (simplified)
+    if let Some(close) = find_delim_close(after, ch, 1) {
         let inner_start = i + 1;
         let inner_end = i + 1 + close;
         let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + (inner_end + 1) as u64));
@@ -1101,39 +1398,30 @@ fn try_emphasis(region: &[u8], i: usize, n: usize, ch: u8, base: u64, refs: &Ref
 /// `region`). The returned spans are relative to `region` start (offset 0 = region start).
 /// We need them absolute in the document, so add `base` (the document offset of `region[0]`).
 fn rebase_inlines(inlines: Vec<Inline>, delta: i64) -> Vec<Inline> {
-    inlines
-        .into_iter()
-        .map(|il| {
-            let m = il.meta();
-            let span = SourceSpan::new(
-                ByteOffset((m.span.start.0 as i64 + delta).max(0) as u64),
-                ByteOffset((m.span.end.0 as i64 + delta).max(0) as u64),
-            );
-            rebase_inline(il, span)
-        })
-        .collect()
+    inlines.into_iter().map(|il| rebase_inline(il, delta)).collect()
 }
 
-fn rebase_inline(il: Inline, span: SourceSpan) -> Inline {
-    let mut il = il;
-    let m = il.meta();
-    let _ = m;
+fn rebase_inline(mut il: Inline, delta: i64) -> Inline {
+    fn shift(m: &mut NodeMeta, delta: i64) {
+        m.span.start = ByteOffset((m.span.start.0 as i64 + delta).max(0) as u64);
+        m.span.end = ByteOffset((m.span.end.0 as i64 + delta).max(0) as u64);
+    }
     match &mut il {
         Inline::Text(m, _) | Inline::CodeSpan(m, _, _) | Inline::MathSpan(m, _, _)
         | Inline::Autolink(m, _) | Inline::HardBreak(m) | Inline::RawHtml(m) | Inline::UnknownInline(m) => {
-            m.span = span;
+            shift(m, delta);
         }
         Inline::Emphasis(m, children, _) | Inline::Strong(m, children, _)
         | Inline::Strikethrough(m, children) => {
-            m.span = span;
-            *children = rebase_inlines(core::mem::take(children), 0);
+            shift(m, delta);
+            *children = rebase_inlines(core::mem::take(children), delta);
         }
         Inline::Link(l) => {
-            l.meta.span = span;
-            l.inlines = rebase_inlines(core::mem::take(&mut l.inlines), 0);
+            shift(&mut l.meta, delta);
+            l.inlines = rebase_inlines(core::mem::take(&mut l.inlines), delta);
         }
         Inline::Image(im) => {
-            im.meta.span = span;
+            shift(&mut im.meta, delta);
         }
     }
     il
@@ -1163,16 +1451,25 @@ fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
     }
     let text_end = j; // position of `]`
     let after = &region[text_end + 1..];
-    // Inline `( ... )` — track parenthesis depth to handle URLs with nested parens.
+    // Inline `( ... )` — track parenthesis depth to handle URLs with nested
+    // parens; `\(` and `\)` are escapes and must not affect the depth count.
     if after.first() == Some(&b'(') {
         let mut depth = 1usize;
         let mut close = 0usize;
-        for (k, &b) in after.iter().enumerate().skip(1) {
-            if b == b'(' { depth += 1; }
-            else if b == b')' {
+        let mut k = 1usize;
+        while k < after.len() {
+            let b = after[k];
+            if b == b'\\' && k + 1 < after.len() {
+                k += 2;
+                continue;
+            }
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
                 depth -= 1;
                 if depth == 0 { close = k; break; }
             }
+            k += 1;
         }
         if close == 0 { return None; }
         let inner = &after[1..close];
@@ -1211,7 +1508,11 @@ fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
         (label, LinkStyle::Shortcut, 0usize)
     };
     let normalized = normalize_label(&label);
-    let (destination, title) = refs.map.get(&normalized).cloned().unwrap_or_default();
+    // CommonMark: a reference/collapsed/shortcut link is only a link when a
+    // matching reference definition exists; otherwise the brackets are
+    // literal text. (Also keeps a dirty regenerate from emitting `[t]()` for
+    // an undefined label.)
+    let (destination, title) = refs.map.get(&normalized).cloned()?;
     let span_end = text_end + 1 + ref_consumed;
     let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + span_end as u64));
     let children = parse_inlines(region, (i + 1) as u64, text_end as u64, refs);
@@ -1274,9 +1575,26 @@ fn collect_text(inlines: &[Inline]) -> String {
 }
 
 fn split_link_dest(inner: &[u8]) -> (String, Option<String>) {
+    // A `<...>` destination may legally contain spaces — take everything up
+    // to the closing `>` as the destination instead of splitting at the
+    // first space (CommonMark: `[a](<u v> t)` = dest `u v`, title `t`).
+    let mut split = inner.len();
+    if inner.first() == Some(&b'<') {
+        if let Some(gt) = inner.iter().position(|&b| b == b'>') {
+            let dest = String::from_utf8_lossy(&inner[1..gt]).to_string();
+            let title_raw = trim_bytes(&inner[gt + 1..]);
+            let title = if title_raw.is_empty() {
+                None
+            } else {
+                let t = trim_matches_bytes(title_raw, |b: u8| b == b'"' || b == b'\'');
+                Some(String::from_utf8_lossy(t).to_string())
+            };
+            return (dest, title);
+        }
+        // Unclosed `<` — fall through to whitespace splitting.
+    }
     // destination ends at first space; rest is title.
     let mut in_quotes = false;
-    let mut split = inner.len();
     for (i, &b) in inner.iter().enumerate() {
         if b == b'"' {
             in_quotes = !in_quotes;
@@ -1322,7 +1640,11 @@ fn collect_references(blocks: &[Block]) -> Refs {
     for b in blocks {
         if let Block::LinkReferenceDefinition(d) = b {
             let normalized = normalize_label(&d.label);
-            refs.map.insert(normalized, (d.destination.clone(), d.title.clone()));
+            // CommonMark: the FIRST definition of a label wins — later
+            // duplicates are ignored, not overwritten.
+            refs.map
+                .entry(normalized)
+                .or_insert((d.destination.clone(), d.title.clone()));
         }
     }
     refs

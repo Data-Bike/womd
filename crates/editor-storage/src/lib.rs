@@ -69,13 +69,18 @@ impl DocumentStorage for InMemoryStorage {
         if start > self.bytes.len() {
             return Err(StorageError::OutOfRange);
         }
-        let end = (start + length).min(self.bytes.len());
+        // `start + length` can overflow usize (huge requested length); saturate.
+        let end = start.saturating_add(length).min(self.bytes.len());
         let bytes = self.bytes[start..end].to_vec();
         Ok(ByteChunk {
             start_offset: offset,
             bytes,
             leading_partial: start != 0 && self.bytes.get(start.wrapping_sub(1)) != Some(&b'\n'),
-            trailing_partial: end < self.bytes.len() && self.bytes.get(end) != Some(&b'\n'),
+            // The chunk is trailing-partial when its last byte is not a newline
+            // (the line continues past the chunk). Checking `bytes[end]` asks
+            // about the *next* byte instead — that inverted both answers for
+            // ranges ending exactly on, or just before, a line boundary.
+            trailing_partial: end < self.bytes.len() && end > 0 && self.bytes[end - 1] != b'\n',
         })
     }
 }
@@ -87,7 +92,8 @@ impl DocumentStorage for InMemoryStorage {
 /// nearest newline boundary.
 pub fn correct_utf8_boundaries(bytes: &[u8], base: usize, offset: usize, length: usize) -> (usize, usize) {
     let raw_start = offset.min(bytes.len());
-    let raw_end = (offset + length).min(bytes.len());
+    // `offset + length` can overflow usize for a huge requested length.
+    let raw_end = offset.saturating_add(length).min(bytes.len());
     // Walk back to a UTF-8 char boundary.
     let mut start = raw_start;
     while start > 0 && !is_char_boundary(&bytes[start..]) {
@@ -122,36 +128,47 @@ fn is_char_boundary(slice: &[u8]) -> bool {
 /// `permissions` is reserved for future use (§100). On platforms where atomic rename is
 /// not possible over an existing file, the caller may fall back to a non-atomic replace;
 /// this implementation uses `rename` which is atomic on POSIX and best-effort on Windows.
-pub fn atomic_save(path: &Path, bytes: &[u8]) -> StorageResult<()> {
-    let mut tmp_path = path.to_path_buf();
-    let mut name = path
+/// Temp-file name unique to this process — two editors saving the same file
+/// must not race on one shared temp path (last rename still wins, but a
+/// shared temp file could interleave both payloads).
+fn temp_name_for(path: &Path) -> String {
+    let base = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "document".to_string());
-    name.push_str(".womd-tmp");
-    tmp_path.set_file_name(name);
-
-    {
-        let mut file = File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
-        file.write_all(bytes).map_err(|e| StorageError::Io(e.to_string()))?;
-        file.flush().map_err(|e| StorageError::Io(e.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let _ = libc_sync(file.as_raw_fd());
-        }
-        let _ = file;
-    }
-    std::fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))?;
-    Ok(())
+    format!("{base}.womd-tmp-{}", std::process::id())
 }
 
-#[cfg(unix)]
-fn libc_sync(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-    // Best-effort fsync without a libc dependency: use `std::fs::File::sync_all` via
-    // reopening is awkward; instead we accept the OS page cache for the temp file and rely
-    // on the rename being atomic. A full fsync can be added via a small `libc` dep later.
-    let _ = fd;
+pub fn atomic_save(path: &Path, bytes: &[u8]) -> StorageResult<()> {
+    let mut tmp_path = path.to_path_buf();
+    tmp_path.set_file_name(temp_name_for(path));
+
+    let result = (|| -> StorageResult<()> {
+        {
+            let mut file = File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
+            file.write_all(bytes).map_err(|e| StorageError::Io(e.to_string()))?;
+            // fsync the temp file BEFORE the rename — `File::sync_all` works
+            // cross-platform (fsync on POSIX, FlushFileBuffers on Windows). Without
+            // this, a crash between rename and page-cache flush can leave a
+            // zero-length target.
+            file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
+        }
+        std::fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))
+    })();
+    // A failed save must not litter the user's directory with `.womd-tmp-*`
+    // files — they would show up in the file tree and confuse the next save.
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result?;
+    // Best-effort fsync of the parent directory so the rename itself is durable
+    // (opening a directory as a file only works on POSIX; harmless to skip).
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -165,32 +182,53 @@ pub fn streaming_save(
     patches: &[(ByteRange, Vec<u8>)],
 ) -> StorageResult<()> {
     let mut tmp_path = path.to_path_buf();
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "document".to_string());
-    name.push_str(".womd-tmp");
-    tmp_path.set_file_name(name);
+    tmp_path.set_file_name(temp_name_for(path));
 
-    let mut file = File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
-    let mut cursor: u64 = 0;
-    for (range, replacement) in patches {
-        // Copy unchanged bytes from cursor to the patch start.
-        if range.start.0 > cursor {
-            let s = cursor as usize;
-            let e = range.start.0 as usize;
-            file.write_all(&source[s..e]).map_err(|e2| StorageError::Io(e2.to_string()))?;
+    // Validate patches: sorted, non-overlapping, and within the source bounds.
+    // A malformed patch would otherwise panic on `source[s..e]` or silently
+    // write a corrupted file.
+    let mut prev_end = 0u64;
+    for (range, _) in patches {
+        if range.start.0 > range.end.0
+            || range.start.0 < prev_end
+            || range.end.0 > source.len() as u64
+        {
+            return Err(StorageError::OutOfRange);
         }
-        // Write the replacement.
-        file.write_all(replacement).map_err(|e2| StorageError::Io(e2.to_string()))?;
-        cursor = range.end.0;
+        prev_end = range.end.0;
     }
-    // Trailing unchanged bytes.
-    if (cursor as usize) < source.len() {
-        file.write_all(&source[cursor as usize..]).map_err(|e2| StorageError::Io(e2.to_string()))?;
+
+    let result = (|| -> StorageResult<()> {
+        let mut file = File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
+        let mut cursor: u64 = 0;
+        for (range, replacement) in patches {
+            // Copy unchanged bytes from cursor to the patch start.
+            if range.start.0 > cursor {
+                let s = cursor as usize;
+                let e = range.start.0 as usize;
+                file.write_all(&source[s..e]).map_err(|e2| StorageError::Io(e2.to_string()))?;
+            }
+            // Write the replacement.
+            file.write_all(replacement).map_err(|e2| StorageError::Io(e2.to_string()))?;
+            cursor = range.end.0;
+        }
+        // Trailing unchanged bytes.
+        if (cursor as usize) < source.len() {
+            file.write_all(&source[cursor as usize..]).map_err(|e2| StorageError::Io(e2.to_string()))?;
+        }
+        file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    file.flush().map_err(|e| StorageError::Io(e.to_string()))?;
-    std::fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))?;
+    result?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -222,6 +260,52 @@ mod tests {
         assert!(chunk.trailing_partial);
     }
 
+    /// `trailing_partial` reflects whether the chunk's *last* byte is a line
+    /// boundary — a chunk ending exactly on `\n` is complete, and a chunk
+    /// ending just before `\n` is partial (it split the line).
+    #[test]
+    fn trailing_partial_reflects_chunk_end() {
+        let s = InMemoryStorage::new(DocumentId::new("t"), b"ab\ncd\n".to_vec());
+        // [0,3) = "ab\n" ends on a newline -> not partial, even though the
+        // document continues with "cd".
+        let chunk = s.read_range(ByteOffset(0), 3).unwrap();
+        assert_eq!(chunk.bytes, b"ab\n");
+        assert!(!chunk.trailing_partial);
+        // [0,2) = "ab" ends mid-line -> partial, even though the next byte is '\n'.
+        let chunk = s.read_range(ByteOffset(0), 2).unwrap();
+        assert!(chunk.trailing_partial);
+        // [3,6) = "cd\n" -> complete.
+        let chunk = s.read_range(ByteOffset(3), 3).unwrap();
+        assert!(!chunk.trailing_partial);
+    }
+
+    #[test]
+    fn streaming_save_rejects_overlapping_patches() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("womd_streaming_overlap_test.md");
+        let original = b"abcdef\n";
+        let patches = vec![
+            (ByteRange::new(ByteOffset(0), ByteOffset(4)), b"X".to_vec()),
+            (ByteRange::new(ByteOffset(2), ByteOffset(6)), b"Y".to_vec()),
+        ];
+        assert!(matches!(
+            streaming_save(&path, original, &patches),
+            Err(StorageError::OutOfRange)
+        ));
+    }
+
+    #[test]
+    fn streaming_save_rejects_out_of_bounds_patch() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("womd_streaming_oob_test.md");
+        let original = b"abc\n";
+        let patches = vec![(ByteRange::new(ByteOffset(0), ByteOffset(100)), b"X".to_vec())];
+        assert!(matches!(
+            streaming_save(&path, original, &patches),
+            Err(StorageError::OutOfRange)
+        ));
+    }
+
     #[test]
     fn out_of_range() {
         let s = InMemoryStorage::new(DocumentId::new("t"), b"hi\n".to_vec());
@@ -250,6 +334,53 @@ mod tests {
         File::open(&path).unwrap().read_to_end(&mut read_back).unwrap();
         assert_eq!(read_back, payload);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Patches given out of order must be rejected — the stitch loop assumes
+    /// sorted, non-overlapping ranges.
+    #[test]
+    fn streaming_save_rejects_unsorted_patches() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("womd_streaming_unsorted_test.md");
+        let original = b"abcdef\n";
+        let patches = vec![
+            (ByteRange::new(ByteOffset(4), ByteOffset(6)), b"X".to_vec()),
+            (ByteRange::new(ByteOffset(0), ByteOffset(2)), b"Y".to_vec()),
+        ];
+        assert!(matches!(
+            streaming_save(&path, original, &patches),
+            Err(StorageError::OutOfRange)
+        ));
+        // The temp file must not be left behind on validation failure.
+        assert!(!path.exists());
+    }
+
+    /// Read-range flags must hold at EVERY split point: `leading_partial`
+    /// iff the byte before the chunk isn't `\n`, `trailing_partial` iff the
+    /// chunk's last byte isn't `\n` and the file continues.
+    #[test]
+    fn read_range_flags_at_every_boundary() {
+        let s = InMemoryStorage::new(DocumentId::new("t"), b"ab\ncd\nef".to_vec());
+        let bytes = b"ab\ncd\nef";
+        for start in 0..bytes.len() {
+            for end in start..=bytes.len() {
+                if start == end {
+                    continue;
+                }
+                let chunk = s.read_range(ByteOffset(start as u64), end - start).unwrap();
+                assert_eq!(chunk.bytes, &bytes[start..end], "[{start},{end})");
+                assert_eq!(
+                    chunk.leading_partial,
+                    start > 0 && bytes[start - 1] != b'\n',
+                    "leading_partial at [{start},{end})"
+                );
+                assert_eq!(
+                    chunk.trailing_partial,
+                    end < bytes.len() && bytes[end - 1] != b'\n',
+                    "trailing_partial at [{start},{end})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -49,11 +49,17 @@ pub fn intraline_diff(old: &[u8], new: &[u8]) -> Vec<IntralineChange> {
     if old == new {
         return Vec::new();
     }
-    // Bounded fallback for pathological lines.
+    // Bounded fallback for pathological lines. The LCS DP table is n*m usize
+    // cells — capping each side at MAX_TOKENS alone still allows ~512 MB of
+    // table, so the product is capped as well (~32 MB).
     const MAX_TOKENS: usize = 8192;
+    const MAX_LCS_CELLS: usize = 4_000_000;
     let old_toks = tokenize(old);
     let new_toks = tokenize(new);
-    if old_toks.len() > MAX_TOKENS || new_toks.len() > MAX_TOKENS {
+    if old_toks.len() > MAX_TOKENS
+        || new_toks.len() > MAX_TOKENS
+        || old_toks.len().saturating_mul(new_toks.len()) > MAX_LCS_CELLS
+    {
         return vec![IntralineChange {
             old_range: ByteRange::new(ByteOffset(0), ByteOffset(old.len() as u64)),
             new_range: ByteRange::new(ByteOffset(0), ByteOffset(new.len() as u64)),

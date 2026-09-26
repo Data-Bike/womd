@@ -87,9 +87,12 @@ watch(() => props.root, loadEntries, { immediate: true });
 
 async function openFolderDialog() {
   try {
+    // multiple:false returns a plain path string (not an array) — indexing
+    // [0] would emit the first CHARACTER of the path as the new root.
     const selected = await open({ directory: true, multiple: false });
-    if (selected && selected.length) {
-      emit('update:root', selected[0]);
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (path) {
+      emit('update:root', path);
     }
   } catch (e) {
     console.error('openFolderDialog:', e);

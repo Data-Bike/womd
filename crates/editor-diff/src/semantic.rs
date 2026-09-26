@@ -89,10 +89,10 @@ pub fn semantic_diff(old: &[u8], new: &[u8], profile: MarkdownProfile) -> Vec<Se
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
-    diff_documents(&old_doc, &new_doc)
+    diff_documents(&old_doc, &new_doc, old, new)
 }
 
-fn diff_documents(old: &Document, new: &Document) -> Vec<SemanticChange> {
+fn diff_documents(old: &Document, new: &Document, old_src: &[u8], new_src: &[u8]) -> Vec<SemanticChange> {
     // Skip blank-line trivia; compare meaningful blocks.
     let old_blocks: Vec<&Block> = old.blocks.iter().filter(|b| !matches!(b, Block::BlankLine(_))).collect();
     let new_blocks: Vec<&Block> = new.blocks.iter().filter(|b| !matches!(b, Block::BlankLine(_))).collect();
@@ -110,7 +110,7 @@ fn diff_documents(old: &Document, new: &Document) -> Vec<SemanticChange> {
             Some((j, _)) => {
                 used_new[j] = true;
                 // Same kind/text: check byte content for "modified".
-                if !bytes_equal(ob, new_blocks[j]) {
+                if !bytes_equal(ob, new_blocks[j], old_src, new_src) {
                     changes.push(SemanticChange::Modified { unit: ou });
                 }
             }
@@ -125,8 +125,19 @@ fn diff_documents(old: &Document, new: &Document) -> Vec<SemanticChange> {
     changes
 }
 
-fn bytes_equal(a: &Block, b: &Block) -> bool {
-    a.span() == b.span() || a == b
+/// Compare two blocks by source bytes. Structural comparison can't work:
+/// `CodeBlock`, `HtmlBlock`, and `UnknownBlock` don't store their content in
+/// the AST (it's only in `source[span]`), so two code blocks with different
+/// bodies would wrongly compare equal and the modification would be missed.
+/// Byte comparison through each block's own source span also correctly reports
+/// identical content at different offsets as unchanged.
+fn bytes_equal(a: &Block, b: &Block, a_src: &[u8], b_src: &[u8]) -> bool {
+    fn span_bytes<'s>(src: &'s [u8], span: editor_markdown::SourceSpan) -> &'s [u8] {
+        let start = (span.start.0 as usize).min(src.len());
+        let end = (span.end.0 as usize).min(src.len()).max(start);
+        &src[start..end]
+    }
+    span_bytes(a_src, a.span()) == span_bytes(b_src, b.span())
 }
 
 #[cfg(test)]
@@ -171,5 +182,79 @@ mod tests {
         let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
         let desc = changes.iter().map(|c| c.describe()).collect::<Vec<_>>().join("; ");
         assert!(desc.contains("Paragraph added"));
+    }
+
+    /// A same-length edit produces identical spans on both sides — the old
+    /// `bytes_equal` treated equal spans as equal content and missed the
+    /// modification entirely.
+    #[test]
+    fn same_length_modification_is_detected() {
+        let old = b"abc\n";
+        let new = b"xyz\n";
+        let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            SemanticChange::Modified { unit: SemanticUnit::Paragraph }
+        )), "expected a Modified paragraph, got {changes:?}");
+    }
+
+    /// A block whose content is identical but whose span moved (because an
+    /// earlier edit shifted it) must compare equal — position is not content.
+    #[test]
+    fn moved_but_identical_block_is_not_modified() {
+        // Direct unit test of the comparison helper: two parses of the same
+        // paragraph at different offsets.
+        let doc_a = parse(b"shifted text\n", MarkdownProfile::Gfm).unwrap();
+        let doc_b = parse(b"x y z\n\nshifted text\n", MarkdownProfile::Gfm).unwrap();
+        // Both are single-line; take each last paragraph.
+        let a = &doc_a.blocks[0];
+        let b = doc_b.blocks.iter().rev().find(|x| matches!(x, Block::Paragraph(_))).unwrap();
+        assert_ne!(a.span(), b.span(), "spans must differ for the test to be meaningful");
+        assert!(
+            super::bytes_equal(a, b, b"shifted text\n", b"x y z\n\nshifted text\n"),
+            "identical content at different offsets must compare equal"
+        );
+    }
+
+    /// CodeBlock doesn't store its body in the AST — a content-only change
+    /// inside a fenced block must still be detected as Modified.
+    #[test]
+    fn modified_code_block_body_is_detected() {
+        let old = b"```rust\nlet a = 1;\n```\n";
+        let new = b"```rust\nlet a = 2;\n```\n";
+        let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            SemanticChange::Modified { unit: SemanticUnit::CodeBlock }
+        )), "expected a Modified code block, got {changes:?}");
+    }
+
+    /// HtmlBlock likewise stores no content — body changes must be detected.
+    #[test]
+    fn modified_html_block_body_is_detected() {
+        let old = b"<div>\n  <p>old</p>\n</div>\n";
+        let new = b"<div>\n  <p>new</p>\n</div>\n";
+        let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
+        assert!(changes.iter().any(|c| matches!(c, SemanticChange::Modified { .. })),
+            "expected a Modified change, got {changes:?}");
+    }
+
+    /// Same fence but different code -> Modified; identical block moved by an
+    /// earlier edit -> unchanged (regression coverage for both directions).
+    #[test]
+    fn code_block_change_vs_move() {
+        let old = b"para\n\n```\nbody\n```\n";
+        let moved = b"para edit\n\n```\nbody\n```\n";
+        let modified = b"para\n\n```\nchanged\n```\n";
+        let moved_changes = semantic_diff(old, moved, MarkdownProfile::Gfm);
+        assert!(moved_changes.iter().all(|c| !matches!(
+            c,
+            SemanticChange::Modified { unit: SemanticUnit::CodeBlock }
+        )), "moved identical code block must not be Modified: {moved_changes:?}");
+        let mod_changes = semantic_diff(old, modified, MarkdownProfile::Gfm);
+        assert!(mod_changes.iter().any(|c| matches!(
+            c,
+            SemanticChange::Modified { unit: SemanticUnit::CodeBlock }
+        )), "expected Modified code block: {mod_changes:?}");
     }
 }

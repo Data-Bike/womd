@@ -376,6 +376,13 @@ async function switchTab(tabId) {
 }
 
 async function closeTab(tabId) {
+  const tab = tabs.value.find(t => t.id === tabId);
+  // Closing a dirty tab discards its unsaved buffer for good — the backend
+  // drops the DocumentBuffer on close_tab — so confirm first (autosave may
+  // not have run yet, and untitled docs can't autosave at all).
+  if (tab?.dirty && !confirm('This document has unsaved changes. Close it and discard them?')) {
+    return;
+  }
   try {
     await invoke('close_tab', { tabId });
     await refreshTabs();

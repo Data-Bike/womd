@@ -297,12 +297,30 @@ pub trait GitExtended {
 }
 
 /// Credentials for a remote (§35). Secrets are never logged (§87).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually to redact tokens and passphrases — a
+/// derived impl would print the secrets into logs and error messages.
+#[derive(Clone)]
 pub enum Credentials {
     SshKey { key_path: String, passphrase: Option<String> },
     SshAgent,
     HttpsToken { token: String },
     OAuth { token: String },
+}
+
+impl core::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SshKey { key_path, passphrase } => f
+                .debug_struct("SshKey")
+                .field("key_path", key_path)
+                .field("passphrase", &passphrase.as_ref().map(|_| "***"))
+                .finish(),
+            Self::SshAgent => f.write_str("SshAgent"),
+            Self::HttpsToken { .. } => f.write_str("HttpsToken(***)"),
+            Self::OAuth { .. } => f.write_str("OAuth(***)"),
+        }
+    }
 }
 
 /// Provider of credentials for a remote URL.

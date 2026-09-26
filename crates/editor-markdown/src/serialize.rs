@@ -11,11 +11,19 @@ use editor_domain::ByteOffset;
 use crate::ast::*;
 
 /// Serialize a document back to bytes using `source` as the verbatim backing store.
+///
+/// For lazily-parsed documents (`parsed_offset < source.len()`) the blocks only
+/// cover the parsed prefix; the unparsed tail has no dirty nodes by definition,
+/// so it is emitted verbatim from `source` — serializing must never truncate.
 pub fn serialize(doc: &Document, source: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(source.len());
     for block in &doc.blocks {
         serialize_block(block, source, &mut out);
     }
+    // Emit the unparsed tail verbatim: `doc.span.end` tracks the end of the
+    // last parsed block (== source.len() for fully-parsed documents).
+    let tail_start = (doc.span.end.0 as usize).min(source.len());
+    out.extend_from_slice(&source[tail_start..]);
     out
 }
 
@@ -32,11 +40,29 @@ fn emit_span(span: SourceSpan, source: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&source[span.start.0 as usize..span.end.0 as usize]);
 }
 
+/// Re-emit the line ending that terminated the original span (`\n`, `\r\n`, or
+/// nothing at EOF without a trailing newline). Block spans include their line
+/// ending, so regenerated blocks must emit one too — otherwise the following
+/// block's text is glued onto the same line.
+fn reemit_line_ending(span: SourceSpan, source: &[u8], out: &mut Vec<u8>) {
+    let end = (span.end.0 as usize).min(source.len());
+    if end >= 2 && &source[end - 2..end] == b"\r\n" {
+        out.extend_from_slice(b"\r\n");
+    } else if end >= 1 && source[end - 1] == b'\n' {
+        out.push(b'\n');
+    }
+}
+
 /// Regenerate a dirty block from its (modified) content + preserved trivia.
+///
+/// `source` is the buffer this block's spans index into — for de-marked
+/// children (block quote / list item content) that is the marker-stripped
+/// buffer, NOT the original document.
 fn regenerate_block(block: &Block, source: &[u8], out: &mut Vec<u8>) {
     match block {
         Block::Paragraph(p) => {
-            out.extend_from_slice(serialize_inlines(&p.inlines).as_bytes());
+            out.extend_from_slice(serialize_inlines_src(&p.inlines, source).as_bytes());
+            reemit_line_ending(p.meta.span, source, out);
         }
         Block::Heading(h) => {
             if h.style == HeadingStyle::Atx {
@@ -44,22 +70,24 @@ fn regenerate_block(block: &Block, source: &[u8], out: &mut Vec<u8>) {
                     out.push(b'#');
                 }
                 out.push(b' ');
-                out.extend_from_slice(serialize_inlines(&h.inlines).as_bytes());
+                out.extend_from_slice(serialize_inlines_src(&h.inlines, source).as_bytes());
                 if h.atx_close_hashes > 0 {
                     out.push(b' ');
                     for _ in 0..h.atx_close_hashes {
                         out.push(b'#');
                     }
                 }
+                reemit_line_ending(h.meta.span, source, out);
             } else {
                 // Setext: text line + underline of '=' (h1) or '-' (h2).
-                out.extend_from_slice(serialize_inlines(&h.inlines).as_bytes());
+                out.extend_from_slice(serialize_inlines_src(&h.inlines, source).as_bytes());
                 out.push(b'\n');
                 let underline = if h.level == 1 { b'=' } else { b'-' };
                 let ulen = if h.setext_underline_len > 0 { h.setext_underline_len } else { 3 };
                 for _ in 0..ulen {
                     out.push(underline);
                 }
+                reemit_line_ending(h.meta.span, source, out);
             }
         }
         Block::List(l) => {
@@ -79,19 +107,106 @@ fn regenerate_block(block: &Block, source: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// Split a raw line (as yielded by `split_inclusive` on `\n`) into content and
+/// line ending, mirroring the parser's `content_end` semantics — a trailing
+/// `\r` belongs to the ending.
+fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
+    if line.ends_with(b"\r\n") {
+        line.split_at(line.len() - 2)
+    } else if line.ends_with(b"\n") || line.ends_with(b"\r") {
+        line.split_at(line.len() - 1)
+    } else {
+        (line, &[])
+    }
+}
+
+/// Rebuild the marker-stripped buffer the parser produced for a block quote's
+/// children: each line loses its leading spaces, the `>` marker, and one
+/// optional space after it. Child block spans index into THIS buffer —
+/// serializing clean children against the document would read wrong bytes.
+fn de_mark_quote_source(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        let (content, ending) = split_line_ending(line);
+        let ind = content.iter().take_while(|&&b| b == b' ').count();
+        let s = &content[ind.min(content.len())..];
+        // Mirror the parser's de-marked build: `>`-marked lines lose marker +
+        // one optional space; lazy continuation lines keep their indent —
+        // it is content (`> a\n    ---` is paragraph text inside the quote).
+        let s = if s.first() == Some(&b'>') {
+            let after = &s[1..];
+            if after.first() == Some(&b' ') { &after[1..] } else { after }
+        } else {
+            content
+        };
+        out.extend_from_slice(s);
+        out.extend_from_slice(ending);
+    }
+    out
+}
+
+/// Rebuild the de-marked buffer the parser produced for a list item's
+/// children: the first line loses indent + marker + whitespace after it plus
+/// the task checkbox (`[ ] `/`[x] `, re-emitted from `item.task`);
+/// continuation lines lose `indent + content_indent` bytes.
+fn de_mark_item_source(raw: &[u8], ordered: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut strip = 0usize;
+    for (k, line) in raw.split_inclusive(|&b| b == b'\n').enumerate() {
+        let (content, ending) = split_line_ending(line);
+        if k == 0 {
+            let ind = content.iter().take_while(|&&b| b == b' ').count();
+            let s = &content[ind.min(content.len())..];
+            let marker_len = if ordered {
+                s.iter().take_while(|b| b.is_ascii_digit()).count() + 1
+            } else {
+                1
+            };
+            let after = &s[marker_len.min(s.len())..];
+            let ws = after.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+            strip = ind + marker_len + ws;
+            let rest = &content[strip.min(content.len())..];
+            if rest.starts_with(b"[ ] ") || rest.starts_with(b"[x] ") || rest.starts_with(b"[X] ") {
+                strip += 4;
+            }
+        }
+        // Continuation lines strip `strip`, but never more than the line's own
+        // indent — lazy continuation lines (`- a\nlazy`) carry less indent and
+        // must be kept verbatim, mirroring the parser's de-marked build.
+        let n = if k == 0 {
+            strip.min(content.len())
+        } else {
+            strip
+                .min(content.iter().take_while(|&&b| b == b' ').count())
+                .min(content.len())
+        };
+        out.extend_from_slice(&content[n..]);
+        out.extend_from_slice(ending);
+    }
+    out
+}
+
+/// The de-marked child buffer for `item`, rebuilt from its span in `source`.
+fn item_demarked_source(item: &ListItem, list: &List, source: &[u8]) -> Vec<u8> {
+    let st = item.meta.span.start.0 as usize;
+    let e = (item.meta.span.end.0 as usize).min(source.len());
+    let raw = if st <= e { &source[st..e] } else { &[][..] };
+    de_mark_item_source(raw, list.ordered)
+}
+
 /// Regenerate a dirty list block from its children + preserved structure (Invariant 2).
 /// Each item's children are serialized recursively; the marker and task checkbox are
 /// re-emitted from the item's metadata.
-fn regenerate_list(list: &List, _source: &[u8], out: &mut Vec<u8>) {
+fn regenerate_list(list: &List, source: &[u8], out: &mut Vec<u8>) {
     for (i, item) in list.items.iter().enumerate() {
         // Marker: ordered lists emit `N.` or `N)`; unordered emit `-`/`*`/`+`.
         if list.ordered {
             let n = list.start + i as u32;
             out.extend_from_slice(n.to_string().as_bytes());
-            out.push(b'.');
-        } else {
-            out.push(list.marker);
         }
+        // `marker` preserves the original delimiter — `.` vs `)` for ordered
+        // lists; hard-coding `.` would corrupt `1)`-style lists on regenerate.
+        out.push(list.marker);
         out.push(b' ');
         // Task list checkbox.
         if let Some(task) = &item.task {
@@ -100,6 +215,9 @@ fn regenerate_list(list: &List, _source: &[u8], out: &mut Vec<u8>) {
                 TaskState::Done => out.extend_from_slice(b"[x] "),
             }
         }
+        // Children's spans index into the item's marker-stripped buffer, not
+        // the document — rebuild it so clean children emit their own bytes.
+        let de = item_demarked_source(item, list, source);
         // Children: the first child's first line goes on the marker line (no indent).
         // Subsequent lines and blocks are indented by 2 spaces.
         let mut first_child = true;
@@ -108,7 +226,7 @@ fn regenerate_list(list: &List, _source: &[u8], out: &mut Vec<u8>) {
                 // Serialize first child without leading indent; its first line follows
                 // the marker on the same line.
                 let mut child_buf = Vec::new();
-                serialize_block(child, _source, &mut child_buf);
+                serialize_block(child, &de, &mut child_buf);
                 let text = String::from_utf8_lossy(&child_buf);
                 let mut lines = text.lines();
                 if let Some(first_line) = lines.next() {
@@ -116,7 +234,11 @@ fn regenerate_list(list: &List, _source: &[u8], out: &mut Vec<u8>) {
                     out.push(b'\n');
                 }
                 for line in lines {
-                    out.extend_from_slice(b"  ");
+                    // Blank lines carry no indent — `"  \n"` would introduce
+                    // trailing whitespace the source never had.
+                    if !line.is_empty() {
+                        out.extend_from_slice(b"  ");
+                    }
                     out.extend_from_slice(line.as_bytes());
                     out.push(b'\n');
                 }
@@ -124,10 +246,12 @@ fn regenerate_list(list: &List, _source: &[u8], out: &mut Vec<u8>) {
             } else {
                 // Subsequent children: indent all lines by 2 spaces.
                 let mut child_buf = Vec::new();
-                serialize_block(child, _source, &mut child_buf);
+                serialize_block(child, &de, &mut child_buf);
                 let text = String::from_utf8_lossy(&child_buf);
                 for line in text.lines() {
-                    out.extend_from_slice(b"  ");
+                    if !line.is_empty() {
+                        out.extend_from_slice(b"  ");
+                    }
                     out.extend_from_slice(line.as_bytes());
                     out.push(b'\n');
                 }
@@ -143,9 +267,14 @@ fn regenerate_list(list: &List, _source: &[u8], out: &mut Vec<u8>) {
 /// Regenerate a dirty block quote from its children (Invariant 2).
 /// Each child block is serialized and prefixed with `> ` on each line.
 fn regenerate_block_quote(bq: &BlockQuote, source: &[u8], out: &mut Vec<u8>) {
+    // Children's spans index into the marker-stripped buffer, not `source`.
+    let st = bq.meta.span.start.0 as usize;
+    let e = (bq.meta.span.end.0 as usize).min(source.len());
+    let raw = if st <= e { &source[st..e] } else { &[][..] };
+    let de = de_mark_quote_source(raw);
     for child in &bq.children {
         let mut child_buf = Vec::new();
-        serialize_block_with_indent(child, source, &mut child_buf, 0);
+        serialize_block_with_indent(child, &de, &mut child_buf, 0);
         // Prefix each line with `> `.
         let text = String::from_utf8_lossy(&child_buf);
         for line in text.lines() {
@@ -195,31 +324,51 @@ fn serialize_block_with_indent(block: &Block, source: &[u8], out: &mut Vec<u8>, 
 
 /// Serialize inline nodes back to Markdown text.
 pub fn serialize_inlines(inlines: &[Inline]) -> String {
+    serialize_inlines_src(inlines, &[])
+}
+
+/// Like `serialize_inlines` but allows verbatim `source[span]` fallback for
+/// node kinds that cannot be regenerated from their stored content
+/// (`RawHtml`, `UnknownInline`). `source` must be the buffer the inline
+/// spans index into — the de-marked buffer for quote/list children.
+fn serialize_inlines_src(inlines: &[Inline], source: &[u8]) -> String {
     let mut s = String::new();
     for il in inlines {
-        serialize_inline(il, &mut s);
+        serialize_inline(il, source, &mut s);
     }
     s
 }
 
-fn serialize_inline(il: &Inline, s: &mut String) {
+/// Emit an inline node's source span verbatim when it is in bounds.
+fn emit_inline_span(meta: &NodeMeta, source: &[u8], s: &mut String) -> bool {
+    let st = meta.span.start.0 as usize;
+    let e = meta.span.end.0 as usize;
+    if st <= e && e <= source.len() {
+        s.push_str(&String::from_utf8_lossy(&source[st..e]));
+        true
+    } else {
+        false
+    }
+}
+
+fn serialize_inline(il: &Inline, source: &[u8], s: &mut String) {
     match il {
         Inline::Text(_, t) => s.push_str(t),
         Inline::Emphasis(_, children, kind) => {
             let d = if *kind == EmphasisKind::Asterisk { "*" } else { "_" };
             s.push_str(d);
-            s.push_str(&serialize_inlines(children));
+            s.push_str(&serialize_inlines_src(children, source));
             s.push_str(d);
         }
         Inline::Strong(_, children, kind) => {
             let d = if *kind == EmphasisKind::Asterisk { "**" } else { "__" };
             s.push_str(d);
-            s.push_str(&serialize_inlines(children));
+            s.push_str(&serialize_inlines_src(children, source));
             s.push_str(d);
         }
         Inline::Strikethrough(_, children) => {
             s.push_str("~~");
-            s.push_str(&serialize_inlines(children));
+            s.push_str(&serialize_inlines_src(children, source));
             s.push_str("~~");
         }
         Inline::CodeSpan(_, t, n) => {
@@ -242,7 +391,7 @@ fn serialize_inline(il: &Inline, s: &mut String) {
         Inline::Link(l) => match l.style {
             LinkStyle::Inline => {
                 s.push('[');
-                s.push_str(&serialize_inlines(&l.inlines));
+                s.push_str(&serialize_inlines_src(&l.inlines, source));
                 s.push_str("](");
                 s.push_str(&l.destination);
                 if let Some(title) = &l.title {
@@ -254,19 +403,19 @@ fn serialize_inline(il: &Inline, s: &mut String) {
             }
             LinkStyle::Reference => {
                 s.push('[');
-                s.push_str(&serialize_inlines(&l.inlines));
+                s.push_str(&serialize_inlines_src(&l.inlines, source));
                 s.push_str("][");
                 s.push_str(l.reference.as_deref().unwrap_or(""));
                 s.push(']');
             }
             LinkStyle::Collapsed => {
                 s.push('[');
-                s.push_str(&serialize_inlines(&l.inlines));
+                s.push_str(&serialize_inlines_src(&l.inlines, source));
                 s.push_str("][]");
             }
             LinkStyle::Shortcut => {
                 s.push('[');
-                s.push_str(&serialize_inlines(&l.inlines));
+                s.push_str(&serialize_inlines_src(&l.inlines, source));
                 s.push(']');
             }
         },
@@ -291,11 +440,17 @@ fn serialize_inline(il: &Inline, s: &mut String) {
             s.push_str("  \n");
         }
         Inline::RawHtml(m) => {
-            // Verbatim fallback.
-            s.push_str(&format!("[raw html @{}..{}]", m.span.start.0, m.span.end.0));
+            // These nodes have no stored content — emit their source span
+            // verbatim when `source` is available, never placeholder text that
+            // would corrupt the regenerated block.
+            if !emit_inline_span(m, source, s) {
+                s.push_str(&format!("[raw html @{}..{}]", m.span.start.0, m.span.end.0));
+            }
         }
         Inline::UnknownInline(m) => {
-            s.push_str(&format!("[unknown @{}..{}]", m.span.start.0, m.span.end.0));
+            if !emit_inline_span(m, source, s) {
+                s.push_str(&format!("[unknown @{}..{}]", m.span.start.0, m.span.end.0));
+            }
         }
     }
 }
@@ -311,11 +466,36 @@ pub fn roundtrip(source: &[u8], profile: editor_domain::MarkdownProfile) -> Vec<
 /// Changes only `[ ]`<->`[x]` within the item's span (§7, Invariant 2).
 pub fn toggle_task_item(source: &[u8], item: &ListItem) -> Option<Vec<u8>> {
     let span = item.meta.span;
-    let region = &source[span.start.0 as usize..span.end.0 as usize];
-    let marker_pos = region
+    let (st, e) = (span.start.0 as usize, span.end.0 as usize);
+    if st > e || e > source.len() {
+        return None; // stale span (item captured before a later edit)
+    }
+    let region = &source[st..e];
+    // The checkbox sits on the item's first line, directly after the list
+    // marker — searching the whole span would hit a literal `[ ]` inside
+    // code spans or text of a non-task item.
+    let first_line_end = region.iter().position(|&b| b == b'\n').unwrap_or(region.len());
+    let first_line = &region[..first_line_end];
+    let marker_pos = first_line
         .windows(3)
-        .position(|w| w == b"[ ]" || w == b"[x]" || w == b"[X]")?;
-    let abs = span.start.0 as usize + marker_pos;
+        .position(|w| w == b"[ ]" || w == b"[x]" || w == b"[X]")
+        .filter(|&pos| {
+            // Everything before `[` must be indent + list marker + whitespace.
+            let prefix = &first_line[..pos];
+            let prefix = &prefix[prefix.iter().take_while(|&&b| b == b' ').count()..];
+            let after_marker = if prefix.first() == Some(&b'-') || prefix.first() == Some(&b'*') || prefix.first() == Some(&b'+') {
+                &prefix[1..]
+            } else {
+                let digits = prefix.iter().take_while(|b| b.is_ascii_digit()).count();
+                if digits > 0 && (prefix.get(digits) == Some(&b'.') || prefix.get(digits) == Some(&b')')) {
+                    &prefix[digits + 1..]
+                } else {
+                    return false;
+                }
+            };
+            after_marker.iter().all(|&b| b == b' ' || b == b'\t')
+        })?;
+    let abs = st + marker_pos;
     let mut out = source.to_vec();
     let new = match &source[abs..abs + 3] {
         b"[ ]" => b"[x]",
@@ -334,7 +514,15 @@ pub fn replace_text_run(
     old: &str,
     new: &str,
 ) -> Option<(Vec<u8>, i64)> {
-    let region = &source[para_span.start.0 as usize..para_span.end.0 as usize];
+    if old.is_empty() {
+        // `windows(0)` panics; an empty needle has no defined position.
+        return None;
+    }
+    let (st, e) = (para_span.start.0 as usize, para_span.end.0 as usize);
+    if st > e || e > source.len() {
+        return None; // stale span
+    }
+    let region = &source[st..e];
     let pos = region.windows(old.len()).position(|w| w == old.as_bytes())?;
     let abs = para_span.start.0 as usize + pos;
     let mut out = source.to_vec();
@@ -445,6 +633,65 @@ mod dirty_tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("1. One"), "first ordered item: {text}");
         assert!(text.contains("2. Two"), "second ordered item: {text}");
+    }
+
+    /// `1)`-style ordered lists must regenerate with `)` — a hard-coded `.`
+    /// would corrupt the source on dirty regeneration.
+    #[test]
+    fn dirty_ordered_list_preserves_paren_marker() {
+        let list = List {
+            meta: meta(100),
+            ordered: true,
+            marker: b')',
+            start: 3,
+            tight: true,
+            items: vec![ListItem {
+                meta: meta(10),
+                task: None,
+                children: vec![Block::Paragraph(Paragraph {
+                    meta: meta(5),
+                    inlines: vec![text_node("Item")],
+                })],
+            }],
+        };
+        let block = Block::List(list);
+        let mut out = Vec::new();
+        serialize_block(&block, b"", &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("3) Item"), "paren marker must be preserved: {text}");
+    }
+
+    /// A header row consisting of a bare `|` produced an inverted cell span
+    /// `(start > end)` which panicked downstream in `parse_inlines` /
+    /// `emit_span`. Degenerate rows must clamp to an empty span instead.
+    #[test]
+    fn degenerate_table_row_does_not_panic() {
+        let src = b"|\n---\n";
+        let doc = crate::parse(src, editor_domain::MarkdownProfile::Gfm).expect("parse must not panic");
+        let out = serialize(&doc, src);
+        assert_eq!(out, src);
+    }
+
+    /// Dirty paragraph/heading regeneration must re-emit the block's line
+    /// ending — otherwise the following block is glued onto the same line —
+    /// and must preserve escape sequences verbatim (`\*`, not bare `*`).
+    #[test]
+    fn dirty_blocks_preserve_newlines_and_escapes() {
+        let src = b"# Title\n\na \\* b\nlast\n";
+        let mut doc = crate::parse(src, editor_domain::MarkdownProfile::Gfm).expect("parse");
+        for b in &mut doc.blocks {
+            b.meta_mut().dirty = true;
+        }
+        let out = serialize(&doc, src);
+        assert_eq!(out, src, "dirty regeneration must keep line endings and escapes");
+    }
+
+    /// `windows(0)` panics — an empty needle must be rejected up front.
+    #[test]
+    fn replace_text_run_empty_old_returns_none() {
+        let src = b"hello\n";
+        let span = SourceSpan::new(ByteOffset(0), ByteOffset(6));
+        assert!(replace_text_run(src, span, "", "x").is_none());
     }
 
     #[test]

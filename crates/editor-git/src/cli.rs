@@ -52,24 +52,70 @@ impl GitCli {
         }
     }
 
+    /// How long a git command may run before it is killed. Network operations
+    /// (fetch/pull/push) need real time; credential prompts are disabled via
+    /// `GIT_TERMINAL_PROMPT=0` so a blocked prompt fails fast instead.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     fn run(git_bin: &str, dir: &Path, args: &[&str]) -> GitResult<std::process::Output> {
-        Command::new(git_bin)
+        use std::io::Read;
+        let mut child = Command::new(git_bin)
             .current_dir(dir)
             .args(args)
-            .output()
-            .map_err(|e| GitError::Io(e.to_string()))
-            .and_then(|o| {
-                if o.status.success() {
-                    Ok(o)
-                } else {
-                    let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    if msg.contains("not a git repository") || msg.contains("not found") {
-                        Err(GitError::NotFound(msg))
-                    } else {
-                        Err(GitError::Other(msg))
-                    }
+            // Never let git prompt for credentials on a terminal that isn't
+            // there — a blocked prompt would hang the command indefinitely.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| GitError::Io(e.to_string()))?;
+        // Drain stdout/stderr on reader threads. Polling try_wait without
+        // draining deadlocks as soon as the child fills a pipe buffer
+        // (a big `status`/`diff` output easily exceeds 64 KiB).
+        let mut out_pipe = child.stdout.take().expect("piped");
+        let mut err_pipe = child.stderr.take().expect("piped");
+        let out_reader = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = out_pipe.read_to_end(&mut v);
+            v
+        });
+        let err_reader = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = err_pipe.read_to_end(&mut v);
+            v
+        });
+        let deadline = std::time::Instant::now() + Self::TIMEOUT;
+        let status = loop {
+            match child.try_wait().map_err(|e| GitError::Io(e.to_string()))? {
+                Some(status) => break status,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-            })
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_reader.join();
+                    let _ = err_reader.join();
+                    return Err(GitError::Other(
+                        "git command timed out (possible dead remote or hung operation)".to_string(),
+                    ));
+                }
+            }
+        };
+        let stdout = out_reader.join().unwrap_or_default();
+        let stderr = err_reader.join().unwrap_or_default();
+        let o = std::process::Output { status, stdout, stderr };
+        if o.status.success() {
+            Ok(o)
+        } else {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if msg.contains("not a git repository") || msg.contains("not found") {
+                Err(GitError::NotFound(msg))
+            } else {
+                Err(GitError::Other(msg))
+            }
+        }
     }
 
     fn exec(&self, args: &[&str]) -> GitResult<std::process::Output> {
@@ -93,28 +139,44 @@ impl VersionControl for GitCli {
     }
 
     fn status(&self) -> GitResult<RepositoryStatus> {
-        // `git status --porcelain=v1 -z` is NUL-delimited; we use the simpler
-        // `--porcelain=v1` (newline-delimited) and avoid paths with newlines (rare).
-        let text = self.exec_text(&["status", "--porcelain=v1", "-b"])?;
+        // `--porcelain=v1 -z`: NUL-delimited records, and paths are emitted
+        // verbatim — the non-`-z` format C-quotes paths containing `"`, `\`,
+        // or non-ASCII bytes (core.quotepath defaults on), so a file named
+        // `файл.md` arrived mangled and could not be staged or diffed.
+        // With `-z`, rename/copy entries are two records: `XY <new>\0<old>\0`.
+        let out = self.exec(&["status", "--porcelain=v1", "-z", "-b"])?;
+        let records: Vec<&[u8]> = out.stdout.split(|&b| b == b'\0').collect();
         let mut status = RepositoryStatus::default();
-        for line in text.lines() {
-            if line.starts_with("## ") {
-                // Branch line: "## main...origin/main [ahead 1]"
-                let rest = &line[3..];
+        let mut i = 0usize;
+        while i < records.len() {
+            let rec = records[i];
+            i += 1;
+            if rec.is_empty() {
+                continue;
+            }
+            if rec.starts_with(b"## ") {
+                // Branch record: "## main...origin/main [ahead 1]"
+                let rest = String::from_utf8_lossy(&rec[3..]);
                 let head = rest.split("...").next().unwrap_or("").trim();
                 status.head_branch = Some(head.to_string());
-                if rest.contains("ahead") || rest.contains("behind") || rest.contains("[") {
-                    status.dirty = true;
+                // Note: ahead/behind is NOT a dirty state — `dirty` means the
+                // working tree has uncommitted changes.
+                continue;
+            }
+            if rec.len() < 4 {
+                continue;
+            }
+            let x = rec[0]; // X = staged (index) status
+            let y = rec[1]; // Y = working tree status
+            let path = String::from_utf8_lossy(&rec[3..]).to_string();
+            // In `-z` mode a rename/copy emits the source path as the next record.
+            let mut old_path = None;
+            if x == b'R' || x == b'C' {
+                if let Some(src) = records.get(i) {
+                    old_path = Some(String::from_utf8_lossy(src).to_string());
+                    i += 1;
                 }
-                continue;
             }
-            if line.len() < 2 {
-                continue;
-            }
-            let x = line.as_bytes()[0]; // X = staged (index) status
-            let y = line.as_bytes()[1]; // Y = working tree status
-            let path_part = &line[3..];
-            let (path, old_path) = parse_rename(path_part);
             let staged_status = status_from_code(x);
             let wt_status = status_from_code(y);
 
@@ -154,6 +216,30 @@ impl VersionControl for GitCli {
     }
 
     fn diff(&self, request: DiffRequest) -> GitResult<Vec<FileDiff>> {
+        // Validate every caller-supplied ref/pathspec *before* building the
+        // argument vector — an unvalidated `--`-looking string would be parsed
+        // as an option by git.
+        match &request {
+            DiffRequest::CommitVsCommit { a, b }
+            | DiffRequest::FileVersionVsVersion { a, b, .. } => {
+                validate_commit_ref(&a.0)?;
+                validate_commit_ref(&b.0)?;
+            }
+            DiffRequest::BranchVsBranch { a, b } => {
+                validate_commit_ref(a)?;
+                validate_commit_ref(b)?;
+            }
+            DiffRequest::HeadVsBranch { branch } => validate_commit_ref(branch)?,
+            DiffRequest::WorkingTreeVsCommit { commit }
+            | DiffRequest::IndexVsCommit { commit }
+            | DiffRequest::WorkingTreeVsCommitFile { commit, .. } => {
+                validate_commit_ref(&commit.0)?;
+            }
+            _ => {}
+        }
+        // File paths go through `literal_pathspec` so glob metacharacters in
+        // file names cannot misfire.
+        let owned;
         let args: Vec<&str> = match &request {
             DiffRequest::WorkingTreeVsIndex => vec!["diff", "--raw"],
             DiffRequest::IndexVsHead => vec!["diff", "--cached", "--raw"],
@@ -164,7 +250,8 @@ impl VersionControl for GitCli {
             DiffRequest::BranchVsBranch { a, b } => vec!["diff", "--raw", a.as_str(), b.as_str()],
             DiffRequest::HeadVsBranch { branch } => vec!["diff", "--raw", "HEAD", branch.as_str()],
             DiffRequest::FileVersionVsVersion { path, a, b } => {
-                vec!["diff", "--raw", a.0.as_str(), b.0.as_str(), "--", path.as_str()]
+                owned = literal_pathspec(path);
+                vec!["diff", "--raw", a.0.as_str(), b.0.as_str(), "--", owned.as_str()]
             }
             DiffRequest::WorkingTreeVsCommit { commit } => {
                 vec!["diff", "--raw", commit.0.as_str()]
@@ -173,7 +260,8 @@ impl VersionControl for GitCli {
                 vec!["diff", "--cached", "--raw", commit.0.as_str()]
             }
             DiffRequest::WorkingTreeVsCommitFile { commit, path } => {
-                vec!["diff", "--raw", commit.0.as_str(), "--", path.as_str()]
+                owned = literal_pathspec(path);
+                vec!["diff", "--raw", commit.0.as_str(), "--", owned.as_str()]
             }
         };
         let text = self.exec_text(&args)?;
@@ -186,9 +274,10 @@ impl VersionControl for GitCli {
                 self.exec(&["add", "-A"])?;
             }
             ChangeSelection::File { path } => {
-                // Use :/ prefix so the path is resolved from the repo root,
-                // not the current working directory (which may be a subdirectory).
-                let ps = if path.starts_with(":/") { path.clone() } else { format!(":/{}", path) };
+                // Resolve from the repo root (the working dir may be a
+                // subdirectory) and match literally — `:/` alone would still
+                // interpret glob metacharacters in the path.
+                let ps = literal_pathspec(&path);
                 self.exec(&["add", "--", ps.as_str()])?;
             }
             ChangeSelection::Hunk { path, hunk_index } => {
@@ -207,7 +296,7 @@ impl VersionControl for GitCli {
                 self.exec(&["reset", "-q"])?;
             }
             ChangeSelection::File { path } => {
-                let ps = if path.starts_with(":/") { path.clone() } else { format!(":/{}", path) };
+                let ps = literal_pathspec(&path);
                 self.exec(&["reset", "-q", "--", ps.as_str()])?;
             }
             ChangeSelection::Hunk { path, hunk_index } => {
@@ -241,13 +330,36 @@ impl VersionControl for GitCli {
             if name.is_empty() {
                 continue;
             }
-            // upstream appears in brackets: [origin/main: ahead 1]
-            let upstream = rest.find('[').and_then(|s| {
-                let e = rest[s..].find(']')?;
-                let inner = &rest[s + 1..s + e];
-                inner.split(':').next().map(|s| s.trim().to_string())
-            });
-            out.push(Branch { name, is_remote: false, upstream, ahead: 0, behind: 0 });
+            // Upstream + tracking counts appear in brackets:
+            //   [origin/main]           — upstream, in sync
+            //   [origin/main: ahead 2, behind 1]
+            //   [gone]                  — upstream was deleted
+            let mut upstream = None;
+            let mut ahead = 0u32;
+            let mut behind = 0u32;
+            if let Some(bi) = rest.find('[') {
+                if let Some(rel_end) = rest[bi..].find(']') {
+                    let inner = rest[bi + 1..bi + rel_end].trim();
+                    if inner != "gone" {
+                        let mut parts = inner.splitn(2, ':');
+                        let up = parts.next().unwrap_or("").trim();
+                        if !up.is_empty() {
+                            upstream = Some(up.to_string());
+                        }
+                        if let Some(tracking) = parts.next() {
+                            for tok in tracking.split(',') {
+                                let tok = tok.trim();
+                                if let Some(n) = tok.strip_prefix("ahead ") {
+                                    ahead = n.trim().parse().unwrap_or(0);
+                                } else if let Some(n) = tok.strip_prefix("behind ") {
+                                    behind = n.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(Branch { name, is_remote: false, upstream, ahead, behind });
         }
         // Remote branches.
         let rem = self.exec_text(&["branch", "-r", "--list"])?;
@@ -262,9 +374,11 @@ impl VersionControl for GitCli {
 
     fn checkout(&self, target: Revision) -> GitResult<()> {
         match target {
-            Revision::Branch(b) => self.exec(&["checkout", b.as_str()])?,
-            Revision::Commit(c) => self.exec(&["checkout", c.0.as_str()])?,
-            Revision::Tag(t) => self.exec(&["checkout", t.as_str()])?,
+            // A leading `-` would be parsed as an option — `checkout -f`
+            // force-discards local changes.
+            Revision::Branch(b) => { validate_name_arg(&b, "branch name")?; self.exec(&["checkout", b.as_str()])?; }
+            Revision::Commit(c) => { validate_commit_ref(&c.0)?; self.exec(&["checkout", c.0.as_str()])?; }
+            Revision::Tag(t) => { validate_name_arg(&t, "tag name")?; self.exec(&["checkout", t.as_str()])?; }
         };
         Ok(())
     }
@@ -307,8 +421,15 @@ fn status_from_code(c: u8) -> FileStatus {
     }
 }
 
-/// Parse a `path` or `old -> new` rename form.
+/// Parse a `path`, `old\tnew` (`--raw` rename), or `old -> new` rename form.
 fn parse_rename(s: &str) -> (String, Option<String>) {
+    // `git diff --raw` emits renames as two TAB-separated paths — without this
+    // branch the path became the literal string "old\tnew" and matched nothing.
+    if let Some(idx) = s.find('\t') {
+        let old = s[..idx].trim().to_string();
+        let new = s[idx + 1..].trim().to_string();
+        return (new, Some(old));
+    }
     if let Some(idx) = s.find(" -> ") {
         let old = s[..idx].trim().to_string();
         let new = s[idx + 4..].trim().to_string();
@@ -331,6 +452,38 @@ fn validate_commit_ref(s: &str) -> GitResult<()> {
         return Err(GitError::Other(format!("invalid characters in commit reference: {:?}", s)));
     }
     Ok(())
+}
+
+/// Validate a git "name" argument (branch/tag/remote names and similar
+/// positional args). Rejects empty strings, leading dashes (which git would
+/// parse as options — `checkout -f` would silently discard local changes), and
+/// control/whitespace characters that can't appear in a ref name anyway.
+fn validate_name_arg(s: &str, what: &str) -> GitResult<()> {
+    if s.is_empty() {
+        return Err(GitError::Other(format!("empty {what}")));
+    }
+    if s.starts_with('-') {
+        return Err(GitError::Other(format!("invalid {what}: {s:?}")));
+    }
+    if s.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(GitError::Other(format!("invalid characters in {what}: {s:?}")));
+    }
+    Ok(())
+}
+
+/// Build a pathspec anchored at the repo root with literal matching:
+/// `:(top,literal)<path>`. Plain `:/` anchors at the root but still applies
+/// glob matching (`*`, `?`, `[...]`), which would misfire for files whose
+/// names contain metacharacters. A caller-supplied `:`-prefixed magic
+/// pathspec is passed through unchanged.
+fn literal_pathspec(path: &str) -> String {
+    // Pass through caller-supplied magic pathspecs and absolute paths
+    // (git accepts absolute paths literally after `--`).
+    if path.starts_with(':') || Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        format!(":(top,literal){path}")
+    }
 }
 
 /// Parse `git diff --raw` output into `FileDiff`s (without hunks; hunks come from a
@@ -357,12 +510,14 @@ fn parse_raw_diff(text: &str) -> Vec<FileDiff> {
 
 /// Get the unified diff for a single file (working tree vs index).
 fn file_unified_diff(repo: &GitCli, path: &str) -> GitResult<String> {
-    repo.exec_text(&["diff", "--", path])
+    let ps = literal_pathspec(path);
+    repo.exec_text(&["diff", "--", ps.as_str()])
 }
 
 /// Get the unified diff for a single file (index vs HEAD) — for unstaging.
 fn file_unified_diff_cached(repo: &GitCli, path: &str) -> GitResult<String> {
-    repo.exec_text(&["diff", "--cached", "--", path])
+    let ps = literal_pathspec(path);
+    repo.exec_text(&["diff", "--cached", "--", ps.as_str()])
 }
 
 /// Extract the `hunk_index`-th hunk from a unified diff text.
@@ -371,7 +526,10 @@ fn extract_hunk(diff_text: &str, hunk_index: usize) -> Option<String> {
     let mut hunk_count = 0usize;
     let mut current: Vec<&str> = Vec::new();
     let mut in_hunk = false;
-    for line in diff_text.lines() {
+    // `split('\n')` NOT `lines()`: `lines()` strips a trailing '\r', which
+    // corrupts hunks from CRLF files — the rebuilt patch wouldn't match the
+    // real bytes and `git apply` would reject it (or worse, misapply).
+    for line in diff_text.split('\n') {
         if line.starts_with("@@ ") {
             // If we were collecting the target hunk, we're done.
             if in_hunk && hunk_count - 1 == hunk_index {
@@ -443,45 +601,51 @@ fn unstage_hunk(repo: &GitCli, path: &str, hunk_index: usize) -> GitResult<()> {
 /// constructed patch that includes only the specified lines.
 fn stage_line_range(repo: &GitCli, path: &str, _range: ByteRange) -> GitResult<()> {
     // Simplified: stage the whole file for now. Line-precise staging is a UI-layer follow-up.
-    repo.exec(&["add", "--", path])?;
+    let ps = literal_pathspec(path);
+    repo.exec(&["add", "--", ps.as_str()])?;
     Ok(())
 }
 
 fn unstage_line_range(repo: &GitCli, path: &str, _range: ByteRange) -> GitResult<()> {
-    repo.exec(&["reset", "-q", "--", path])?;
+    let ps = literal_pathspec(path);
+    repo.exec(&["reset", "-q", "--", ps.as_str()])?;
+    Ok(())
+}
+
+/// Write `patch` to a fresh temp file and run `git apply --cached [--reverse]`
+/// on it. `create_new` refuses to follow a pre-existing file/symlink at the
+/// predictable temp path (TOCTOU hardening on shared temp dirs).
+fn apply_patch_via_temp(repo: &GitCli, patch: &str, reverse: bool) -> GitResult<()> {
+    use std::io::Write;
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("womd_hunk_patch_{}_{}.patch", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+    let write_result = std::fs::File::create_new(&tmp)
+        .and_then(|mut f| f.write_all(patch.as_bytes()));
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(GitError::Io(e.to_string()));
+    }
+    let path_str = tmp.to_string_lossy().to_string();
+    let args = if reverse {
+        vec!["apply", "--cached", "--reverse", path_str.as_str()]
+    } else {
+        vec!["apply", "--cached", path_str.as_str()]
+    };
+    let result = repo.exec(&args);
+    let _ = std::fs::remove_file(&tmp);
+    result?;
     Ok(())
 }
 
 /// Apply a patch to the index using `git apply --cached`.
 fn apply_patch_to_index(repo: &GitCli, patch: &str) -> GitResult<()> {
-    use std::io::Write;
-    let mut tmp = std::env::temp_dir();
-    tmp.push(format!("womd_hunk_patch_{}.patch", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| GitError::Io(e.to_string()))?;
-        f.write_all(patch.as_bytes()).map_err(|e| GitError::Io(e.to_string()))?;
-    }
-    let path_str = tmp.to_string_lossy().to_string();
-    let result = repo.exec(&["apply", "--cached", path_str.as_str()]);
-    let _ = std::fs::remove_file(&tmp);
-    result?;
-    Ok(())
+    apply_patch_via_temp(repo, patch, false)
 }
 
 /// Apply a reverse patch to the index (unstage).
 fn apply_patch_to_index_reverse(repo: &GitCli, patch: &str) -> GitResult<()> {
-    use std::io::Write;
-    let mut tmp = std::env::temp_dir();
-    tmp.push(format!("womd_hunk_unpatch_{}.patch", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| GitError::Io(e.to_string()))?;
-        f.write_all(patch.as_bytes()).map_err(|e| GitError::Io(e.to_string()))?;
-    }
-    let path_str = tmp.to_string_lossy().to_string();
-    let result = repo.exec(&["apply", "--cached", "--reverse", path_str.as_str()]);
-    let _ = std::fs::remove_file(&tmp);
-    result?;
-    Ok(())
+    apply_patch_via_temp(repo, patch, true)
 }
 
 /// File history for a single document (§45).
@@ -489,7 +653,8 @@ pub fn file_history(repo: &GitCli, path: &str) -> GitResult<Vec<FileHistoryEntry
     if path.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
         return Err(GitError::Other("invalid characters in path".into()));
     }
-    let text = repo.exec_text(&["log", "--follow", "--pretty=format:%H%x09%an%x09%ad%x09%s", "--date=short", "--", path])?;
+    let ps = literal_pathspec(path);
+    let text = repo.exec_text(&["log", "--follow", "--pretty=format:%H%x09%an%x09%ad%x09%s", "--date=short", "--", ps.as_str()])?;
     let mut out = Vec::new();
     for line in text.lines() {
         let mut f = line.split('\t');
@@ -543,7 +708,13 @@ impl GitExtended for GitCli {
             let idx_str = parts[0].trim_start_matches("stash@{").trim_end_matches('}');
             let index: usize = idx_str.parse().unwrap_or(0);
             let rest = parts[1];
-            let branch = rest.split(':').next().unwrap_or("").trim().to_string();
+            // "WIP on <branch>: <sha> <subject>" or "On <branch>: <message>"
+            // (custom -m stashes) — extract just the branch name.
+            let after_prefix = rest
+                .strip_prefix("WIP on ")
+                .or_else(|| rest.strip_prefix("On "))
+                .unwrap_or(rest);
+            let branch = after_prefix.split(':').next().unwrap_or("").trim().to_string();
             let message = rest.to_string();
             out.push(StashEntry { index, message, branch });
         }
@@ -583,25 +754,32 @@ impl GitExtended for GitCli {
 
     // ── Branch management ──────────────────────────────────────────────────
     fn create_branch(&self, name: &str) -> GitResult<()> {
+        validate_name_arg(name, "branch name")?;
         self.exec(&["branch", name])?;
         Ok(())
     }
 
     fn delete_branch(&self, name: &str, force: bool) -> GitResult<()> {
+        validate_name_arg(name, "branch name")?;
         let flag = if force { "-D" } else { "-d" };
         self.exec(&["branch", flag, name])?;
         Ok(())
     }
 
     fn rename_branch(&self, old_name: &str, new_name: &str) -> GitResult<()> {
+        validate_name_arg(old_name, "branch name")?;
+        validate_name_arg(new_name, "branch name")?;
         self.exec(&["branch", "-m", old_name, new_name])?;
         Ok(())
     }
 
     // ── Merge / Rebase ─────────────────────────────────────────────────────
     fn merge(&self, branch: &str, strategy: MergeStrategy) -> GitResult<()> {
+        // The merge target is a commit-ish; a leading `-` would smuggle
+        // options like `--abort` or `--strategy=` into the merge.
+        validate_commit_ref(branch)?;
         let args: Vec<&str> = match strategy {
-            MergeStrategy::Merge => vec!["merge", "--no-ff", branch],
+            MergeStrategy::Merge => vec!["merge", branch],
             MergeStrategy::FastForwardOnly => vec!["merge", "--ff-only", branch],
             MergeStrategy::NoFastForward => vec!["merge", "--no-ff", branch],
             MergeStrategy::Squash => vec!["merge", "--squash", branch],
@@ -621,6 +799,7 @@ impl GitExtended for GitCli {
     }
 
     fn rebase(&self, branch: &str) -> GitResult<()> {
+        validate_commit_ref(branch)?;
         self.exec(&["rebase", branch])?;
         Ok(())
     }
@@ -695,6 +874,7 @@ impl GitExtended for GitCli {
     }
 
     fn create_tag(&self, name: &str, message: Option<&str>) -> GitResult<()> {
+        validate_name_arg(name, "tag name")?;
         match message {
             Some(msg) => { self.exec(&["tag", "-a", name, "-m", msg])?; }
             None => { self.exec(&["tag", name])?; }
@@ -703,6 +883,7 @@ impl GitExtended for GitCli {
     }
 
     fn delete_tag(&self, name: &str) -> GitResult<()> {
+        validate_name_arg(name, "tag name")?;
         self.exec(&["tag", "-d", name])?;
         Ok(())
     }
@@ -727,37 +908,53 @@ impl GitExtended for GitCli {
             });
             if is_fetch { entry.fetch_url = url.clone(); }
             else { entry.push_url = url.clone(); }
-            entry.url = entry.fetch_url.clone();
+            // The canonical url prefers fetch; fall back to push for
+            // remotes that only have a push URL configured.
+            entry.url = if !entry.fetch_url.is_empty() {
+                entry.fetch_url.clone()
+            } else {
+                entry.push_url.clone()
+            };
         }
         Ok(remotes.into_values().collect())
     }
 
     fn add_remote(&self, name: &str, url: &str) -> GitResult<()> {
+        validate_name_arg(name, "remote name")?;
+        if url.starts_with('-') || url.chars().any(|c| c.is_control()) {
+            return Err(GitError::Other(format!("invalid remote url: {url:?}")));
+        }
         self.exec(&["remote", "add", name, url])?;
         Ok(())
     }
 
     fn remove_remote(&self, name: &str) -> GitResult<()> {
+        validate_name_arg(name, "remote name")?;
         self.exec(&["remote", "remove", name])?;
         Ok(())
     }
 
     fn push_to_remote(&self, remote: &str, branch: &str, force: bool) -> GitResult<()> {
+        validate_name_arg(remote, "remote name")?;
+        validate_name_arg(branch, "branch name")?;
         let refspec = format!("{}:{}", branch, branch);
         if force {
-            self.exec(&["push", "--force", remote, branch, refspec.as_str()])?;
+            self.exec(&["push", "--force", remote, refspec.as_str()])?;
         } else {
-            self.exec(&["push", remote, branch, refspec.as_str()])?;
+            self.exec(&["push", remote, refspec.as_str()])?;
         }
         Ok(())
     }
 
     fn pull_from_remote(&self, remote: &str, branch: &str) -> GitResult<()> {
+        validate_name_arg(remote, "remote name")?;
+        validate_commit_ref(branch)?;
         self.exec(&["pull", remote, branch])?;
         Ok(())
     }
 
     fn fetch_remote(&self, remote: &str) -> GitResult<()> {
+        validate_name_arg(remote, "remote name")?;
         self.exec(&["fetch", remote])?;
         Ok(())
     }
@@ -779,7 +976,8 @@ impl GitExtended for GitCli {
         let limit = format!("-{}", max_count);
         let fmt = "%H%x09%h%x09%an%x09%ae%x09%ad%x09%s%x09%b%x09%p%x1e";
         let pretty = format!("format:{}", fmt);
-        let text = self.exec_text(&["log", "--follow", "-M", &format!("--pretty={}", pretty), "--date=short", limit.as_str(), "--", path])?;
+        let ps = literal_pathspec(path);
+        let text = self.exec_text(&["log", "--follow", "-M", &format!("--pretty={}", pretty), "--date=short", limit.as_str(), "--", ps.as_str()])?;
         Ok(parse_log(&text))
     }
 
@@ -800,7 +998,8 @@ impl GitExtended for GitCli {
     fn diff_file_at_commits(&self, path: &str, a: &str, b: &str) -> GitResult<Vec<FileDiff>> {
         validate_commit_ref(a)?;
         validate_commit_ref(b)?;
-        let text = self.exec_text(&["diff", "--raw", a, b, "--", path])?;
+        let ps = literal_pathspec(path);
+        let text = self.exec_text(&["diff", "--raw", a, b, "--", ps.as_str()])?;
         Ok(parse_raw_diff(&text))
     }
 
@@ -833,6 +1032,7 @@ impl GitExtended for GitCli {
 
     // ── Config ─────────────────────────────────────────────────────────────
     fn config_get(&self, key: &str) -> GitResult<Option<String>> {
+        validate_name_arg(key, "config key")?;
         match self.exec_text(&["config", key]) {
             Ok(text) => {
                 let trimmed = text.trim();
@@ -844,6 +1044,7 @@ impl GitExtended for GitCli {
     }
 
     fn config_set(&self, key: &str, value: &str) -> GitResult<()> {
+        validate_name_arg(key, "config key")?;
         self.exec(&["config", key, value])?;
         Ok(())
     }
@@ -865,9 +1066,10 @@ impl GitExtended for GitCli {
     }
 
     fn diff_file_raw(&self, path: &str) -> GitResult<String> {
-        let text = self.exec_text(&["diff", "HEAD", "--", path])?;
+        let ps = literal_pathspec(path);
+        let text = self.exec_text(&["diff", "HEAD", "--", ps.as_str()])?;
         if text.trim().is_empty() {
-            self.exec_text(&["diff", "--cached", "HEAD", "--", path])
+            self.exec_text(&["diff", "--cached", "HEAD", "--", ps.as_str()])
         } else {
             Ok(text)
         }
@@ -876,21 +1078,25 @@ impl GitExtended for GitCli {
     fn diff_file_commits_raw(&self, path: &str, commit_a: &str, commit_b: &str) -> GitResult<String> {
         validate_commit_ref(commit_a)?;
         validate_commit_ref(commit_b)?;
-        self.exec_text(&["diff", commit_a, commit_b, "--", path])
+        let ps = literal_pathspec(path);
+        self.exec_text(&["diff", commit_a, commit_b, "--", ps.as_str()])
     }
 
     fn diff_file_vs_commit_raw(&self, path: &str, commit: &str) -> GitResult<String> {
         validate_commit_ref(commit)?;
-        self.exec_text(&["diff", commit, "--", path])
+        let ps = literal_pathspec(path);
+        self.exec_text(&["diff", commit, "--", ps.as_str()])
     }
 
     fn discard_file(&self, path: &str) -> GitResult<()> {
-        self.exec_text(&["checkout", "--", path])?;
+        let ps = literal_pathspec(path);
+        self.exec_text(&["checkout", "--", ps.as_str()])?;
         Ok(())
     }
 
     fn clean_files(&self, pathspec: &str) -> GitResult<()> {
-        self.exec_text(&["clean", "-f", "--", pathspec])?;
+        let ps = literal_pathspec(pathspec);
+        self.exec_text(&["clean", "-f", "--", ps.as_str()])?;
         Ok(())
     }
 
@@ -1133,6 +1339,24 @@ mod tests {
         let st = repo.status().expect("status");
         assert!(st.staged.iter().any(|f| f.path == "doc.md"), "some changes should still be staged");
         assert!(st.changes.iter().any(|f| f.path == "doc.md"), "some changes should be unstaged");
+    }
+
+    /// `extract_hunk` must keep '\r' bytes — `str::lines` strips them, which
+    /// silently corrupts hunks for CRLF files and makes `git apply` reject
+    /// the rebuilt patch ("patch does not apply").
+    #[test]
+    fn extract_hunk_preserves_crlf_bytes() {
+        let diff = "diff --git a/f.md b/f.md\r\nindex 111..222 100644\r\n--- a/f.md\r\n+++ b/f.md\r\n@@ -1,2 +1,2 @@\r\n-old line\r\n+new line\r\n context\r\n";
+        let hunk = extract_hunk(diff, 0).expect("hunk");
+        assert!(hunk.contains("-old line\r\n"), "CR stripped: {hunk:?}");
+        assert!(hunk.contains(" context\r\n"), "CR stripped: {hunk:?}");
+    }
+
+    /// Selecting a hunk index that doesn't exist returns None, not a panic.
+    #[test]
+    fn extract_hunk_out_of_range_is_none() {
+        let diff = "@@ -1 +1 @@\n-a\n+b\n";
+        assert!(extract_hunk(diff, 5).is_none());
     }
 
     // ── Tests for GitExtended ────────────────────────────────────────────────
@@ -2581,5 +2805,100 @@ mod tests {
         let work_dir = repo.work_dir();
         assert!(work_dir.exists(), "work_dir should exist");
         assert_eq!(work_dir, dir.path());
+    }
+
+    /// `git status` without `-z` C-quotes non-ASCII and special-char paths
+    /// (core.quotepath), which mangled `файл.md` into octal escapes and broke
+    /// staging/diff. The `-z` parser must return verbatim paths.
+    #[test]
+    fn status_non_ascii_path_is_verbatim() {
+        if !git_available() { return; }
+        let dir = make_repo();
+        write(dir.path(), "файл (2).md", b"# x\n");
+        let repo = GitCli::open(dir.path()).expect("open");
+        let st = repo.status().expect("status");
+        assert!(st.untracked.iter().any(|f| f.path == "файл (2).md"),
+            "untracked path should be verbatim, got: {:?}", st.untracked);
+    }
+
+    /// Rename entries in `-z` mode emit the source path as a following record —
+    /// the parser must pair them, not treat the source as a separate file.
+    #[test]
+    fn status_rename_pairs_paths() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        let git = std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string());
+        Command::new(&git).current_dir(repo.work_dir()).args(["mv", "README.md", "renamed.md"]).output().expect("git mv");
+        let st = repo.status().expect("status");
+        let ren = st.staged.iter().find(|f| f.status == FileStatus::Renamed);
+        let ren = ren.expect("rename should be staged");
+        assert_eq!(ren.path, "renamed.md");
+        assert_eq!(ren.old_path.as_deref(), Some("README.md"));
+        // The source path must not leak into staged as its own entry.
+        assert!(!st.staged.iter().any(|f| f.path == "README.md" && f.old_path.is_none()));
+    }
+
+    // ── Option-injection guards ────────────────────────────────────────────
+    // User-controlled names must never reach git as a leading `-` argument:
+    // `git checkout -f` discards local changes, `git fetch --prune` deletes
+    // remote-tracking refs, `git pull origin --rebase` changes pull semantics.
+    #[test]
+    fn rejects_dash_prefixed_branch_checkout() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        assert!(repo.checkout(Revision::Branch("-f".to_string())).is_err());
+        assert!(repo.checkout(Revision::Branch("--force".to_string())).is_err());
+    }
+
+    #[test]
+    fn rejects_dash_prefixed_names() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        assert!(repo.create_branch("-x").is_err());
+        assert!(repo.delete_branch("--all", false).is_err());
+        assert!(repo.rename_branch("-m", "x").is_err());
+        assert!(repo.merge("--abort", MergeStrategy::Merge).is_err());
+        assert!(repo.rebase("--continue").is_err());
+        assert!(repo.create_tag("-d", None).is_err());
+        assert!(repo.add_remote("-t", "https://x").is_err());
+        assert!(repo.add_remote("origin", "-m").is_err());
+        assert!(repo.fetch_remote("--prune").is_err());
+        assert!(repo.pull_from_remote("origin", "--rebase").is_err());
+        assert!(repo.push_to_remote("-u", "main", false).is_err());
+        assert!(repo.config_get("-l").is_err());
+    }
+
+    #[test]
+    fn rejects_control_chars_in_names() {
+        if !git_available() { return; }
+        let (_dir, repo, _id) = make_repo_with_commit();
+        assert!(repo.create_branch("bad\nname").is_err());
+        assert!(repo.create_branch("bad name").is_err());
+        assert!(repo.checkout(Revision::Branch(String::new())).is_err());
+    }
+
+    /// `git diff --raw` separates rename paths with a TAB — the old parser
+    /// looked for " -> " and produced the literal path "old\tnew".
+    #[test]
+    fn parse_rename_tab_separated() {
+        let (path, old) = parse_rename("old name.md\tnew name.md");
+        assert_eq!(path, "new name.md");
+        assert_eq!(old, Some("old name.md".to_string()));
+        let (path2, old2) = parse_rename("a -> b");
+        assert_eq!(path2, "b");
+        assert_eq!(old2, Some("a".to_string()));
+        let (plain, none) = parse_rename("plain.md");
+        assert_eq!(plain, "plain.md");
+        assert_eq!(none, None);
+    }
+
+    /// A `--raw` rename line must yield a usable new path + old path.
+    #[test]
+    fn parse_raw_diff_rename() {
+        let text = ":100644 100644 abc1234 def5678 R100\told.md\tnew.md\n";
+        let diffs = parse_raw_diff(text);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, "new.md");
+        assert_eq!(diffs[0].old_path, Some("old.md".to_string()));
     }
 }

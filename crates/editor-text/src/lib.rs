@@ -60,24 +60,73 @@ pub fn line_column_to_byte(table: &PieceTable, lc: LineColumn) -> ByteOffset {
     } else {
         table.len()
     };
-    // Walk scalars within [line_start, next) until we reach the column or the line end.
+    // Walk scalars within [line_start, next) until we reach the column.
     let line_bytes = table.extract_bytes(ByteRange::new(ByteOffset(line_start), ByteOffset(next)));
-    let mut bytes_into_line = 0u64;
     let mut scalars_seen = 0u64;
     for (i, b) in line_bytes.iter().enumerate() {
         if b & 0xC0 != 0x80 {
             if scalars_seen == lc.column.0 {
-                bytes_into_line = i as u64;
-                break;
+                return ByteOffset(line_start + i as u64);
             }
             scalars_seen += 1;
         }
-        bytes_into_line = i as u64;
     }
-    // If column exceeds line length, clamp to line end (before the newline).
-    ByteOffset(line_start + bytes_into_line)
+    // Column at/past end of line: clamp to the line end (the next line's start,
+    // or the document end for the last line). Never lands mid-scalar.
+    ByteOffset(next)
 }
 
 /// Re-export the original buffer type for storage/mmap integration.
 /// Uses `ByteSource` trait to support both in-memory and mmap-backed buffers.
 pub type OriginalBuffer = Arc<dyn editor_domain::ByteSource>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(bytes: &[u8]) -> PieceTable {
+        PieceTable::from_bytes(bytes.to_vec())
+    }
+
+    #[test]
+    fn line_column_round_trip() {
+        let t = table(b"ab\ncd\nef");
+        for off in 0..=t.len() {
+            let lc = byte_to_line_column(&t, ByteOffset(off));
+            let back = line_column_to_byte(&t, lc);
+            assert_eq!(back.0, off.min(t.len()), "offset {off} lc={lc:?}");
+        }
+    }
+
+    #[test]
+    fn line_column_past_eol_clamps_to_line_end() {
+        let t = table(b"ab\ncd");
+        // Line 0 has 2 scalars + newline; huge column clamps to next line start.
+        assert_eq!(line_column_to_byte(&t, LineColumn { line: LineIndex(0), column: ScalarIndex(99) }).0, 3);
+        // Last line clamps to document end, not the last byte.
+        assert_eq!(line_column_to_byte(&t, LineColumn { line: LineIndex(1), column: ScalarIndex(99) }).0, 5);
+    }
+
+    #[test]
+    fn line_column_never_lands_mid_scalar() {
+        // 'é' is two UTF-8 bytes (0xC3 0xA9); '😀' is four.
+        let t = table("aé😀".as_bytes());
+        // Columns 0..=3 land on scalar boundaries 0,1,3,7. Column past the end
+        // clamps to the document end — never inside a multi-byte scalar.
+        let boundaries: Vec<u64> = (0..=3u64)
+            .map(|c| line_column_to_byte(&t, LineColumn { line: LineIndex(0), column: ScalarIndex(c) }).0)
+            .collect();
+        assert_eq!(boundaries, vec![0, 1, 3, 7]);
+        assert_eq!(
+            line_column_to_byte(&t, LineColumn { line: LineIndex(0), column: ScalarIndex(99) }).0,
+            t.len()
+        );
+    }
+
+    #[test]
+    fn line_column_empty_line() {
+        let t = table(b"a\n\nb");
+        assert_eq!(line_column_to_byte(&t, LineColumn { line: LineIndex(1), column: ScalarIndex(0) }).0, 2);
+        assert_eq!(line_column_to_byte(&t, LineColumn { line: LineIndex(1), column: ScalarIndex(5) }).0, 3);
+    }
+}

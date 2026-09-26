@@ -23,7 +23,7 @@ impl SourceSpan {
         ByteRange::new(self.start, self.end)
     }
     pub fn len(&self) -> u64 {
-        self.end.0 - self.start.0
+        self.end.0.saturating_sub(self.start.0)
     }
 }
 
@@ -364,6 +364,108 @@ pub enum LinkStyle {
     Reference,
     Collapsed,
     Shortcut,
+}
+
+// ---------------------------------------------------------------------------
+// Span shifting (incremental reparse support, ADR-003 §58)
+// ---------------------------------------------------------------------------
+
+fn shift_offset(off: &mut ByteOffset, delta: i64) {
+    *off = ByteOffset((off.0 as i64 + delta).max(0) as u64);
+}
+
+fn shift_span(span: &mut SourceSpan, delta: i64) {
+    shift_offset(&mut span.start, delta);
+    shift_offset(&mut span.end, delta);
+}
+
+fn shift_meta(meta: &mut NodeMeta, delta: i64) {
+    shift_span(&mut meta.span, delta);
+}
+
+/// Shift every *document-coordinate* `SourceSpan` in a top-level block by `delta`.
+///
+/// Used by `parse_range` to rebase window-relative spans onto absolute document
+/// offsets and by `DocumentBuffer`'s incremental reparse to shift trailing blocks
+/// after an edit.
+///
+/// Spans that live in a *de-marked* coordinate space are intentionally left
+/// untouched: `BlockQuote::children` and `ListItem::children` are parsed against a
+/// marker-stripped buffer, so their offsets are not document coordinates. Only the
+/// container's own spans (block meta, list item meta) are document coordinates.
+pub fn shift_block_spans(block: &mut Block, delta: i64) {
+    match block {
+        Block::BlankLine(m)
+        | Block::ThematicBreak(ThematicBreak { meta: m, .. })
+        | Block::CodeBlock(CodeBlock { meta: m, .. })
+        | Block::HtmlBlock(HtmlBlock { meta: m })
+        | Block::LinkReferenceDefinition(LinkReferenceDefinition { meta: m, .. })
+        | Block::UnknownBlock(UnknownBlock { meta: m, .. }) => shift_meta(m, delta),
+        Block::Paragraph(p) => {
+            shift_meta(&mut p.meta, delta);
+            for i in &mut p.inlines {
+                shift_inline_spans(i, delta);
+            }
+        }
+        Block::Heading(h) => {
+            shift_meta(&mut h.meta, delta);
+            for i in &mut h.inlines {
+                shift_inline_spans(i, delta);
+            }
+        }
+        Block::BlockQuote(bq) => {
+            // Children spans are de-marked coordinates — shift the container only.
+            shift_meta(&mut bq.meta, delta);
+        }
+        Block::List(l) => {
+            shift_meta(&mut l.meta, delta);
+            for item in &mut l.items {
+                // Item span is a document coordinate; item children are de-marked.
+                shift_meta(&mut item.meta, delta);
+            }
+        }
+        Block::Table(t) => {
+            shift_meta(&mut t.meta, delta);
+            for row in &mut t.rows {
+                shift_meta(&mut row.meta, delta);
+                for cell in &mut row.cells {
+                    shift_meta(&mut cell.meta, delta);
+                    for i in &mut cell.inlines {
+                        shift_inline_spans(i, delta);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Shift an inline node's document-coordinate span (and any nested inline
+/// children) by `delta`.
+pub fn shift_inline_spans(inline: &mut Inline, delta: i64) {
+    match inline {
+        Inline::Text(m, _)
+        | Inline::CodeSpan(m, _, _)
+        | Inline::MathSpan(m, _, _)
+        | Inline::Autolink(m, _)
+        | Inline::HardBreak(m)
+        | Inline::RawHtml(m)
+        | Inline::UnknownInline(m) => shift_meta(m, delta),
+        Inline::Emphasis(m, children, _)
+        | Inline::Strong(m, children, _)
+        | Inline::Strikethrough(m, children) => {
+            shift_meta(m, delta);
+            for c in children {
+                shift_inline_spans(c, delta);
+            }
+        }
+        Inline::Link(l) => {
+            shift_meta(&mut l.meta, delta);
+            for c in &mut l.inlines {
+                shift_inline_spans(c, delta);
+            }
+        }
+        Inline::Image(i) => shift_meta(&mut i.meta, delta),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

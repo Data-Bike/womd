@@ -49,6 +49,7 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ManifestParseEr
     let id = value
         .get("id")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
         .ok_or(ManifestParseError::MissingField("id"))?
         .to_string();
     let name = value
@@ -81,12 +82,18 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ManifestParseEr
 }
 
 fn parse_api_version(s: &str) -> Result<ApiVersion, ManifestParseError> {
+    // Strict `major[.minor]`: reject extra components and non-numeric parts
+    // (the old code silently mapped "1.x" and "1.2.3" to 1.0/1.2).
     let parts: Vec<&str> = s.split('.').collect();
-    let major = parts
-        .first()
-        .and_then(|p| p.parse::<u32>().ok())
-        .ok_or_else(|| ManifestParseError::InvalidApiVersion(s.to_string()))?;
-    let minor = parts.get(1).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    let err = || ManifestParseError::InvalidApiVersion(s.to_string());
+    if parts.len() > 2 {
+        return Err(err());
+    }
+    let major = parts[0].parse::<u32>().map_err(|_| err())?;
+    let minor = match parts.get(1) {
+        Some(p) => p.parse::<u32>().map_err(|_| err())?,
+        None => 0,
+    };
     Ok(ApiVersion { major, minor })
 }
 
@@ -179,6 +186,30 @@ version = "1"
 api_version = "abc"
 "#;
         assert!(matches!(parse_manifest(bad), Err(ManifestParseError::InvalidApiVersion(_))));
+    }
+
+    /// Malformed versions must be rejected, not silently coerced:
+    /// "1.x" -> minor unparseable (was: 0), "1.2.3" -> extra component (was: 1.2).
+    #[test]
+    fn api_version_rejects_malformed_shapes() {
+        for bad in ["1.x", "1.2.3", "x", "1.", "", ".2"] {
+            let m = format!("id = \"p\"\nname = \"p\"\nversion = \"1\"\napi_version = \"{bad}\"\n");
+            assert!(
+                matches!(parse_manifest(&m), Err(ManifestParseError::InvalidApiVersion(_))),
+                "api_version {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_id_rejected() {
+        let m = r#"
+id = ""
+name = "x"
+version = "1"
+api_version = "1"
+"#;
+        assert!(matches!(parse_manifest(m), Err(ManifestParseError::MissingField("id"))));
     }
 
     #[test]

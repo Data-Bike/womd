@@ -68,8 +68,39 @@ fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
 pub fn line_diff(old: &[u8], new: &[u8]) -> Vec<LineChange> {
     let a = split_lines(old);
     let b = split_lines(new);
-    let script = myers_edit_script(&a, &b);
-    script_to_changes(&a, &b, &script)
+    // Strip the common prefix/suffix first: Myers' trace memory is
+    // O(D * (N+M)), so shrinking the problem to the changed middle is both a
+    // large speed and memory win for typical small-edit diffs.
+    let mut p = 0usize;
+    while p < a.len() && p < b.len() && a[p] == b[p] {
+        p += 1;
+    }
+    let mut s = 0usize;
+    while s < a.len() - p && s < b.len() - p && a[a.len() - 1 - s] == b[b.len() - 1 - s] {
+        s += 1;
+    }
+    let a_mid = &a[p..a.len() - s];
+    let b_mid = &b[p..b.len() - s];
+    let mid_script = myers_edit_script(a_mid, b_mid);
+
+    let mut out = Vec::with_capacity(p + mid_script.len() + s);
+    for i in 0..p {
+        out.push(LineChange::Equal {
+            old_no: (i + 1) as u32,
+            new_no: (i + 1) as u32,
+            bytes: a[i].to_vec(),
+        });
+    }
+    out.extend(script_to_changes(a_mid, b_mid, &mid_script, p as u32));
+    for i in 0..s {
+        let idx = a.len() - s + i;
+        out.push(LineChange::Equal {
+            old_no: (idx + 1) as u32,
+            new_no: (b.len() - s + i + 1) as u32,
+            bytes: a[idx].to_vec(),
+        });
+    }
+    out
 }
 
 /// Myers edit script as a sequence of operations over the concatenated a/b walk.
@@ -98,7 +129,13 @@ fn myers_edit_script(a: &[&[u8]], b: &[&[u8]]) -> Vec<Step> {
     let mut trace: Vec<Vec<i64>> = Vec::new();
 
     let offset = max as i64;
-    for d in 0..=max as i64 {
+    // Bound total trace memory: each iteration stores a clone of `v` (2*max+1
+    // i64 entries). Cap the trace at ~16M entries so pathological inputs
+    // (e.g. two large completely-different files) degrade to a coarse but
+    // still-correct diff instead of allocating gigabytes.
+    const TRACE_ENTRY_BUDGET: usize = 16 * 1024 * 1024;
+    let max_d = (TRACE_ENTRY_BUDGET / (2 * max + 1)).min(max) as i64;
+    for d in 0..=max_d {
         trace.push(v.clone());
         for k in (-d..=d).step_by(2) {
             let mut x = if k == -d || (k != d && v[(k - 1 + offset) as usize] < v[(k + 1 + offset) as usize]) {
@@ -117,7 +154,8 @@ fn myers_edit_script(a: &[&[u8]], b: &[&[u8]]) -> Vec<Step> {
             }
         }
     }
-    // Fallback (should not happen): emit all deletes then all inserts.
+    // Fallback (iteration budget exhausted — should not happen for typical
+    // diffs): emit all deletes then all inserts. Correct, just not minimal.
     let mut out = Vec::with_capacity(n + m);
     out.extend(std::iter::repeat_n(Step::Delete, n));
     out.extend(std::iter::repeat_n(Step::Insert, m));
@@ -179,23 +217,27 @@ fn backtrack(trace: &[Vec<i64>], a: &[&[u8]], b: &[&[u8]], last_d: i64) -> Vec<S
 }
 
 /// Convert an edit script into `LineChange`s with 1-based line numbers.
-fn script_to_changes(a: &[&[u8]], b: &[&[u8]], script: &[Step]) -> Vec<LineChange> {
+/// `base` is the number of leading common-prefix lines already emitted, so
+/// line numbers stay correct when the script covers only the middle region.
+fn script_to_changes(a: &[&[u8]], b: &[&[u8]], script: &[Step], base: u32) -> Vec<LineChange> {
     let mut out = Vec::with_capacity(script.len());
-    let mut i = 0u32; // 1-based old line
-    let mut j = 0u32; // 1-based new line
+    // `i`/`j` index the middle slices (0-based); `base` only shifts the
+    // reported 1-based line numbers.
+    let mut i = 0u32;
+    let mut j = 0u32;
     for &s in script {
         match s {
             Step::Equal => {
-                out.push(LineChange::Equal { old_no: i + 1, new_no: j + 1, bytes: a[i as usize].to_vec() });
+                out.push(LineChange::Equal { old_no: base + i + 1, new_no: base + j + 1, bytes: a[i as usize].to_vec() });
                 i += 1;
                 j += 1;
             }
             Step::Delete => {
-                out.push(LineChange::Delete { old_no: i + 1, bytes: a[i as usize].to_vec() });
+                out.push(LineChange::Delete { old_no: base + i + 1, bytes: a[i as usize].to_vec() });
                 i += 1;
             }
             Step::Insert => {
-                out.push(LineChange::Insert { new_no: j + 1, bytes: b[j as usize].to_vec() });
+                out.push(LineChange::Insert { new_no: base + j + 1, bytes: b[j as usize].to_vec() });
                 j += 1;
             }
         }
@@ -277,5 +319,52 @@ mod tests {
         let new = b"a\nb\n";
         let changes = line_diff(old, new);
         assert!(changes.iter().all(|c| matches!(c, LineChange::Equal { .. })));
+    }
+
+    /// Two large inputs with zero common lines must hit the trace-budget
+    /// fallback (deletes+inserts) instead of allocating O(D*(N+M)) memory —
+    /// and must still cover every line on both sides.
+    #[test]
+    fn disjoint_large_inputs_hit_bounded_fallback() {
+        // 3000 + 3000 disjoint lines: D=6000 exceeds the trace budget, so the
+        // algorithm must degrade to the coarse (all-delete, all-insert) script.
+        let old: Vec<u8> = (0..3000).flat_map(|i| format!("old-{i}\n").into_bytes()).collect();
+        let new: Vec<u8> = (0..3000).flat_map(|i| format!("new-{i}\n").into_bytes()).collect();
+        let changes = line_diff(&old, &new);
+        let deletes = changes.iter().filter(|c| matches!(c, LineChange::Delete { .. })).count();
+        let inserts = changes.iter().filter(|c| matches!(c, LineChange::Insert { .. })).count();
+        assert_eq!(deletes, 3000, "every old line must be deleted");
+        assert_eq!(inserts, 3000, "every new line must be inserted");
+        // Line numbers stay 1-based and ordered.
+        for (i, c) in changes.iter().enumerate().take(3000) {
+            let LineChange::Delete { old_no, .. } = c else { panic!("delete expected") };
+            assert_eq!(*old_no as usize, i + 1);
+        }
+    }
+
+    /// Common prefix/suffix trimming must keep reported line numbers absolute:
+    /// one inserted line deep inside a large file yields a single Insert with
+    /// the correct new-side number.
+    #[test]
+    fn single_insert_deep_in_file_reports_correct_line_number() {
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..500 {
+            old.push_str(&format!("line-{i}\n"));
+            new.push_str(&format!("line-{i}\n"));
+            if i == 249 {
+                new.push_str("inserted\n");
+            }
+        }
+        let changes = line_diff(old.as_bytes(), new.as_bytes());
+        let inserts: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Insert { .. }))
+            .collect();
+        assert_eq!(inserts.len(), 1);
+        let LineChange::Insert { new_no, .. } = inserts[0] else { unreachable!() };
+        assert_eq!(*new_no, 251, "inserted line is new-side line 251");
+        let equals = changes.iter().filter(|c| matches!(c, LineChange::Equal { .. })).count();
+        assert_eq!(equals, 500);
     }
 }

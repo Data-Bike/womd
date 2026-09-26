@@ -89,6 +89,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { renderBlockHtml } from '../render.js';
 import * as textEditing from '../lib/textEditing.js';
 import { byteOffsetToTextareaIndex } from '../lib/byteOffset.js';
+import { contentChanged, restoreLineEndings } from '../lib/lineEndings.js';
 
 // ---------------------------------------------------------------------------
 // Overview
@@ -178,6 +179,7 @@ const editOriginal = ref('');
 const suppressScroll = ref(false);
 
 const sourceText = ref('');
+const sourceOriginal = ref(''); // raw text as loaded (may contain CRLF)
 const sourceLoading = ref(false);
 const sourceTextarea = ref(null);
 
@@ -205,7 +207,11 @@ async function saveSource() {
     // IPC looks the payload up by parameter name, so the fields must be
     // nested under an `args` key (unlike insert_text's two scalar params,
     // which are matched by their own individual names).
-    await invoke('replace_text', { args: { start: 0, end, newText: sourceText.value } });
+    // The textarea normalizes CRLF to LF — restore the document's original
+    // line ending or a source-view save would rewrite the entire file.
+    const newText = restoreLineEndings(sourceOriginal.value, sourceText.value);
+    await invoke('replace_text', { args: { start: 0, end, newText } });
+    sourceOriginal.value = newText;
     emit('dirty', true);
     await loadDocument();
   } catch (e) {
@@ -453,9 +459,11 @@ async function loadSourceView() {
   sourceLoading.value = true;
   try {
     sourceText.value = await invoke('get_document_text');
+    sourceOriginal.value = sourceText.value;
   } catch (e) {
     console.error('loadSourceView:', e);
     sourceText.value = '';
+    sourceOriginal.value = '';
   } finally {
     sourceLoading.value = false;
   }
@@ -572,6 +580,11 @@ function restoreScroll(savedScroll) {
 async function updateVisibleAndLoad() {
   if (loadingVisible) return;
   loadingVisible = true;
+  // A scroll that lands while a load is in-flight used to be dropped — the
+  // early `loadingVisible` return meant the *latest* range never loaded
+  // until the user scrolled again. Snapshot scrollTop so the finally-block
+  // can detect the move and re-run for the settled viewport.
+  const entryScrollTop = scrollTop.value;
   try {
     const { start, end } = visibleRange.value;
     const toLoad = [];
@@ -595,6 +608,11 @@ async function updateVisibleAndLoad() {
     nextTick(() => requestAnimationFrame(measureHeights));
   } finally {
     loadingVisible = false;
+    // The user scrolled while we were loading — re-run once for the settled
+    // range. Bounded: re-runs only when scrollTop actually moved.
+    if (scrollTop.value !== entryScrollTop) {
+      updateVisibleAndLoad();
+    }
   }
 }
 
@@ -736,11 +754,28 @@ async function exitEdit(force) {
   if (editingIndex.value < 0) return;
   const index = editingIndex.value;
   const old = editOriginal.value;
-  const changed = editSource.value !== old;
+  // The textarea API normalizes every line break to `\n` — a CRLF block would
+  // otherwise always look "changed" and the commit would rewrite the whole
+  // block to LF. Compare normalized content; restore the original ending on
+  // commit so the edit diff stays minimal.
+  const changed = contentChanged(old, editSource.value);
 
-  if (changed || force) {
+  // Replace ONLY when content actually changed: `force` means "commit any
+  // pending edit", not "always rewrite the block". A no-change replace_block
+  // still records an undo step and marks the backend dirty — so clicking
+  // between blocks (enterEdit -> exitEdit(true)) used to flip is_dirty on a
+  // document the user never modified.
+  if (changed) {
     try {
-      await invoke('replace_block', { blockIndex: index, newSource: editSource.value });
+      await invoke('replace_block', {
+        blockIndex: index,
+        newSource: restoreLineEndings(old, editSource.value),
+        // Pin the block identity: lazy chunk parsing may have merged/split
+        // the tail block since get_blocks, shifting indices — the backend
+        // rejects a stale index instead of overwriting another block.
+        expectedStart: meta[index] ? meta[index].start : null,
+        expectedEnd: meta[index] ? meta[index].end : null,
+      });
       const rawMeta = await invoke('get_syntax_tree_meta');
       const newStartLines = await fetchLineNumbers(rawMeta.length);
       anchorAfterEdit = index;
@@ -748,7 +783,7 @@ async function exitEdit(force) {
       const data = await invoke('get_block_data', { blockIndex: index });
       if (data) cacheSet(index, data);
       dataVersion.value++;
-      if (changed) emit('dirty', true);
+      emit('dirty', true);
     } catch (e) {
       console.error('exitEdit replace:', e);
     }
@@ -777,6 +812,11 @@ async function exitEdit(force) {
 // commits the in-progress edit (via the exposed `save()`) and then persists
 // the document to disk. Handling it here too would just call exitEdit twice.
 function onKeydown(e) {
+  // During IME composition (CJK input), keystrokes belong to the composer —
+  // Escape cancels the composition, not the edit; Enter confirms the
+  // candidate, not the block. Treating them as edit-level commands commits
+  // half-typed text.
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Escape') {
     e.preventDefault();
     exitEdit(false);
@@ -822,7 +862,9 @@ function updateCursorFromTextarea() {
   if (!el) return;
   const idx = editingIndex.value;
   const base = idx >= 0 ? (startLines[idx] || (idx + 1)) : 1;
-  const pos = posToLineCol(editSource.value, el.selectionStart);
+  // Use el.value (LF-normalized like selectionStart), not editSource, which may
+  // hold raw CRLF text before the first input event.
+  const pos = posToLineCol(el.value, el.selectionStart);
   emit('cursor', { line: base - 1 + pos.line, col: pos.col });
 }
 
@@ -848,7 +890,11 @@ function getActiveTextarea() {
 function withSourceText(transform) {
   const ta = sourceTextarea.value;
   if (!ta) return;
-  const before = sourceText.value;
+  // Transform the normalized textarea value (what selectionStart/End refer
+  // to), not raw sourceText which may contain CRLF — indices would drift by
+  // one per CRLF pair before the selection. Line endings are restored from
+  // sourceOriginal on saveSource.
+  const before = ta.value;
   const result = transform(before, ta.selectionStart, ta.selectionEnd);
   sourceText.value = result.value;
   nextTick(() => {
@@ -925,8 +971,14 @@ async function getBlockSource(index) {
 async function replaceBlockSource(index, newSource) {
   try {
     const savedScroll = viewport.value ? viewport.value.scrollTop : scrollTop.value;
-    await invoke('replace_block', { blockIndex: index, newSource });
-    emit('dirty', true);
+    const result = await invoke('replace_block', {
+      blockIndex: index,
+      newSource,
+      expectedStart: meta[index] ? meta[index].start : null,
+      expectedEnd: meta[index] ? meta[index].end : null,
+    });
+    // `changed` is false for byte-identical no-ops — don't mark clean docs dirty.
+    if (result?.changed) emit('dirty', true);
     const rawMeta = await invoke('get_syntax_tree_meta');
     const newStartLines = await fetchLineNumbers(rawMeta.length);
     anchorAfterEdit = index;
@@ -968,7 +1020,15 @@ function findPlainTextInSource(source, plainText) {
         if (i < source.length) i++;
         continue;
       }
-      if (source[i] === '[' || source[i] === '!') { i++; continue; }
+      // `!` is only markup when it opens an image (`![`) — a bare exclamation
+      // mark is literal text and must stay in `plain` or the index mapping
+      // shifts for text like "hi!".
+      if (source[i] === '!' && source[i + 1] !== '[') {
+        sourcePos.push(i);
+        plain += source[i];
+        i++;
+        continue;
+      }
       i++;
       continue;
     }
@@ -1109,8 +1169,14 @@ function sourceInsertAt(offset, text) {
   sourceText.value = value;
   ta.value = value;
   nextTick(() => {
-    ta.selectionStart = newStart;
-    ta.selectionEnd = newStart;
+    // newStart is an index into the raw string; the textarea counts the
+    // LF-normalized value — subtract the CRLF pairs before the position.
+    let taPos = newStart;
+    for (let i = 0; i < newStart && i + 1 < value.length; i++) {
+      if (value[i] === '\r' && value[i + 1] === '\n') taPos--;
+    }
+    ta.selectionStart = taPos;
+    ta.selectionEnd = taPos;
     ta.focus();
     syncGutter();
   });
@@ -1170,9 +1236,12 @@ async function insertImageFromDrop(clientX, clientY, paths) {
 }
 
 async function handleDragDrop(event) {
-  if (event.type !== 'drop' || !event.paths?.length) return;
+  if (event.type !== 'drop' || !event.paths?.length || !event.position) return;
   const clientX = event.position.x / (window.devicePixelRatio || 1);
   const clientY = event.position.y / (window.devicePixelRatio || 1);
+  // A missing/non-finite position would pass every bounds check (all
+  // comparisons against NaN are false) and silently insert at block 0.
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
   await insertImageFromDrop(clientX, clientY, event.paths);
 }
 
@@ -1254,10 +1323,14 @@ async function applyLineFormat(prefix) {
   const source = await getBlockSource(found.index);
   if (!source) return;
   const lines = source.split('\n');
-  const allPrefixed = lines.every(line => line.startsWith(prefix));
+  // A "line" in a CRLF block ends with `\r` — strip it for emptiness/prefix
+  // checks and preserve it when rewriting, or `> \r` artifacts appear.
+  const body = (line) => (line.endsWith('\r') ? line.slice(0, -1) : line);
+  const tail = (line) => (line.endsWith('\r') ? '\r' : '');
+  const allPrefixed = lines.every(line => body(line).startsWith(prefix) || body(line) === '');
   const newSource = allPrefixed
-    ? lines.map(line => line.slice(prefix.length)).join('\n')
-    : lines.map(line => (line ? prefix + line : '')).join('\n');
+    ? lines.map(line => (body(line).startsWith(prefix) ? body(line).slice(prefix.length) : body(line)) + tail(line)).join('\n')
+    : lines.map(line => (body(line) ? prefix + body(line) : '') + tail(line)).join('\n');
   await replaceBlockSource(found.index, newSource);
 }
 
@@ -1581,7 +1654,7 @@ async function searchReplaceCurrent(replacement) {
   const m = searchMatches[searchStatus.value.index];
   const wasIndex = searchStatus.value.index;
   try {
-    await invoke('replace_match_in_document', {
+    const result = await invoke('replace_match_in_document', {
       args: {
         start: m.start,
         end: m.end,
@@ -1591,7 +1664,9 @@ async function searchReplaceCurrent(replacement) {
         replacement: replacement ?? '',
       },
     });
-    emit('dirty', true);
+    // The backend reports `changed: false` for byte-identical no-op
+    // replacements — emitting dirty on those would mark a clean document dirty.
+    if (result?.changed) emit('dirty', true);
     await loadDocument();
     await performSearch(searchQuery, searchOptions, ++searchRequestId);
     if (searchMatches.length) {

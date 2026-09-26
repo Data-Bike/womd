@@ -9,7 +9,7 @@
 #![cfg_attr(not(feature = "custom-protocol"), allow(dead_code))]
 
 use std::sync::Mutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 
 use editor_core::{DocumentBuffer, EditTransaction, TextEdit};
@@ -106,6 +106,9 @@ struct EditResult {
     text: Option<String>,
     is_dirty: bool,
     block_count: usize,
+    /// False when the command was a byte-identical no-op (no edit applied, no
+    /// undo step recorded). Lets the frontend avoid emitting phantom dirty.
+    changed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,6 +155,10 @@ fn doc_info_from_tab(tab: &DocumentTab) -> DocumentInfo {
 
 /// Build an EditResult from a tab, conditionally serializing text only for small docs.
 fn edit_result_from_tab(tab: &DocumentTab) -> EditResult {
+    edit_result(tab, true)
+}
+
+fn edit_result(tab: &DocumentTab, changed: bool) -> EditResult {
     let byte_len = tab.buffer.len() as usize;
     let text = if byte_len > LARGE_DOC_THRESHOLD {
         None
@@ -162,6 +169,7 @@ fn edit_result_from_tab(tab: &DocumentTab) -> EditResult {
         text,
         is_dirty: tab.buffer.is_dirty(),
         block_count: tab.buffer.syntax().blocks.len(),
+        changed,
     }
 }
 
@@ -381,9 +389,35 @@ fn close_tab(state: tauri::State<'_, Mutex<AppState>>, tab_id: u64) -> Result<Op
 // Tauri commands — document operations (operate on the active tab)
 // ---------------------------------------------------------------------------
 
+/// Canonicalize a path for identity comparison; falls back to the input
+/// unchanged when canonicalization fails (nonexistent file, permissions).
+fn canonical_or_self(p: &PathBuf) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.clone())
+}
+
+/// Index of the open tab whose `file_path` resolves to `canonical`, if any.
+fn find_tab_idx_for_path(tabs: &[DocumentTab], canonical: &PathBuf) -> Option<usize> {
+    tabs.iter().position(|t| {
+        t.file_path
+            .as_ref()
+            .is_some_and(|p| canonical_or_self(p) == *canonical)
+    })
+}
+
 /// Open a file from disk in a new tab.
 #[tauri::command]
 fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Result<DocumentInfo, String> {
+    // Dedup: the same file in two tabs would create divergent buffers —
+    // whichever saved last would silently clobber the other's edits.
+    let canonical = canonical_or_self(&PathBuf::from(&path));
+    {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        if let Some(idx) = find_tab_idx_for_path(&s.tabs, &canonical) {
+            s.active = idx;
+            let tab = s.active_tab()?;
+            return Ok(doc_info_from_tab(tab));
+        }
+    }
     // Use mmap-backed storage for zero-copy reads (Invariant 6: >RAM file support).
     let doc_id = DocumentId::new(&path);
     let storage = editor_storage::MmapStorage::open(&path, doc_id)
@@ -425,6 +459,13 @@ fn open_document(state: tauri::State<'_, Mutex<AppState>>, path: String) -> Resu
         Some(String::from_utf8_lossy(&buffer.serialize()).to_string())
     };
     let mut s = state.lock().map_err(|e| e.to_string())?;
+    // Re-check under the final lock: another open_document for the same file
+    // could have raced past the earlier check while we were parsing.
+    if let Some(idx) = find_tab_idx_for_path(&s.tabs, &canonical) {
+        s.active = idx;
+        let tab = s.active_tab()?;
+        return Ok(doc_info_from_tab(tab));
+    }
     let id = s.next_id;
     s.next_id += 1;
     s.push_tab(DocumentTab { id, buffer, file_path: Some(PathBuf::from(path)) });
@@ -446,10 +487,12 @@ fn new_document(state: tauri::State<'_, Mutex<AppState>>) -> Result<DocumentInfo
         id: DocumentId::new("untitled"),
         has_bom: false,
         line_ending: editor_domain::LineEnding::Lf,
-        trailing_newline: true,
+        // An empty buffer has no trailing newline; marking it `true` would lie
+        // about document metadata until the first save.
+        trailing_newline: false,
         encoding: editor_domain::Encoding::Utf8,
     };
-    let buffer = DocumentBuffer::open(b"\n".to_vec(), meta, MarkdownProfile::Gfm)
+    let buffer = DocumentBuffer::open(Vec::new(), meta, MarkdownProfile::Gfm)
         .map_err(|e| e.to_string())?;
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let id = s.next_id;
@@ -478,6 +521,16 @@ fn open_welcome(state: tauri::State<'_, Mutex<AppState>>) -> Result<DocumentInfo
     let buffer = DocumentBuffer::open(WELCOME_MD.as_bytes().to_vec(), meta, MarkdownProfile::Gfm)
         .map_err(|e| e.to_string())?;
     let mut s = state.lock().map_err(|e| e.to_string())?;
+    // Dedup: the welcome doc is a singleton — re-opening it should switch to
+    // the existing tab, not spawn an identical second one (file_path is None,
+    // so the path-based dedup can't catch it).
+    if let Some(idx) = s.tabs.iter().position(|t| {
+        t.file_path.is_none() && t.buffer.meta.id == DocumentId::new("welcome")
+    }) {
+        s.active = idx;
+        let tab = s.active_tab()?;
+        return Ok(doc_info_from_tab(tab));
+    }
     let id = s.next_id;
     s.next_id += 1;
     let tab = DocumentTab { id, buffer, file_path: None };
@@ -493,6 +546,37 @@ fn get_document_text(state: tauri::State<'_, Mutex<AppState>>) -> Result<String,
     Ok(String::from_utf8_lossy(&tab.buffer.serialize()).to_string())
 }
 
+/// Shared byte-range replacement against a locked tab. Used by the public
+/// replace/insert commands and internally by replace_match_in_document so the
+/// match-verification and the edit happen under one lock (no TOCTOU window
+/// where a concurrent edit could shift the offsets between them).
+fn replace_text_in_tab(tab: &mut DocumentTab, start: u64, end: u64, new_text: &str) -> Result<EditResult, String> {
+    if start > end || end > tab.buffer.len() {
+        return Err(format!(
+            "invalid range [{},{}) for document of {} bytes",
+            start,
+            end,
+            tab.buffer.len()
+        ));
+    }
+    // No-op guard: a byte-identical replacement is not an edit — it must not
+    // record an undo step or dirty the buffer.
+    if tab.buffer.serialize_range(start, end) == new_text.as_bytes() {
+        return Ok(edit_result(tab, false));
+    }
+    let edit = TextEdit::replace(
+        ByteRange::new(ByteOffset(start), ByteOffset(end)),
+        new_text.as_bytes(),
+    );
+    let tx = EditTransaction::single(
+        edit,
+        editor_domain::Selection::caret(ByteOffset(start)),
+        editor_domain::Selection::caret(ByteOffset(start + new_text.len() as u64)),
+    );
+    tab.buffer.apply(tx).map_err(|e| e.to_string())?;
+    Ok(edit_result_from_tab(tab))
+}
+
 /// Replace a text range in the active document.
 #[tauri::command]
 fn replace_text(
@@ -501,17 +585,7 @@ fn replace_text(
 ) -> Result<EditResult, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
-    let edit = TextEdit::replace(
-        ByteRange::new(ByteOffset(args.start), ByteOffset(args.end)),
-        args.new_text.as_bytes(),
-    );
-    let tx = EditTransaction::single(
-        edit,
-        editor_domain::Selection::caret(ByteOffset(args.start)),
-        editor_domain::Selection::caret(ByteOffset(args.start + args.new_text.len() as u64)),
-    );
-    tab.buffer.apply(tx).map_err(|e| e.to_string())?;
-    Ok(edit_result_from_tab(tab))
+    replace_text_in_tab(tab, args.start, args.end, &args.new_text)
 }
 
 /// Insert text at a position in the active document.
@@ -608,8 +682,12 @@ fn search_document(state: tauri::State<'_, Mutex<AppState>>, args: SearchArgs) -
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
     let bytes = tab.buffer.serialize();
-    let text = String::from_utf8_lossy(&bytes);
-    Ok(find_matches_in_text(&text, &args.query, args.case_sensitive, args.regex))
+    // Strict UTF-8 — `from_utf8_lossy` would substitute U+FFFD for invalid
+    // sequences, shifting every subsequent byte offset and corrupting the
+    // match ranges the frontend feeds back into replace commands.
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "document is not valid UTF-8 — search unavailable".to_string())?;
+    Ok(find_matches_in_text(text, &args.query, args.case_sensitive, args.regex))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -627,6 +705,24 @@ struct ReplaceMatchArgs {
 /// found by re-matching `query` against `matched_text` (the exact substring
 /// at `[start, end)`). For non-regex searches the template is used literally
 /// (no expansion — a literal replacement string should never be reinterpreted).
+/// True when `text[start..end]` is still a match of `query` — i.e. a regex
+/// search starting at `start` finds exactly `[start, end)`. Uses `find_at`
+/// (not `find` on the slice) so `\b`/`\B` word boundaries see the real
+/// document context, not artificial slice edges. Pure helper for tests.
+fn range_still_matches(
+    text: &str,
+    start: usize,
+    end: usize,
+    query: &str,
+    case_sensitive: bool,
+    is_regex: bool,
+) -> Result<bool, regex::Error> {
+    let re = compile_search_regex(query, case_sensitive, is_regex)?;
+    Ok(re
+        .find_at(text, start)
+        .is_some_and(|m| m.start() == start && m.end() == end))
+}
+
 fn expand_replacement(matched_text: &str, query: &str, case_sensitive: bool, is_regex: bool, template: &str) -> String {
     if !is_regex {
         return template.to_string();
@@ -652,19 +748,29 @@ fn replace_match_in_document(
     state: tauri::State<'_, Mutex<AppState>>,
     args: ReplaceMatchArgs,
 ) -> Result<EditResult, String> {
-    let expanded = {
-        let s = state.lock().map_err(|e| e.to_string())?;
-        let tab = s.active_tab()?;
-        let bytes = tab.buffer.serialize();
-        let text = String::from_utf8_lossy(&bytes);
-        let start = args.start as usize;
-        let end = args.end as usize;
-        if start > end || end > text.len() {
-            return Err("match range out of bounds — document changed, please search again".to_string());
-        }
-        expand_replacement(&text[start..end], &args.query, args.case_sensitive, args.regex, &args.replacement)
-    };
-    replace_text(state, ReplaceTextArgs { start: args.start, end: args.end, new_text: expanded })
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    let tab = s.active_tab_mut()?;
+    let bytes = tab.buffer.serialize();
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "document is not valid UTF-8 — replace unavailable".to_string())?;
+    let start = args.start as usize;
+    let end = args.end as usize;
+    if start > end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return Err("match range out of bounds — document changed, please search again".to_string());
+    }
+    // Verify the range still matches the query: the document may have
+    // changed since the search that produced these offsets, and replacing
+    // a stale range would destroy whatever bytes now sit there. The lock is
+    // held through the replace_text_in_tab call below, so no concurrent edit
+    // can invalidate the offsets between check and write.
+    let still = range_still_matches(text, start, end, &args.query, args.case_sensitive, args.regex)
+        .map_err(|_| "invalid regular expression".to_string())?;
+    if !still {
+        return Err("match no longer matches — document changed, please search again".to_string());
+    }
+    let matched = &text[start..end];
+    let expanded = expand_replacement(matched, &args.query, args.case_sensitive, args.regex, &args.replacement);
+    replace_text_in_tab(tab, args.start, args.end, &expanded)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -700,13 +806,16 @@ fn replace_all_in_document(
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
     let bytes = tab.buffer.serialize();
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    let found = find_matches_in_text(&text, &args.query, args.case_sensitive, args.regex);
+    // Borrow, don't copy — `.to_string()` here would allocate a second
+    // full-document buffer (100+ MB) for no reason.
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "document is not valid UTF-8 — replace unavailable".to_string())?;
+    let found = find_matches_in_text(text, &args.query, args.case_sensitive, args.regex);
     if !found.valid {
         return Err("invalid regular expression".to_string());
     }
     if found.matches.is_empty() {
-        return Ok(ReplaceAllResult { count: 0, edit: edit_result_from_tab(tab) });
+        return Ok(ReplaceAllResult { count: 0, edit: edit_result(tab, false) });
     }
 
     let mut edits: Vec<TextEdit> = found
@@ -749,8 +858,9 @@ fn replace_all_in_document(
 fn get_blocks(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<BlockInfo>, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
-    let serialized = tab.buffer.serialize();
-    let full_text = String::from_utf8_lossy(&serialized);
+    // Blocks only cover [0, parsed_offset) — serializing the whole buffer
+    // would materialize the unparsed tail of a lazy (>RAM) document.
+    let serialized = tab.buffer.serialize_range(0, tab.buffer.parsed_offset());
     let blocks: Vec<BlockInfo> = tab
         .buffer
         .syntax()
@@ -761,8 +871,10 @@ fn get_blocks(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<BlockInfo>
             let m = b.meta();
             let start = m.span.start.0 as usize;
             let end = m.span.end.0 as usize;
-            let source = if start <= end && end <= full_text.len() {
-                full_text[start..end].to_string()
+            // Slice raw bytes (not a &str) — a span that lands mid-char must
+            // not panic the command.
+            let source = if start <= end && end <= serialized.len() {
+                String::from_utf8_lossy(&serialized[start..end]).to_string()
             } else {
                 String::new()
             };
@@ -780,11 +892,19 @@ fn get_blocks(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<BlockInfo>
 
 /// Replace a single block's source text by block index.
 /// This produces a minimal diff — only the block's byte range is replaced.
+///
+/// `expected_start`/`expected_end` pin the block identity: lazy chunk parsing
+/// can merge/split the trailing block between `get_blocks` and this call,
+/// shifting indices — a stale index would then overwrite a DIFFERENT block's
+/// span. When the caller supplies the span it saw, a mismatch rejects the
+/// write instead of corrupting another block.
 #[tauri::command]
 fn replace_block(
     state: tauri::State<'_, Mutex<AppState>>,
     block_index: usize,
     new_source: String,
+    expected_start: Option<u64>,
+    expected_end: Option<u64>,
 ) -> Result<EditResult, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
@@ -794,6 +914,17 @@ fn replace_block(
         let block = blocks.get(block_index).ok_or_else(|| "invalid block index".to_string())?;
         block.meta().span
     };
+    if expected_start.is_some_and(|es| span.start.0 != es)
+        || expected_end.is_some_and(|ee| span.end.0 != ee)
+    {
+        return Err("block moved — document changed, please retry the edit".to_string());
+    }
+    // No-op guard: replacing a block with byte-identical content must not
+    // record an undo step or mark the buffer dirty (the commit paths call
+    // this unconditionally on exit).
+    if tab.buffer.serialize_range(span.start.0, span.end.0) == new_source.as_bytes() {
+        return Ok(edit_result(tab, false));
+    }
     let edit = TextEdit::replace(
         ByteRange::new(span.start, span.end),
         new_source.as_bytes(),
@@ -812,8 +943,11 @@ fn replace_block(
 fn undo(state: tauri::State<'_, Mutex<AppState>>) -> Result<EditResult, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
+    let had = tab.buffer.undo_manager().can_undo();
     tab.buffer.undo().map_err(|e| e.to_string())?;
-    Ok(edit_result_from_tab(tab))
+    // An undo on an empty stack changed nothing — report `changed` accurately
+    // so the frontend doesn't emit phantom dirty.
+    Ok(edit_result(tab, had))
 }
 
 /// Redo the last undone edit in the active document.
@@ -821,8 +955,9 @@ fn undo(state: tauri::State<'_, Mutex<AppState>>) -> Result<EditResult, String> 
 fn redo(state: tauri::State<'_, Mutex<AppState>>) -> Result<EditResult, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab_mut()?;
+    let had = tab.buffer.undo_manager().can_redo();
     tab.buffer.redo().map_err(|e| e.to_string())?;
-    Ok(edit_result_from_tab(tab))
+    Ok(edit_result(tab, had))
 }
 
 /// Resolve which path a save should target: an explicit path (e.g. from a
@@ -858,8 +993,12 @@ fn save_document(
 fn get_syntax_tree(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<SyntaxBlock>, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
-    let full_text = tab.buffer.serialize();
-    let text_str = String::from_utf8_lossy(&full_text).to_string();
+    // For lazy docs only [0, parsed_offset) is parsed — copy just that prefix
+    // (all block spans end at or before parsed_offset) instead of
+    // materializing the whole, possibly >RAM, buffer.
+    let parsed_len = tab.buffer.parsed_offset();
+    let parsed_text = tab.buffer.serialize_range(0, parsed_len);
+    let text_str = String::from_utf8_lossy(&parsed_text).to_string();
     let blocks: Vec<SyntaxBlock> = tab
         .buffer
         .syntax()
@@ -869,8 +1008,8 @@ fn get_syntax_tree(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<Synta
             let m = b.meta();
             let start = m.span.start.0 as usize;
             let end = m.span.end.0 as usize;
-            let source = if start <= end && end <= text_str.len() {
-                text_str[start..end].to_string()
+            let source = if start <= end && end <= parsed_text.len() {
+                String::from_utf8_lossy(&parsed_text[start..end]).to_string()
             } else {
                 String::new()
             };
@@ -1006,7 +1145,8 @@ fn get_block_line_numbers(
     let s = state.lock().map_err(|e| e.to_string())?;
     let tab = s.active_tab()?;
     let blocks = &tab.buffer.syntax().blocks;
-    let end_index = (start_index + count).min(blocks.len());
+    // `start_index + count` can overflow usize for a degenerate `count`.
+    let end_index = start_index.saturating_add(count).min(blocks.len());
     if start_index >= end_index {
         return Ok(Vec::new());
     }
@@ -1088,13 +1228,15 @@ fn git_diff(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitFileDiff>
     }).collect())
 }
 
-/// Convert a repo-root-relative path to a git pathspec that works from any subdirectory.
-/// Uses the `:/` magic prefix (relative to root of working tree).
+/// Convert a repo-root-relative path to a git pathspec that works from any
+/// subdirectory AND matches literally. `:/` alone anchors at the root but still
+/// applies glob matching — `:(top,literal)` anchors AND treats `*?[...]` as
+/// ordinary characters, so files whose names contain metacharacters work.
 fn root_pathspec(path: &str) -> String {
-    if path.starts_with(":/") || path.starts_with("**/") {
+    if path.starts_with(':') {
         path.to_string()
     } else {
-        format!(":/{}", path)
+        format!(":(top,literal){path}")
     }
 }
 
@@ -1216,9 +1358,17 @@ fn git_file_history(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GitC
     let tab = s.active_tab()?;
     let path = tab.file_path.as_ref().ok_or("no file open")?;
     let dir = path.parent().ok_or("no parent directory")?;
-    let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let git = editor_git::GitCli::open(dir).map_err(|e| e.to_string())?;
-    let history = editor_git::file_history(&git, &file_name).map_err(|e| e.to_string())?;
+    // History needs the repo-root-relative path — the bare file name only
+    // matches files at the top level, silently returning empty history for
+    // anything in a subdirectory.
+    let root = git.repo_root().map_err(|e| e.to_string())?;
+    let rel = path
+        .strip_prefix(&root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let history = editor_git::file_history(&git, &rel).map_err(|e| e.to_string())?;
     Ok(history.iter().map(|e| GitCommitInfo {
         sha: e.revision.0.clone(),
         author: e.author.clone(),
@@ -1548,6 +1698,14 @@ fn git_head_commit(state: tauri::State<'_, Mutex<AppState>>) -> Result<String, S
 fn git_read_file_at_revision(state: tauri::State<'_, Mutex<AppState>>, file_path: String, revision: String) -> Result<String, String> {
     let git = open_git_for_active(&state)?;
     if revision.is_empty() {
+        // `file_path` is repo-relative; reject absolute paths and `..`
+        // components so the read can't escape the repository root.
+        let rel = std::path::Path::new(&file_path);
+        if rel.is_absolute()
+            || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("file_path must be a repo-relative path without '..'".to_string());
+        }
         let root = git.repo_root().map_err(|e| e.to_string())?;
         let full = std::path::Path::new(&root).join(&file_path);
         let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
@@ -1600,6 +1758,61 @@ fn git_repo_root(state: tauri::State<'_, Mutex<AppState>>) -> Result<Option<Stri
 // This avoids depending on the adapters/github crate (Invariant 3,4).
 
 /// Run `gh` in the active document's directory and return stdout.
+/// Run a subprocess with a deadline: spawn with piped output drained on reader
+/// threads (a full pipe buffer would otherwise block a healthy child and look
+/// like a hang), poll `try_wait`, kill on timeout. `Command::output()` has no
+/// timeout — a wedged network op (`gh`, credential prompt) hung the command
+/// forever.
+fn run_subprocess(
+    bin: &str,
+    dir: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(bin)
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{} not available: {}", bin, e))?;
+    let mut out_pipe = child.stdout.take().expect("piped");
+    let mut err_pipe = child.stderr.take().expect("piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out_pipe.read_to_end(&mut v);
+        v
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err_pipe.read_to_end(&mut v);
+        v
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(s) => break s,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(format!("{} timed out", bin));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    })
+}
+
 fn gh_exec_text(state: &tauri::State<'_, Mutex<AppState>>, args: &[&str]) -> Result<String, String> {
     let dir = {
         let s = state.lock().map_err(|e| e.to_string())?;
@@ -1609,11 +1822,7 @@ fn gh_exec_text(state: &tauri::State<'_, Mutex<AppState>>, args: &[&str]) -> Res
         dir.to_path_buf()
     };
     let gh_bin = std::env::var("GH_BIN").unwrap_or_else(|_| "gh".to_string());
-    let out = std::process::Command::new(&gh_bin)
-        .current_dir(&dir)
-        .args(args)
-        .output()
-        .map_err(|e| format!("gh CLI not available: {}", e))?;
+    let out = run_subprocess(&gh_bin, &dir, args, std::time::Duration::from_secs(60))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
@@ -1717,25 +1926,31 @@ fn github_logout(state: tauri::State<'_, Mutex<AppState>>) -> Result<bool, Strin
 #[tauri::command]
 fn github_repo_metadata(state: tauri::State<'_, Mutex<AppState>>) -> Result<GithubRepoMetadata, String> {
     let text = gh_exec_text(&state, &["repo", "view", "--json", "nameWithOwner,defaultBranchRef,url"])?;
-    let full_name = extract_json_field(&text, "nameWithOwner");
-    let default_branch = extract_json_field(&text, "defaultBranchRef");
-    let html_url = extract_json_field(&text, "url");
-    Ok(GithubRepoMetadata { full_name, default_branch, html_url })
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("invalid gh JSON: {e}"))?;
+    Ok(GithubRepoMetadata {
+        full_name: v["nameWithOwner"].as_str().unwrap_or("").to_string(),
+        default_branch: v["defaultBranchRef"]["name"].as_str().unwrap_or("").to_string(),
+        html_url: v["url"].as_str().unwrap_or("").to_string(),
+    })
 }
 
 /// List pull requests via `gh pr list`.
 #[tauri::command]
 fn github_pull_requests(state: tauri::State<'_, Mutex<AppState>>) -> Result<Vec<GithubPullRequest>, String> {
     let text = gh_exec_text(&state, &["pr", "list", "--json", "number,title,state,url", "--limit", "30"])?;
+    // gh emits a compact JSON array on ONE line — real JSON parsing is
+    // required; the old per-line + substring approach only ever saw the
+    // first PR and broke on escaped quotes in titles.
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("invalid gh JSON: {e}"))?;
     let mut prs = Vec::new();
-    // Parse JSON lines — gh outputs a JSON array.
-    for line in text.lines() {
-        if line.contains("\"number\"") {
-            let number = extract_json_int(line, "number");
-            let title = extract_json_field(line, "title");
-            let state = extract_json_field(line, "state");
-            let html_url = extract_json_field(line, "url");
-            prs.push(GithubPullRequest { number, title, state, html_url });
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            prs.push(GithubPullRequest {
+                number: item["number"].as_i64().unwrap_or(0),
+                title: item["title"].as_str().unwrap_or("").to_string(),
+                state: item["state"].as_str().unwrap_or("").to_string(),
+                html_url: item["url"].as_str().unwrap_or("").to_string(),
+            });
         }
     }
     Ok(prs)
@@ -1748,48 +1963,6 @@ fn github_remote_branches(state: tauri::State<'_, Mutex<AppState>>) -> Result<Ve
     let names = git.remote_branches().map_err(|e| e.to_string())?;
     let branches = names.into_iter().map(|name| GithubRemoteBranch { name }).collect();
     Ok(branches)
-}
-
-/// Extract a JSON string field value (simple parser — no serde dependency on gh output).
-fn extract_json_field(text: &str, field: &str) -> String {
-    let needle = format!("\"{}\":", field);
-    if let Some(idx) = text.find(&needle) {
-        let rest = &text[idx + needle.len()..];
-        let rest = rest.trim_start();
-        if rest.starts_with('"') {
-            let inner = &rest[1..];
-            if let Some(end) = inner.find('"') {
-                return inner[..end].to_string();
-            }
-        } else if rest.starts_with('{') {
-            // Nested object — extract "name" sub-field for defaultBranchRef.
-            if let Some(name_idx) = rest.find("\"name\":") {
-                let name_rest = &rest[name_idx + 7..];
-                let name_rest = name_rest.trim_start();
-                if name_rest.starts_with('"') {
-                    let inner = &name_rest[1..];
-                    if let Some(end) = inner.find('"') {
-                        return inner[..end].to_string();
-                    }
-                }
-            }
-        }
-    }
-    String::new()
-}
-
-/// Extract a JSON integer field value.
-fn extract_json_int(text: &str, field: &str) -> i64 {
-    let needle = format!("\"{}\":", field);
-    if let Some(idx) = text.find(&needle) {
-        let rest = &text[idx + needle.len()..];
-        let rest = rest.trim_start();
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
-        if let Ok(n) = num_str.parse() {
-            return n;
-        }
-    }
-    0
 }
 
 /// Open a file by relative path (resolved against the active document's directory).
@@ -1808,9 +1981,16 @@ fn open_relative_file(
     let resolved = base_dir.join(&relative_path);
     drop(s);
 
-    let path = resolved.canonicalize().unwrap_or(resolved);
-    // Security: prevent path traversal — ensure the resolved path is within base_dir.
-    let canonical_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
+    // Security: prevent path traversal — the resolved path must stay within
+    // base_dir. `canonicalize` must succeed: a non-canonicalized path keeps
+    // `..` segments which `starts_with` compares literally, letting
+    // `base/../outside` pass as "inside".
+    let path = resolved
+        .canonicalize()
+        .map_err(|_| format!("cannot resolve path: {}", relative_path))?;
+    let canonical_base = base_dir
+        .canonicalize()
+        .map_err(|_| "cannot resolve base directory".to_string())?;
     if !path.starts_with(&canonical_base) {
         return Err("path traversal denied: resolved path is outside the base directory".to_string());
     }
@@ -1842,6 +2022,14 @@ fn open_relative_file(
     };
 
     let mut s = state.lock().map_err(|e| e.to_string())?;
+    // Same dedup as open_document: `path` is already canonicalized, so a
+    // link to a file that's already open must activate its tab rather than
+    // fork a second, divergent buffer.
+    if let Some(idx) = find_tab_idx_for_path(&s.tabs, &path) {
+        s.active = idx;
+        let tab = s.active_tab()?;
+        return Ok(doc_info_from_tab(tab));
+    }
     let id = s.next_id;
     s.next_id += 1;
     let tab = DocumentTab {
@@ -1918,16 +2106,35 @@ fn copy_file(src_path: String, dest_path: String) -> Result<bool, String> {
         return Err(format!("Destination already exists: {}", dest_path));
     }
     if src.is_dir() {
-        copy_dir_recursive(src, dest).map_err(|e| e.to_string())?;
+        // Copying a directory into itself would recurse: `read_dir` can observe
+        // the freshly-created destination during iteration. Canonicalize the
+        // destination's parent (dest itself doesn't exist yet) and reject any
+        // destination that resolves inside the source tree.
+        let canonical_src = src.canonicalize().map_err(|e| e.to_string())?;
+        let canonical_dest = dest
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| p.join(dest.file_name().unwrap_or_default()))
+            .unwrap_or_else(|| dest.to_path_buf());
+        if canonical_dest.starts_with(&canonical_src) {
+            return Err("cannot copy a directory into itself".to_string());
+        }
+        copy_dir_recursive(&canonical_src, &canonical_dest).map_err(|e| e.to_string())?;
     } else {
         std::fs::copy(src, dest).map_err(|e| e.to_string())?;
     }
     Ok(true)
 }
 
-/// Move/rename a file or directory.
+/// Move/rename a file or directory. Open tabs whose file lives at the moved
+/// path (or under a moved directory) are repointed at the new location so a
+/// later save does not silently recreate the old path.
 #[tauri::command]
-fn move_file(src_path: String, dest_path: String) -> Result<bool, String> {
+fn move_file(
+    state: tauri::State<'_, Mutex<AppState>>,
+    src_path: String,
+    dest_path: String,
+) -> Result<bool, String> {
     let src = std::path::Path::new(&src_path);
     let dest = std::path::Path::new(&dest_path);
     if !src.exists() {
@@ -1937,13 +2144,40 @@ fn move_file(src_path: String, dest_path: String) -> Result<bool, String> {
         return Err(format!("Destination already exists: {}", dest_path));
     }
     std::fs::rename(src, dest).map_err(|e| e.to_string())?;
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    repoint_tabs_after_move(&mut s, src, dest);
     Ok(true)
+}
+
+/// Repoint every open tab whose file path equals `src` — or lives under `src`
+/// when a directory was moved — to the corresponding location under `dest`.
+fn repoint_tabs_after_move(state: &mut AppState, src: &std::path::Path, dest: &std::path::Path) {
+    for tab in &mut state.tabs {
+        let Some(fp) = &tab.file_path else { continue };
+        if fp == src {
+            tab.file_path = Some(dest.to_path_buf());
+        } else if let Ok(rest) = fp.strip_prefix(src) {
+            tab.file_path = Some(dest.join(rest));
+        }
+    }
 }
 
 /// Delete a file or directory.
 #[tauri::command]
-fn delete_file(path: String) -> Result<bool, String> {
-    let p = std::path::Path::new(&path);
+fn delete_file(
+    state: tauri::State<'_, Mutex<AppState>>,
+    path: String,
+) -> Result<bool, String> {
+    let p = delete_path(&path)?;
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    detach_tabs_for_deleted_path(&mut s, &p);
+    Ok(true)
+}
+
+/// The filesystem part of delete_file — split out so tests can exercise it
+/// without a `tauri::State`.
+fn delete_path(path: &str) -> Result<PathBuf, String> {
+    let p = std::path::Path::new(path);
     if !p.exists() {
         return Err(format!("Path does not exist: {}", path));
     }
@@ -1952,7 +2186,22 @@ fn delete_file(path: String) -> Result<bool, String> {
     } else {
         std::fs::remove_file(p).map_err(|e| e.to_string())?;
     }
-    Ok(true)
+    Ok(p.to_path_buf())
+}
+
+/// Clear `file_path` on every open tab pointing at `path` (or inside it, when
+/// a directory was deleted). Without this the tab keeps a stale path and the
+/// next save — including autosave — silently recreates a file the user just
+/// deleted. The buffer itself is untouched; the tab behaves like an unsaved
+/// document and will prompt for a new path on save.
+fn detach_tabs_for_deleted_path(state: &mut AppState, path: &std::path::Path) {
+    for tab in &mut state.tabs {
+        let Some(fp) = &tab.file_path else { continue };
+        // starts_with covers `fp == path` too (a path is its own prefix).
+        if fp.starts_with(path) {
+            tab.file_path = None;
+        }
+    }
 }
 
 /// Create a new file (with empty content).
@@ -1977,8 +2226,19 @@ fn create_directory(path: String) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Recursively copy a directory.
+/// Recursively copy a directory. Depth is capped so symlink cycles (Windows
+/// falls back to copying the resolved target) can't recurse forever.
 fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    copy_dir_depth(src, dest, 0)
+}
+
+fn copy_dir_depth(src: &std::path::Path, dest: &std::path::Path, depth: u32) -> std::io::Result<()> {
+    if depth > 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "directory depth limit exceeded (possible symlink cycle)",
+        ));
+    }
     std::fs::create_dir(dest)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -1998,7 +2258,7 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io:
                 // On Windows, fall back to copying the resolved target.
                 let resolved = src_path.canonicalize().unwrap_or_else(|_| src_path.clone());
                 if resolved.is_dir() {
-                    copy_dir_recursive(&resolved, &dest_path)?;
+                    copy_dir_depth(&resolved, &dest_path, depth + 1)?;
                 } else {
                     std::fs::copy(&resolved, &dest_path)?;
                 }
@@ -2008,7 +2268,7 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io:
                 std::fs::copy(&src_path, &dest_path)?;
             }
         } else if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
+            copy_dir_depth(&src_path, &dest_path, depth + 1)?;
         } else {
             std::fs::copy(&src_path, &dest_path)?;
         }
@@ -2034,9 +2294,40 @@ fn get_tear_off_file(
 // ---------------------------------------------------------------------------
 
 fn detect_line_ending(bytes: &[u8]) -> editor_domain::LineEnding {
-    if bytes.windows(2).any(|w| w == b"\r\n") {
+    // Count each newline family once — a `\r\n` counts as one CRLF, not a lone
+    // CR. The old check returned Crlf as soon as ANY `\r\n` existed, so files
+    // that were mostly LF with one CRLF were mislabeled.
+    let mut crlf = 0u64;
+    let mut lf = 0u64;
+    let mut cr = 0u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    crlf += 1;
+                    i += 2;
+                } else {
+                    cr += 1;
+                    i += 1;
+                }
+            }
+            b'\n' => {
+                lf += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    // Dominant family wins; genuinely mixed files are reported as Mixed
+    // (per-line endings are preserved by the piece table regardless).
+    let kinds = u8::from(crlf > 0) + u8::from(lf > 0) + u8::from(cr > 0);
+    if kinds > 1 {
+        return editor_domain::LineEnding::Mixed;
+    }
+    if crlf > 0 {
         editor_domain::LineEnding::Crlf
-    } else if bytes.contains(&b'\r') {
+    } else if cr > 0 {
         editor_domain::LineEnding::Cr
     } else {
         editor_domain::LineEnding::Lf
@@ -2156,7 +2447,9 @@ fn parse_unified_diff(text: &str) -> Vec<GitHunkInfo> {
 fn span_text(span: editor_markdown::SourceSpan, text: &str) -> String {
     let s = span.start.0 as usize;
     let e = span.end.0 as usize;
-    if s <= e && e <= text.len() { text[s..e].to_string() } else { String::new() }
+    // `str::get` returns None for mid-char boundaries — a stale span must not
+    // panic the command.
+    if s <= e { text.get(s..e).unwrap_or("").to_string() } else { String::new() }
 }
 
 /// Like span_text but rebases offsets by subtracting `base` (for virtualized
@@ -2164,12 +2457,88 @@ fn span_text(span: editor_markdown::SourceSpan, text: &str) -> String {
 fn span_text_relative(span: editor_markdown::SourceSpan, text: &str, base: u64) -> String {
     let s = span.start.0.saturating_sub(base) as usize;
     let e = span.end.0.saturating_sub(base) as usize;
-    if s <= e && e <= text.len() { text[s..e].to_string() } else { String::new() }
+    if s <= e { text.get(s..e).unwrap_or("").to_string() } else { String::new() }
 }
 
 /// Like block_to_ast but uses relative offsets (subtracts `base` from all spans).
 /// Used by get_block_data for virtualized rendering where only the block's local
 /// bytes are available, not the full 120MB document.
+/// True when a line is a code-fence closing line: a run of 3+ identical
+/// backticks or tildes and nothing else (closing fences cannot have an info
+/// string; leading whitespace is allowed).
+fn is_closing_fence_line(line: &str) -> bool {
+    let t = line.trim();
+    let Some(&c) = t.as_bytes().first() else { return false };
+    if c != b'`' && c != b'~' {
+        return false;
+    }
+    t.len() >= 3 && t.bytes().all(|b| b == c)
+}
+
+/// Split a line (as yielded by `split_inclusive('\n')`) into content and line
+/// ending, mirroring the parser's `content_end` semantics — a trailing `\r`
+/// belongs to the ending, never to the content.
+fn split_line_ending(line: &str) -> (&str, &str) {
+    if let Some(s) = line.strip_suffix("\r\n") {
+        (s, "\r\n")
+    } else if let Some(s) = line.strip_suffix('\n') {
+        (s, "\n")
+    } else if let Some(s) = line.strip_suffix('\r') {
+        (s, "\r")
+    } else {
+        (line, "")
+    }
+}
+
+/// Rebuild the marker-stripped buffer the parser produced for a block quote's
+/// children: each line loses its leading spaces, the `>` marker, and one
+/// optional space after it. Child block spans are relative to THIS buffer —
+/// extracting them from the document text would read the wrong bytes.
+fn de_mark_block_quote(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.split_inclusive('\n') {
+        let (content, ending) = split_line_ending(line);
+        let ind = content.bytes().take_while(|&b| b == b' ').count();
+        let s = &content[ind.min(content.len())..];
+        let s = s.strip_prefix('>').unwrap_or(s);
+        let s = s.strip_prefix(' ').unwrap_or(s);
+        out.push_str(s);
+        out.push_str(ending);
+    }
+    out
+}
+
+/// Rebuild the marker-stripped buffer the parser produced for a list item's
+/// children: the first line loses indent + marker + whitespace after the
+/// marker plus the task checkbox (rendered separately from `item.task`);
+/// continuation lines lose `indent + content_indent` bytes.
+fn de_mark_list_item(raw: &str, ordered: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut strip = 0usize;
+    for (k, line) in raw.split_inclusive('\n').enumerate() {
+        let (content, ending) = split_line_ending(line);
+        if k == 0 {
+            let ind = content.bytes().take_while(|&b| b == b' ').count();
+            let s = &content[ind.min(content.len())..];
+            let marker_len = if ordered {
+                s.bytes().take_while(|b| b.is_ascii_digit()).count() + 1
+            } else {
+                1
+            };
+            let after = &s[marker_len.min(s.len())..];
+            let ws = after.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+            strip = ind + marker_len + ws;
+            let rest = &content[strip.min(content.len())..];
+            if rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] ") {
+                strip += 4;
+            }
+        }
+        out.push_str(&content[strip.min(content.len())..]);
+        out.push_str(ending);
+    }
+    out
+}
+
 fn block_to_ast_relative(block: &editor_markdown::Block, text: &str, base: u64) -> Option<AstNode> {
     use editor_markdown::Block;
     match block {
@@ -2182,18 +2551,24 @@ fn block_to_ast_relative(block: &editor_markdown::Block, text: &str, base: u64) 
         Block::Paragraph(p) => Some(AstNode::Paragraph {
             children: p.inlines.iter().map(|i| inline_to_ast_relative(i, text, base)).collect(),
         }),
-        Block::BlockQuote(bq) => Some(AstNode::BlockQuote {
-            children: bq.children.iter().filter_map(|b| block_to_ast_relative(b, text, base)).collect(),
-        }),
+        Block::BlockQuote(bq) => {
+            let de = de_mark_block_quote(&span_text_relative(bq.meta.span, text, base));
+            Some(AstNode::BlockQuote {
+                children: bq.children.iter().filter_map(|b| block_to_ast_relative(b, &de, 0)).collect(),
+            })
+        }
         Block::List(l) => Some(AstNode::List {
             ordered: l.ordered,
             start: l.start,
-            items: l.items.iter().map(|item| ListItemNode {
-                task: item.task.map(|t| match t {
-                    editor_markdown::TaskState::Open => "open".to_string(),
-                    editor_markdown::TaskState::Done => "done".to_string(),
-                }),
-                children: item.children.iter().filter_map(|b| block_to_ast_relative(b, text, base)).collect(),
+            items: l.items.iter().map(|item| {
+                let de = de_mark_list_item(&span_text_relative(item.meta.span, text, base), l.ordered);
+                ListItemNode {
+                    task: item.task.map(|t| match t {
+                        editor_markdown::TaskState::Open => "open".to_string(),
+                        editor_markdown::TaskState::Done => "done".to_string(),
+                    }),
+                    children: item.children.iter().filter_map(|b| block_to_ast_relative(b, &de, 0)).collect(),
+                }
             }).collect(),
         }),
         Block::CodeBlock(cb) => {
@@ -2201,7 +2576,15 @@ fn block_to_ast_relative(block: &editor_markdown::Block, text: &str, base: u64) 
             let content = if cb.fenced {
                 let lines: Vec<&str> = raw.lines().collect();
                 if lines.len() >= 2 {
-                    lines[1..lines.len()-1].join("\n")
+                    // Drop the closing line only when it is actually a closing
+                    // fence — an *unclosed* fence would otherwise silently lose
+                    // the last content line.
+                    let body_end = if is_closing_fence_line(lines[lines.len() - 1]) {
+                        lines.len() - 1
+                    } else {
+                        lines.len()
+                    };
+                    lines[1..body_end].join("\n")
                 } else {
                     raw
                 }
@@ -2298,28 +2681,41 @@ fn block_to_ast(block: &editor_markdown::Block, text: &str) -> Option<AstNode> {
         Block::Paragraph(p) => Some(AstNode::Paragraph {
             children: p.inlines.iter().map(|i| inline_to_ast(i, text)).collect(),
         }),
-        Block::BlockQuote(bq) => Some(AstNode::BlockQuote {
-            children: bq.children.iter().filter_map(|b| block_to_ast(b, text)).collect(),
-        }),
+        Block::BlockQuote(bq) => {
+            let de = de_mark_block_quote(&span_text(bq.meta.span, text));
+            Some(AstNode::BlockQuote {
+                children: bq.children.iter().filter_map(|b| block_to_ast(b, &de)).collect(),
+            })
+        }
         Block::List(l) => Some(AstNode::List {
             ordered: l.ordered,
             start: l.start,
-            items: l.items.iter().map(|item| ListItemNode {
-                task: item.task.map(|t| match t {
-                    editor_markdown::TaskState::Open => "open".to_string(),
-                    editor_markdown::TaskState::Done => "done".to_string(),
-                }),
-                children: item.children.iter().filter_map(|b| block_to_ast(b, text)).collect(),
+            items: l.items.iter().map(|item| {
+                let de = de_mark_list_item(&span_text(item.meta.span, text), l.ordered);
+                ListItemNode {
+                    task: item.task.map(|t| match t {
+                        editor_markdown::TaskState::Open => "open".to_string(),
+                        editor_markdown::TaskState::Done => "done".to_string(),
+                    }),
+                    children: item.children.iter().filter_map(|b| block_to_ast(b, &de)).collect(),
+                }
             }).collect(),
         }),
         Block::CodeBlock(cb) => {
             // Extract content between fence markers, or dedent indented code.
             let raw = span_text(cb.meta.span, text);
             let content = if cb.fenced {
-                // Strip fence lines.
+                // Strip the opening fence line — and the closing one only when
+                // it is actually a closing fence (unclosed fences keep all
+                // remaining lines as content).
                 let lines: Vec<&str> = raw.lines().collect();
                 if lines.len() >= 2 {
-                    lines[1..lines.len()-1].join("\n")
+                    let body_end = if is_closing_fence_line(lines[lines.len() - 1]) {
+                        lines.len() - 1
+                    } else {
+                        lines.len()
+                    };
+                    lines[1..body_end].join("\n")
                 } else {
                     raw
                 }
@@ -2435,7 +2831,14 @@ fn block_kind_name(block: &editor_markdown::Block) -> String {
 /// instead of linking to an external file.
 #[tauri::command]
 fn read_image_file(path: String) -> Result<String, String> {
+    const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
     let path = PathBuf::from(path);
+    let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    if size > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image too large to embed ({size} bytes, max {MAX_IMAGE_BYTES})"
+        ));
+    }
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let ext = path
         .extension()
@@ -2824,66 +3227,26 @@ mod tests {
         assert_eq!(hunks[0].lines.len(), 3);
     }
 
-    /// root_pathspec should prepend :/ to make paths relative to repo root.
+    /// root_pathspec should prepend the top-level literal pathspec magic.
     #[test]
     fn test_root_pathspec_basic() {
-        assert_eq!(root_pathspec("src/main.rs"), ":/src/main.rs");
-        assert_eq!(root_pathspec("crates/editor-ui/src/main.rs"), ":/crates/editor-ui/src/main.rs");
+        assert_eq!(root_pathspec("src/main.rs"), ":(top,literal)src/main.rs");
+        assert_eq!(root_pathspec("crates/editor-ui/src/main.rs"), ":(top,literal)crates/editor-ui/src/main.rs");
+        // Glob metacharacters in real file names must be treated literally.
+        assert_eq!(root_pathspec("docs/a[1].md"), ":(top,literal)docs/a[1].md");
     }
 
-    /// root_pathspec should not double-prefix paths that already start with :/.
+    /// root_pathspec should not double-prefix paths that already carry magic.
     #[test]
     fn test_root_pathspec_already_prefixed() {
         assert_eq!(root_pathspec(":/src/main.rs"), ":/src/main.rs");
-        assert_eq!(root_pathspec("**/*.rs"), "**/*.rs");
+        assert_eq!(root_pathspec(":(top)src/main.rs"), ":(top)src/main.rs");
     }
 
     /// root_pathspec should handle empty path.
     #[test]
     fn test_root_pathspec_empty() {
-        assert_eq!(root_pathspec(""), ":/");
-    }
-
-    /// extract_json_field should parse string values.
-    #[test]
-    fn test_extract_json_field_string() {
-        let json = r#"{"nameWithOwner":"user/repo","url":"https://github.com/user/repo"}"#;
-        assert_eq!(extract_json_field(json, "nameWithOwner"), "user/repo");
-        assert_eq!(extract_json_field(json, "url"), "https://github.com/user/repo");
-    }
-
-    /// extract_json_field should handle nested objects (defaultBranchRef).
-    #[test]
-    fn test_extract_json_field_nested() {
-        let json = r#"{"defaultBranchRef":{"name":"main","ref":"refs/heads/main"}}"#;
-        assert_eq!(extract_json_field(json, "defaultBranchRef"), "main");
-    }
-
-    /// extract_json_field should return empty for missing fields.
-    #[test]
-    fn test_extract_json_field_missing() {
-        let json = r#"{"foo":"bar"}"#;
-        assert_eq!(extract_json_field(json, "baz"), "");
-    }
-
-    /// extract_json_int should parse integer values.
-    #[test]
-    fn test_extract_json_int() {
-        let json = r#"{"number":42,"title":"test"}"#;
-        assert_eq!(extract_json_int(json, "number"), 42);
-    }
-
-    /// extract_json_int should handle zero and negative.
-    #[test]
-    fn test_extract_json_int_edge() {
-        assert_eq!(extract_json_int(r#"{"n":0}"#, "n"), 0);
-        assert_eq!(extract_json_int(r#"{"n":-5}"#, "n"), -5);
-    }
-
-    /// extract_json_int should return 0 for missing fields.
-    #[test]
-    fn test_extract_json_int_missing() {
-        assert_eq!(extract_json_int(r#"{"foo":"bar"}"#, "n"), 0);
+        assert_eq!(root_pathspec(""), ":(top,literal)");
     }
 
     /// list_directory should return entries sorted (dirs first).
@@ -2939,7 +3302,7 @@ mod tests {
         assert!(file_path.exists());
         // Creating again should fail.
         assert!(create_file(file_path.to_string_lossy().to_string()).is_err());
-        delete_file(file_path.to_string_lossy().to_string()).unwrap();
+        delete_path(&file_path.to_string_lossy()).unwrap();
         assert!(!file_path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2953,7 +3316,7 @@ mod tests {
         let new_dir = dir.join("newfolder");
         create_directory(new_dir.to_string_lossy().to_string()).unwrap();
         assert!(new_dir.is_dir());
-        delete_file(new_dir.to_string_lossy().to_string()).unwrap();
+        delete_path(&new_dir.to_string_lossy()).unwrap();
         assert!(!new_dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2975,6 +3338,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Copying a directory into itself must be rejected — `read_dir` would
+    /// observe the freshly-created destination mid-iteration and recurse
+    /// (the depth cap alone can't stop exponential self-copying).
+    #[test]
+    fn test_copy_dir_into_itself_fails() {
+        let dir = std::env::temp_dir().join("womd_test_copy_self");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        // Direct self-copy and copy into a subdirectory are both rejected.
+        assert!(copy_file(
+            dir.to_string_lossy().to_string(),
+            dir.join("inside").to_string_lossy().to_string()
+        )
+        .is_err());
+        assert!(copy_file(
+            dir.to_string_lossy().to_string(),
+            dir.join("a").join("b").to_string_lossy().to_string()
+        )
+        .is_err());
+        // Copying to a sibling path still works.
+        let sibling = dir.parent().unwrap().join("womd_test_copy_self_sibling");
+        let _ = std::fs::remove_dir_all(&sibling);
+        copy_file(dir.to_string_lossy().to_string(), sibling.to_string_lossy().to_string()).unwrap();
+        assert_eq!(std::fs::read(sibling.join("f.txt")).unwrap(), b"x");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    /// detect_line_ending counts each newline family once — a lone CRLF in
+    /// an LF file (or vice versa) is Mixed, not a mislabeled dominant type.
+    #[test]
+    fn test_detect_line_ending() {
+        use editor_domain::LineEnding;
+        assert!(matches!(detect_line_ending(b"a\nb\n"), LineEnding::Lf));
+        assert!(matches!(detect_line_ending(b"a\r\nb\r\n"), LineEnding::Crlf));
+        assert!(matches!(detect_line_ending(b"a\rb\rc"), LineEnding::Cr));
+        assert!(matches!(detect_line_ending(b"a\nb\r\n"), LineEnding::Mixed));
+        assert!(matches!(detect_line_ending(b"a\r\nb\n"), LineEnding::Mixed));
+        assert!(matches!(detect_line_ending(b""), LineEnding::Lf));
+        assert!(matches!(detect_line_ending(b"no newlines"), LineEnding::Lf));
+    }
+
+    /// de_mark_block_quote strips the `> ` prefix per line, including the
+    /// lazy-continuation form (lines without `>` stay verbatim inside a quote).
+    #[test]
+    fn test_de_mark_block_quote() {
+        assert_eq!(de_mark_block_quote("> a\n> b\n"), "a\nb\n");
+        assert_eq!(de_mark_block_quote(">a\n>b\n"), "a\nb\n");
+        // Lazy continuation line (no `>`) is kept verbatim.
+        assert_eq!(de_mark_block_quote("> a\ncontinued\n"), "a\ncontinued\n");
+        // Nested quote markers are stripped one level only.
+        assert_eq!(de_mark_block_quote("> > deep\n"), "> deep\n");
+    }
+
+    /// de_mark_list_item strips marker + indentation AND the task checkbox —
+    /// the checkbox is re-emitted from `item.task`, so leaving it in the
+    /// buffer would duplicate it on render and dirty regen.
+    #[test]
+    fn test_de_mark_list_item() {
+        assert_eq!(de_mark_list_item("- hello\n- world\n", false), "hello\nworld\n");
+        assert_eq!(de_mark_list_item("- [ ] todo\n- [x] done\n", false), "todo\ndone\n");
+        assert_eq!(de_mark_list_item("- [x] done\n", false), "done\n");
+        // Ordered markers.
+        assert_eq!(de_mark_list_item("1. one\n2. two\n", true), "one\ntwo\n");
+        assert_eq!(de_mark_list_item("3) three\n4) four\n", true), "three\nfour\n");
+        // Continuation lines keep their content (indentation reduced by marker width).
+        assert_eq!(de_mark_list_item("- a\n  cont\n", false), "a\ncont\n");
+    }
+
     /// move_file should rename/move a file.
     #[test]
     fn test_move_file() {
@@ -2984,9 +3417,145 @@ mod tests {
         let src = dir.join("old.txt");
         std::fs::write(&src, b"data").unwrap();
         let dest = dir.join("new.txt");
-        move_file(src.to_string_lossy().to_string(), dest.to_string_lossy().to_string()).unwrap();
+        std::fs::rename(&src, &dest).unwrap();
         assert!(!src.exists());
         assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After a move, open tabs must follow the file to its new path —
+    /// otherwise a save silently recreates the old path.
+    #[test]
+    fn test_repoint_tabs_after_move() {
+        let mut s = AppState::default();
+        let blank = || DocumentTab {
+            id: 0,
+            buffer: DocumentBuffer::open(
+                b"x".to_vec(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("t"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: None,
+        };
+        let mut t1 = blank();
+        t1.file_path = Some(PathBuf::from("/repo/dir/a.md"));
+        let mut t2 = blank();
+        t2.file_path = Some(PathBuf::from("/repo/dir/sub/b.md"));
+        let mut t3 = blank();
+        t3.file_path = Some(PathBuf::from("/repo/other/c.md"));
+        s.push_tab(t1);
+        s.push_tab(t2);
+        s.push_tab(t3);
+        let src = std::path::Path::new("/repo/dir");
+        let dest = std::path::Path::new("/repo/moved");
+        repoint_tabs_after_move(&mut s, src, dest);
+        assert_eq!(s.tabs[0].file_path.as_deref(), Some(std::path::Path::new("/repo/moved/a.md")));
+        assert_eq!(s.tabs[1].file_path.as_deref(), Some(std::path::Path::new("/repo/moved/sub/b.md")));
+        assert_eq!(s.tabs[2].file_path.as_deref(), Some(std::path::Path::new("/repo/other/c.md")));
+    }
+
+    /// Deleting a file (or its directory) must detach open tabs from the dead
+    /// path — otherwise the next save silently recreates it.
+    #[test]
+    fn test_detach_tabs_for_deleted_path() {
+        let mut s = AppState::default();
+        let blank = || DocumentTab {
+            id: 0,
+            buffer: DocumentBuffer::open(
+                b"x".to_vec(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("t"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: None,
+        };
+        let mut t1 = blank();
+        t1.file_path = Some(PathBuf::from("/repo/dir/a.md"));
+        let mut t2 = blank();
+        t2.file_path = Some(PathBuf::from("/repo/dir/sub/b.md"));
+        let mut t3 = blank();
+        t3.file_path = Some(PathBuf::from("/repo/other/c.md"));
+        let mut t4 = blank(); // untitled — stays untouched
+        t4.file_path = None;
+        s.push_tab(t1);
+        s.push_tab(t2);
+        s.push_tab(t3);
+        s.push_tab(t4);
+
+        // File delete: only the exact file detaches.
+        detach_tabs_for_deleted_path(&mut s, std::path::Path::new("/repo/dir/a.md"));
+        assert_eq!(s.tabs[0].file_path, None);
+        assert_eq!(s.tabs[1].file_path.as_deref(), Some(std::path::Path::new("/repo/dir/sub/b.md")));
+        assert_eq!(s.tabs[2].file_path.as_deref(), Some(std::path::Path::new("/repo/other/c.md")));
+
+        // Directory delete: every tab under it detaches; siblings keep paths.
+        detach_tabs_for_deleted_path(&mut s, std::path::Path::new("/repo/dir"));
+        assert_eq!(s.tabs[1].file_path, None);
+        assert_eq!(s.tabs[2].file_path.as_deref(), Some(std::path::Path::new("/repo/other/c.md")));
+        // A prefix-similar path (/repo/dirX) must NOT detach.
+        let mut t5 = blank();
+        t5.file_path = Some(PathBuf::from("/repo/dirX/d.md"));
+        s.push_tab(t5);
+        detach_tabs_for_deleted_path(&mut s, std::path::Path::new("/repo/dir"));
+        assert_eq!(s.tabs[4].file_path.as_deref(), Some(std::path::Path::new("/repo/dirX/d.md")));
+    }
+
+    /// find_tab_idx_for_path must match a tab opened via a non-normalized
+    /// spelling of the same file (dot segments, different separators) — this
+    /// is what prevents the same file opening twice with diverging buffers.
+    #[test]
+    fn find_tab_idx_for_path_dedups() {
+        let dir = std::env::temp_dir().join("womd_test_dedup");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.md");
+        std::fs::write(&f, b"hi").unwrap();
+
+        let mk = |id: u64, path: Option<PathBuf>| DocumentTab {
+            id,
+            buffer: DocumentBuffer::open(
+                b"x".to_vec(),
+                editor_domain::DocumentMeta {
+                    id: DocumentId::new("t"),
+                    has_bom: false,
+                    line_ending: editor_domain::LineEnding::Lf,
+                    trailing_newline: false,
+                    encoding: editor_domain::Encoding::Utf8,
+                },
+                MarkdownProfile::Gfm,
+            )
+            .unwrap(),
+            file_path: path,
+        };
+        // Tab opened with a `..`-normalized-away spelling.
+        let weird = dir.join("sub").join("..").join("a.md");
+        let tabs = vec![
+            mk(1, None),                                  // untitled — no match
+            mk(2, Some(weird)),                           // same file, odd spelling
+            mk(3, Some(dir.join("other.md"))),            // different file
+        ];
+        let canon = canonical_or_self(&f);
+        assert_eq!(find_tab_idx_for_path(&tabs, &canon), Some(1));
+        // A different file must not match.
+        let other = dir.join("b.md");
+        std::fs::write(&other, b"y").unwrap();
+        assert_eq!(find_tab_idx_for_path(&tabs, &canonical_or_self(&other)), None);
+        // Untitled tabs never match.
+        let untitled = vec![mk(9, None)];
+        assert_eq!(find_tab_idx_for_path(&untitled, &canon), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3130,6 +3699,34 @@ mod tests {
         assert_eq!(&text[m.start as usize..m.end as usize], "ist");
     }
 
+    /// A previously-found match range must be re-verified before replacing —
+    /// bytes that moved under the cursor must not be destroyed.
+    #[test]
+    fn range_still_matches_detects_stale_ranges() {
+        let text = "foo bar foo";
+        // Original match at [0,3) still matches.
+        assert!(range_still_matches(text, 0, 3, "foo", false, false).unwrap());
+        // Simulate a doc edit shifting the second match's bytes.
+        let edited = "foo bar Xoo";
+        assert!(!range_still_matches(edited, 8, 11, "foo", false, false).unwrap());
+        // A range that only partially covers a match is rejected.
+        assert!(!range_still_matches(text, 0, 2, "foo", false, false).unwrap());
+        // Case-insensitive literal still matches a differently-cased range.
+        assert!(range_still_matches("FOO x", 0, 3, "foo", false, false).unwrap());
+    }
+
+    /// `\b`-style context must be evaluated against the real document, not
+    /// the sliced match text — `find_at` preserves it.
+    #[test]
+    fn range_still_matches_respects_word_boundaries() {
+        // `\bfoo` matches at 4 in "the foo" but not inside "thefoo".
+        assert!(range_still_matches("the foo", 4, 7, r"\bfoo", false, true).unwrap());
+        assert!(!range_still_matches("thefoo", 3, 6, r"\bfoo", false, true).unwrap());
+        // `\B` non-boundary: "oo" inside "xoo" — requires the preceding 'x'.
+        assert!(range_still_matches("xoo", 1, 3, r"\Boo", false, true).unwrap());
+        assert!(!range_still_matches(" oo", 1, 3, r"\Boo", false, true).unwrap());
+    }
+
     #[test]
     fn expand_replacement_substitutes_capture_groups() {
         let expanded = expand_replacement("2024-01-15", r"(\d{4})-(\d{2})-(\d{2})", false, true, "$3/$2/$1");
@@ -3237,5 +3834,59 @@ mod tests {
         );
         tab.buffer.apply(tx).unwrap();
         assert_eq!(tab.buffer.serialize(), b"a:1;b:2;c:3");
+    }
+
+    // -----------------------------------------------------------------
+    // De-marked child coordinates (block quote / list item children)
+    // -----------------------------------------------------------------
+
+    /// A fenced code block inside a block quote must render its own bytes.
+    /// Children of a quote live in marker-stripped coordinates — extracting
+    /// them against the document text used to read coincident document bytes.
+    #[test]
+    fn block_to_ast_quote_child_code_block_uses_demarked_spans() {
+        let src = "para text that makes the doc long\n\n> ```rust\n> code()\n> ```\n";
+        let doc = editor_markdown::parse_with(src.as_bytes(), MarkdownProfile::Gfm).unwrap();
+        let quote = doc.blocks.iter().find(|b| matches!(b, editor_markdown::Block::BlockQuote(_)))
+            .expect("quote block");
+        let node = block_to_ast(quote, src).unwrap();
+        let AstNode::BlockQuote { children } = node else { panic!("expected BlockQuote") };
+        let AstNode::CodeBlock { content, .. } = &children[0] else {
+            panic!("expected CodeBlock child")
+        };
+        assert_eq!(content, "code()");
+    }
+
+    /// Same for list items: a fenced code block inside an item must show the
+    /// item's code, not document bytes at coincident offsets.
+    #[test]
+    fn block_to_ast_list_item_code_block_uses_demarked_spans() {
+        let src = "para text that makes the doc long\n\n- item\n\n  ```\n  inside()\n  ```\n";
+        let doc = editor_markdown::parse_with(src.as_bytes(), MarkdownProfile::Gfm).unwrap();
+        let list = doc.blocks.iter().find(|b| matches!(b, editor_markdown::Block::List(_)))
+            .expect("list block");
+        let node = block_to_ast(list, src).unwrap();
+        let AstNode::List { items, .. } = node else { panic!("expected List") };
+        let code = items[0].children.iter().find_map(|c| match c {
+            AstNode::CodeBlock { content, .. } => Some(content.clone()),
+            _ => None,
+        }).expect("code block inside item");
+        assert_eq!(code, "inside()");
+    }
+
+    /// HtmlBlock content inside a block quote resolves against the de-marked
+    /// buffer as well.
+    #[test]
+    fn block_to_ast_quote_child_html_block_uses_demarked_spans() {
+        let src = "para text that makes the doc long\n\n> <div>hi</div>\n";
+        let doc = editor_markdown::parse_with(src.as_bytes(), MarkdownProfile::Gfm).unwrap();
+        let quote = doc.blocks.iter().find(|b| matches!(b, editor_markdown::Block::BlockQuote(_)))
+            .expect("quote block");
+        let node = block_to_ast(quote, src).unwrap();
+        let AstNode::BlockQuote { children } = node else { panic!("expected BlockQuote") };
+        let AstNode::HtmlBlock { content } = &children[0] else {
+            panic!("expected HtmlBlock child")
+        };
+        assert!(content.contains("<div>hi</div>"), "content was {:?}", content);
     }
 }

@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use editor_domain::ids::ProviderId;
@@ -35,17 +35,70 @@ impl GenericGitAdapter {
     }
 
     fn git_text(&self, args: &[&str]) -> Result<String, AdapterError> {
-        let out = Command::new(&self.git_bin)
-            .current_dir(&self.work_dir)
-            .args(args)
-            .output()
-            .map_err(|e| AdapterError::Other(e.to_string()))?;
+        let out = run_with_timeout(&self.git_bin, &self.work_dir, args, CMD_TIMEOUT)?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
         } else {
             Err(AdapterError::Other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
         }
     }
+}
+
+const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `Command::output()` has no timeout — a wedged git (stale lock waiting on a
+/// dead mount, credential prompt on a non-existent terminal) hangs forever.
+/// Drain both pipes on reader threads (a full pipe buffer blocks a healthy
+/// child, which then looks like a hang), poll `try_wait`, kill on deadline.
+fn run_with_timeout(
+    bin: &str,
+    dir: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, AdapterError> {
+    use std::io::Read;
+    let mut child = Command::new(bin)
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| AdapterError::Other(e.to_string()))?;
+    let mut out_pipe = child.stdout.take().expect("piped");
+    let mut err_pipe = child.stderr.take().expect("piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out_pipe.read_to_end(&mut v);
+        v
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err_pipe.read_to_end(&mut v);
+        v
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| AdapterError::Other(e.to_string()))? {
+            Some(s) => break s,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(AdapterError::Other(format!("{} timed out", bin)));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    })
 }
 
 impl RepositoryHostAdapter for GenericGitAdapter {

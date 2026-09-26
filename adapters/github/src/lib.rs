@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use editor_domain::ids::ProviderId;
@@ -33,9 +33,7 @@ impl GithubAdapter {
     }
 
     fn gh_available(&self) -> bool {
-        Command::new(&self.gh_bin)
-            .arg("--version")
-            .output()
+        run_with_timeout(&self.gh_bin, &self.work_dir, &["--version"], PROBE_TIMEOUT)
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
@@ -44,11 +42,7 @@ impl GithubAdapter {
         if !self.gh_available() {
             return Err(AdapterError::Other("gh CLI not installed".to_string()));
         }
-        let out = Command::new(&self.gh_bin)
-            .current_dir(&self.work_dir)
-            .args(args)
-            .output()
-            .map_err(|e| AdapterError::Other(e.to_string()))?;
+        let out = run_with_timeout(&self.gh_bin, &self.work_dir, args, CMD_TIMEOUT)?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
         } else {
@@ -58,17 +52,71 @@ impl GithubAdapter {
 
     fn git_text(&self, args: &[&str]) -> Result<String, AdapterError> {
         let git = std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string());
-        let out = Command::new(&git)
-            .current_dir(&self.work_dir)
-            .args(args)
-            .output()
-            .map_err(|e| AdapterError::Other(e.to_string()))?;
+        let out = run_with_timeout(&git, &self.work_dir, args, CMD_TIMEOUT)?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
         } else {
             Err(AdapterError::Other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
         }
     }
+}
+
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `Command::output()` has no timeout — a wedged network call or a credential
+/// prompt on a non-existent terminal hangs forever. Drain both pipes on
+/// reader threads (a full pipe buffer blocks a healthy child, which then
+/// looks like a hang), poll `try_wait`, and kill on deadline.
+fn run_with_timeout(
+    bin: &str,
+    dir: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, AdapterError> {
+    use std::io::Read;
+    let mut child = Command::new(bin)
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| AdapterError::Other(e.to_string()))?;
+    let mut out_pipe = child.stdout.take().expect("piped");
+    let mut err_pipe = child.stderr.take().expect("piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out_pipe.read_to_end(&mut v);
+        v
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err_pipe.read_to_end(&mut v);
+        v
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| AdapterError::Other(e.to_string()))? {
+            Some(s) => break s,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(AdapterError::Other(format!("{} timed out", bin)));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    })
 }
 
 impl RepositoryHostAdapter for GithubAdapter {
@@ -107,12 +155,14 @@ impl RepositoryHostAdapter for GithubAdapter {
     fn pull_requests(&self) -> Result<Vec<PullRequest>, AdapterError> {
         let text = self.gh_text(&["pr", "list", "--json", "number,title,state,url"])?;
         let mut prs = Vec::new();
-        for line in text.lines() {
-            if line.contains("\"number\"") {
-                let number = extract_json_int(line, "number");
-                let title = extract_json_field(line, "title");
-                let state = extract_json_field(line, "state");
-                let html_url = extract_json_field(line, "url");
+        // gh emits a compact JSON array on a single line — splitting on lines
+        // only ever saw the first PR. Split into top-level objects instead.
+        for obj in split_json_objects(&text) {
+            if obj.contains("\"number\"") {
+                let number = extract_json_int(obj, "number");
+                let title = extract_json_field(obj, "title");
+                let state = extract_json_field(obj, "state");
+                let html_url = extract_json_field(obj, "url");
                 prs.push(PullRequest { number, title, state, html_url });
             }
         }
@@ -146,20 +196,89 @@ impl RepositoryHostAdapter for GithubAdapter {
     fn open_remote_url(&self, _target: RemoteUrlTarget) {}
 }
 
+/// Split a JSON array of objects into the object texts without a full JSON
+/// parser: scans top-level `{...}` regions tracking string literals and escape
+/// sequences so braces inside strings don't confuse the depth counter.
+fn split_json_objects(json: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, c) in json.char_indices() {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push(&json[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Find the index of the closing quote of a JSON string value, honoring `\`
+/// escapes (a bare `find('"')` stops early on an escaped `\"`).
+fn json_string_end(rest: &str) -> Option<usize> {
+    let mut escape = false;
+    for (i, c) in rest.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Minimal JSON string unescape for the escapes gh realistically emits.
+fn json_unescape(s: &str) -> String {
+    s.replace("\\\"", "\"")
+        .replace("\\/", "/")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\\\", "\\")
+}
+
 /// Extract a string field from simple JSON (no serde dep for the adapter skeleton).
 fn extract_json_field(json: &str, field: &str) -> String {
     let needle = format!("\"{field}\":\"");
     if let Some(start) = json.find(&needle) {
         let rest = &json[start + needle.len()..];
-        if let Some(end) = rest.find('"') {
-            return rest[..end].to_string();
+        if let Some(end) = json_string_end(rest) {
+            return json_unescape(&rest[..end]);
         }
     }
     let needle2 = format!("\"{field}\":{{\"name\":\"");
     if let Some(start) = json.find(&needle2) {
         let rest = &json[start + needle2.len()..];
-        if let Some(end) = rest.find('"') {
-            return rest[..end].to_string();
+        if let Some(end) = json_string_end(rest) {
+            return json_unescape(&rest[..end]);
         }
     }
     String::new()
@@ -221,5 +340,100 @@ mod tests {
     fn extract_user_from_auth_status() {
         let text = "Logged in to github.com account octocat";
         assert_eq!(extract_user(text), "octocat");
+    }
+
+    /// gh emits `pr list --json` as a compact array on ONE line — splitting
+    /// must yield every object, not just the first line's.
+    #[test]
+    fn split_json_objects_compact_array() {
+        let json = r#"[{"number":1,"title":"a"},{"number":2,"title":"b"},{"number":3,"title":"c"}]"#;
+        let objs = split_json_objects(json);
+        assert_eq!(objs.len(), 3);
+        assert_eq!(extract_json_int(objs[2], "number"), 3);
+    }
+
+    /// Braces and brackets inside string values must not break the split.
+    #[test]
+    fn split_json_objects_braces_in_strings() {
+        let json = r#"[{"number":1,"title":"fix {parser} [x]"},{"number":2,"title":"ok"}]"#;
+        let objs = split_json_objects(json);
+        assert_eq!(objs.len(), 2);
+        assert_eq!(extract_json_field(objs[0], "title"), "fix {parser} [x]");
+    }
+
+    /// Escaped quotes inside values must not truncate the field.
+    #[test]
+    fn extract_json_field_escaped_quote() {
+        let json = r#"{"title":"say \"hi\" now"}"#;
+        assert_eq!(extract_json_field(json, "title"), "say \"hi\" now");
+    }
+
+    #[test]
+    fn split_json_objects_empty_and_malformed() {
+        assert!(split_json_objects("[]").is_empty());
+        assert!(split_json_objects("not json").is_empty());
+    }
+
+    /// A wedged subprocess (dead remote, credential prompt on a non-existent
+    /// terminal) must be killed at the deadline, not hang the adapter forever.
+    #[test]
+    fn run_with_timeout_kills_hung_process() {
+        // A process that stays alive without stdin or network: `ping` fails
+        // instantly in sandboxes, `timeout` refuses redirected stdin, so use
+        // `Start-Sleep` (Windows) / `sleep` (Unix).
+        #[cfg(windows)]
+        let (bin, args) = (
+            "powershell",
+            vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 30"],
+        );
+        #[cfg(not(windows))]
+        let (bin, args) = ("sh", vec!["-c", "sleep 30"]);
+        let start = std::time::Instant::now();
+        let err = run_with_timeout(bin, Path::new("."), &args, std::time::Duration::from_millis(400))
+            .expect_err("hung process must error");
+        assert!(err.to_string().contains("timed out"), "{}", err);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "kill took too long: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A healthy child producing more output than a pipe buffer (~64 KiB) must
+    /// NOT be mistaken for a hung process — reader threads must drain the pipes
+    /// while the parent polls.
+    #[test]
+    fn run_with_timeout_drains_large_output() {
+        #[cfg(windows)]
+        let (bin, args) = (
+            "cmd",
+            vec!["/c", "for /l %i in (1,1,5000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
+        );
+        #[cfg(not(windows))]
+        let (bin, args) = ("sh", vec!["-c", "yes | head -c 200000"]);
+        let out = run_with_timeout(
+            bin,
+            Path::new("."),
+            &args,
+            std::time::Duration::from_secs(30),
+        )
+        .expect("healthy process with large output must complete");
+        assert!(out.status.success());
+        // >64 KiB — enough to fill an OS pipe buffer and deadlock a naive
+        // spawn+try_wait loop that doesn't drain.
+        assert!(out.stdout.len() > 65_536, "len={}", out.stdout.len());
+    }
+
+    /// A missing binary must produce an error, not a panic or a hang.
+    #[test]
+    fn run_with_timeout_missing_binary() {
+        let err = run_with_timeout(
+            "womd-definitely-not-a-real-binary-xyz",
+            Path::new("."),
+            &[],
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("missing binary must error");
+        assert!(!err.to_string().is_empty());
     }
 }

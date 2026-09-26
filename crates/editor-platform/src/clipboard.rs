@@ -46,16 +46,42 @@ impl Clipboard for SystemClipboard {
     fn set_text(&self, text: &str) -> Result<(), PlatformError> {
         use std::io::Write;
         use std::process::{Command, Stdio};
+        // Shared helper: write `text` to the child's stdin, CLOSE the pipe
+        // (the child waits for EOF), then wait for exit and check the status.
+        // `child.stdin.take()` moves the handle out so it drops at the end of
+        // the write — keeping it alive until `wait()` deadlocks, because the
+        // child never sees EOF. The deadline guards against a wedged tool —
+        // `wait()` has no timeout.
+        fn feed_stdin(child: &mut std::process::Child, text: &str) -> Result<std::process::ExitStatus, PlatformError> {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(text.as_bytes()).map_err(|e| PlatformError::Os(e.to_string()))?;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let status = loop {
+                match child.try_wait().map_err(|e| PlatformError::Os(e.to_string()))? {
+                    Some(s) => break s,
+                    None if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    None => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(PlatformError::Os("clipboard command timed out".to_string()));
+                    }
+                }
+            };
+            if !status.success() {
+                return Err(PlatformError::Os(format!("clipboard command exited with {status}")));
+            }
+            Ok(status)
+        }
         #[cfg(windows)]
         {
             let mut child = Command::new("clip")
                 .stdin(Stdio::piped())
                 .spawn()
                 .map_err(|e| PlatformError::Os(e.to_string()))?;
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(text.as_bytes()).map_err(|e| PlatformError::Os(e.to_string()))?;
-            }
-            child.wait().map_err(|e| PlatformError::Os(e.to_string()))?;
+            feed_stdin(&mut child, text)?;
             Ok(())
         }
         #[cfg(target_os = "macos")]
@@ -64,10 +90,7 @@ impl Clipboard for SystemClipboard {
                 .stdin(Stdio::piped())
                 .spawn()
                 .map_err(|e| PlatformError::Os(e.to_string()))?;
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(text.as_bytes()).map_err(|e| PlatformError::Os(e.to_string()))?;
-            }
-            child.wait().map_err(|e| PlatformError::Os(e.to_string()))?;
+            feed_stdin(&mut child, text)?;
             Ok(())
         }
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -77,10 +100,7 @@ impl Clipboard for SystemClipboard {
                 .stdin(Stdio::piped())
                 .spawn()
                 .map_err(|e| PlatformError::Os(e.to_string()))?;
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(text.as_bytes()).map_err(|e| PlatformError::Os(e.to_string()))?;
-            }
-            child.wait().map_err(|e| PlatformError::Os(e.to_string()))?;
+            feed_stdin(&mut child, text)?;
             Ok(())
         }
     }

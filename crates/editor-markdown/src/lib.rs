@@ -20,8 +20,6 @@ pub use ast::*;
 pub use parser::parse;
 pub use serialize::{serialize, serialize_inlines};
 
-use editor_domain::ByteOffset;
-
 use editor_domain::MarkdownProfile;
 
 /// Parse with the given profile (§3).
@@ -49,14 +47,14 @@ pub fn parse_range(
         return Ok(Vec::new());
     }
     let window = &source[start..end];
-    let blocks = parser::parse_block_sequence_export(window, 0, window.len() as u64, 0, &profile)?;
-    // Rebase spans from window-local to absolute document offsets.
+    let mut blocks = parser::parse_block_sequence_export(window, 0, window.len() as u64, 0, &profile)?;
+    // Rebase every document-coordinate span (block meta, inlines, table
+    // internals, list item meta) from window-local to absolute document offsets.
+    // De-marked children (block quote / list item content) keep their
+    // container-relative coordinates.
     let delta = offset as i64;
-    let mut blocks = blocks;
     for b in &mut blocks {
-        let m = b.meta_mut();
-        m.span.start = ByteOffset((m.span.start.0 as i64 + delta).max(0) as u64);
-        m.span.end = ByteOffset((m.span.end.0 as i64 + delta).max(0) as u64);
+        ast::shift_block_spans(b, delta);
     }
     Ok(blocks)
 }
@@ -282,6 +280,71 @@ mod tests {
         assert_eq!(&toggled[5..], &src[5..]);
     }
 
+    /// A literal `[ ]` inside code spans or plain text of a NON-task item
+    /// must not be toggled — the checkbox lives right after the list marker.
+    #[test]
+    fn task_toggle_ignores_literal_brackets() {
+        let src = b"- text `[ ]` more\n- plain [ ] text\n";
+        let doc = parse(src, MarkdownProfile::Gfm).unwrap();
+        let list = doc.blocks.iter().find_map(|b| match b {
+            Block::List(l) => Some(l),
+            _ => None,
+        }).expect("list");
+        for item in &list.items {
+            assert!(item.task.is_none(), "non-task item");
+            assert!(serialize::toggle_task_item(src, item).is_none(),
+                "literal [ ] in code/text must not toggle");
+        }
+    }
+
+    /// Ordered task items and `[X]` toggle correctly.
+    #[test]
+    fn task_toggle_ordered_and_uppercase() {
+        let src = b"1. [X] done\n2) [ ] todo\n";
+        let doc = parse(src, MarkdownProfile::Gfm).unwrap();
+        let items: Vec<_> = doc.blocks.iter().filter_map(|b| match b {
+            Block::List(l) => Some(l.items.clone()),
+            _ => None,
+        }).flatten().collect();
+        let first = serialize::toggle_task_item(src, &items[0]).expect("toggle");
+        assert_eq!(first, b"1. [ ] done\n2) [ ] todo\n");
+        // Toggling the second item on the ORIGINAL source.
+        let second = serialize::toggle_task_item(src, &items[1]).expect("toggle");
+        assert_eq!(second, b"1. [X] done\n2) [x] todo\n");
+    }
+
+    /// A stale item span (from before an earlier edit) must return None, not panic.
+    #[test]
+    fn task_toggle_stale_span_is_none() {
+        let src = b"- [ ] todo\n";
+        let doc = parse(src, MarkdownProfile::Gfm).unwrap();
+        let mut item = doc.blocks.iter().find_map(|b| match b {
+            Block::List(l) => Some(l.items[0].clone()),
+            _ => None,
+        }).expect("item");
+        item.meta.span = SourceSpan::new(
+            editor_domain::ByteOffset(0),
+            editor_domain::ByteOffset(10_000),
+        );
+        assert!(serialize::toggle_task_item(src, &item).is_none());
+    }
+
+    /// `replace_text_run` on a stale paragraph span returns None, not panic.
+    #[test]
+    fn replace_text_run_stale_span_returns_none() {
+        let src = b"short text\n";
+        let stale = SourceSpan::new(
+            editor_domain::ByteOffset(0),
+            editor_domain::ByteOffset(10_000),
+        );
+        assert!(serialize::replace_text_run(src, stale, "x", "y").is_none());
+        let inverted = SourceSpan::new(
+            editor_domain::ByteOffset(8),
+            editor_domain::ByteOffset(2),
+        );
+        assert!(serialize::replace_text_run(src, inverted, "x", "y").is_none());
+    }
+
     // --- Two-pass link reference resolution (§100) ---
 
     fn find_first_link(doc: &crate::ast::Document) -> Option<&crate::ast::Link> {
@@ -363,6 +426,75 @@ mod tests {
         assert_roundtrip(src);
     }
 
+    /// CommonMark: when a label is defined twice, the FIRST definition wins;
+    /// later duplicates are ignored.
+    #[test]
+    fn duplicate_label_first_definition_wins() {
+        let src = b"[text][x]\n\n[x]: http://first.com\n[x]: http://second.com\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let link = find_first_link(&doc).expect("link");
+        assert_eq!(link.destination, "http://first.com");
+        // Normalization makes "X"/" x " the same label too.
+        let src2 = b"[text][x]\n\n[X]: http://first.com\n[x]: http://second.com\n";
+        let doc2 = parse(src2, MarkdownProfile::Gfm).expect("parse");
+        let link2 = find_first_link(&doc2).expect("link");
+        assert_eq!(link2.destination, "http://first.com");
+    }
+
+    /// Angle-bracket destinations may contain spaces — `[x]: <a b c>` must
+    /// keep `a b c` as the destination, not split on the first space.
+    #[test]
+    fn reference_def_angle_destination_with_spaces() {
+        let src = b"[t][x]\n\n[x]: <http://a b/c> \"Title\"\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let link = find_first_link(&doc).expect("link");
+        assert_eq!(link.destination, "http://a b/c");
+        assert_eq!(link.title.as_deref(), Some("Title"));
+        // Unclosed angle bracket degrades to token parse, still parses.
+        let src2 = b"[t][x]\n\n[x]: <http://a\n";
+        let doc2 = parse(src2, MarkdownProfile::Gfm).expect("parse");
+        let link2 = find_first_link(&doc2).expect("link");
+        assert!(!link2.destination.is_empty());
+    }
+
+    /// `[a](<u v> "t")` — an angle-bracket destination inside an inline link
+    /// may contain spaces; the title still parses after the closing `>`.
+    #[test]
+    fn inline_link_angle_destination_with_spaces() {
+        let src = b"[a](<http://u v/x> \"t\")\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let link = find_first_link(&doc).expect("link");
+        assert_eq!(link.destination, "http://u v/x");
+        assert_eq!(link.title.as_deref(), Some("t"));
+        assert_roundtrip(src);
+    }
+
+    /// `\)` inside an inline link destination is an escape, not the link's
+    /// closing paren — `[a](x\)y)` must parse as one link, not stop early.
+    #[test]
+    fn inline_link_escaped_paren_in_destination() {
+        let src = b"[a](http://x.com/a\\)b)\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let link = find_first_link(&doc).expect("link");
+        assert_eq!(link.destination, "http://x.com/a\\)b");
+        assert_roundtrip(src);
+    }
+
+    /// `[]:` is not a link reference definition — an empty label makes it a
+    /// plain paragraph per CommonMark.
+    #[test]
+    fn empty_label_def_is_paragraph() {
+        let src = b"[]: http://x.com\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        assert!(
+            doc.blocks
+                .iter()
+                .all(|b| !matches!(b, crate::ast::Block::LinkReferenceDefinition(_))),
+            "empty-label line must not produce a LinkReferenceDefinition"
+        );
+        assert_roundtrip(src);
+    }
+
     // --- Nested block parsing (block quote & list children) ---
 
     #[test]
@@ -373,6 +505,255 @@ mod tests {
     #[test]
     fn roundtrip_block_quote_multiline() {
         assert_roundtrip(b"> Line one.\n> Line two.\n");
+    }
+
+    /// CommonMark lazy continuation: a `>`-less line right after quote text
+    /// continues the quote's paragraph — it is NOT a new block outside.
+    #[test]
+    fn block_quote_lazy_continuation_joins_paragraph() {
+        let src = b"> line one\nlazy line\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let quotes = doc
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, crate::ast::Block::BlockQuote(_)))
+            .count();
+        assert_eq!(quotes, 1, "lazy line must stay inside the quote");
+        // The quote's span must cover the lazy line too.
+        let bq = doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b, crate::ast::Block::BlockQuote(_)))
+            .expect("quote");
+        assert_eq!(bq.span().end.0, src.len() as u64);
+        assert_roundtrip(src);
+    }
+
+    /// `> a\n---` — the `---` is a lazy setext underline (h2 inside the
+    /// quote), not a thematic break outside it.
+    #[test]
+    fn block_quote_lazy_setext_underline_becomes_heading() {
+        let src = b"> a\n---\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let bq = doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b, crate::ast::Block::BlockQuote(_)))
+            .expect("quote");
+        if let crate::ast::Block::BlockQuote(q) = bq {
+            assert!(
+                q.children
+                    .iter()
+                    .any(|c| matches!(c, crate::ast::Block::Heading(h) if h.level == 2)),
+                "lazy --- must produce an h2 inside the quote, got {:?}",
+                q.children
+            );
+        }
+        assert_roundtrip(src);
+    }
+
+    /// Lines that START a new block cannot lazy-continue a quote:
+    /// `> a\n- b` = quote{a} + list{b}.
+    #[test]
+    fn block_quote_lazy_continuation_stops_at_block_start() {
+        let src = b"> a\n- b\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let (quotes, lists) = doc.blocks.iter().fold((0, 0), |(q, l), b| {
+            match b {
+                crate::ast::Block::BlockQuote(_) => (q + 1, l),
+                crate::ast::Block::List(_) => (q, l + 1),
+                _ => (q, l),
+            }
+        });
+        assert_eq!((quotes, lists), (1, 1));
+        assert_roundtrip(src);
+    }
+
+    /// Indented code can't interrupt a paragraph — `> a\n    code` lazily
+    /// continues the quote's paragraph, it is NOT code outside the quote.
+    #[test]
+    fn block_quote_indented_lazy_continuation() {
+        let src = b"> a\n    code\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let bq = doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b, crate::ast::Block::BlockQuote(_)))
+            .expect("quote");
+        assert_eq!(bq.span().end.0, src.len() as u64, "indented lazy line must stay inside");
+        assert_roundtrip(src);
+    }
+
+    /// An indented `---`/`#`/`>` line after a paragraph is continuation text,
+    /// not a block start — indented code never interrupts a paragraph, and a
+    /// setext underline may have at most 3 leading spaces.
+    #[test]
+    fn indented_line_continues_paragraph() {
+        // `    ---` under a paragraph: NOT a setext underline.
+        let src = b"a\n    ---\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        assert!(
+            matches!(doc.blocks.as_slice(), [Block::Paragraph(_)]),
+            "4-indented --- must be paragraph text: {:?}",
+            doc.blocks.iter().map(|b| std::mem::discriminant(b)).collect::<Vec<_>>()
+        );
+        assert_roundtrip(src);
+
+        // `    # h` under a paragraph: NOT a heading.
+        let src = b"a\n    # h\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        assert!(matches!(doc.blocks.as_slice(), [Block::Paragraph(_)]));
+        assert_roundtrip(src);
+
+        // But an underline indented ≤3 still forms a setext heading.
+        let src = b"a\n   ---\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        assert!(matches!(doc.blocks.as_slice(), [Block::Heading(_)]));
+        assert_roundtrip(src);
+    }
+
+    /// A lazy continuation line inside a block quote keeps its indent —
+    /// `> a\n    ---` is paragraph text inside the quote, not an h2.
+    #[test]
+    fn block_quote_indented_lazy_line_keeps_indent() {
+        let src = b"> a\n    ---\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let bq = doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b, crate::ast::Block::BlockQuote(_)))
+            .expect("quote");
+        assert_eq!(bq.span().end.0, src.len() as u64);
+        let crate::ast::Block::BlockQuote(q) = bq else { unreachable!() };
+        // The de-marked children must be a single paragraph (`a` + indented
+        // `---` continuation), not para + heading.
+        assert!(
+            matches!(q.children.as_slice(), [crate::ast::Block::Paragraph(_)]),
+            "indented lazy line must stay paragraph text: {} children",
+            q.children.len()
+        );
+        assert_roundtrip(src);
+    }
+
+    /// A blank line still ends the quote — `> a\n\nplain` = quote + para.
+    #[test]
+    fn block_quote_blank_line_still_breaks() {
+        let src = b"> a\n\nplain\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let (quotes, paras) = doc.blocks.iter().fold((0, 0), |(q, p), b| {
+            match b {
+                crate::ast::Block::BlockQuote(_) => (q + 1, p),
+                crate::ast::Block::Paragraph(_) => (q, p + 1),
+                _ => (q, p),
+            }
+        });
+        assert_eq!((quotes, paras), (1, 1));
+        assert_roundtrip(src);
+    }
+
+    /// A closing fence indented 4+ spaces is code content, not a closer —
+    /// the fence runs to EOF instead of ending early.
+    #[test]
+    fn fence_closer_indented_four_spaces_is_not_a_closer() {
+        let src = b"```\n    ```\nstill code\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let cbs = doc
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, crate::ast::Block::CodeBlock(_)))
+            .count();
+        assert_eq!(cbs, 1, "4-indent ``` must not close the fence");
+        let cb = doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b, crate::ast::Block::CodeBlock(_)))
+            .expect("code block");
+        assert_eq!(cb.span().end.0, src.len() as u64);
+        assert_roundtrip(src);
+        // But <=3 spaces still closes.
+        let src2 = b"```\n   ```\nafter\n";
+        let doc2 = parse(src2, MarkdownProfile::Gfm).expect("parse");
+        assert!(
+            doc2.blocks
+                .iter()
+                .any(|b| matches!(b, crate::ast::Block::Paragraph(_))),
+            "3-indent closer must end the fence"
+        );
+    }
+
+    /// `- a\nlazy` — the unmarked line lazily continues the item's
+    /// paragraph; it must not end the list nor become a top-level paragraph.
+    #[test]
+    fn list_lazy_continuation_joins_item() {
+        let src = b"- a\nlazy\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let lists = doc
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, crate::ast::Block::List(_)))
+            .count();
+        assert_eq!(lists, 1);
+        let top_paras = doc
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, crate::ast::Block::Paragraph(_)))
+            .count();
+        assert_eq!(top_paras, 0, "lazy line must not leave the list");
+        assert_roundtrip(src);
+    }
+
+    /// A blank line kills laziness: `- a\n\nx` = list{a} + paragraph{x}.
+    #[test]
+    fn list_lazy_continuation_stops_after_blank() {
+        let src = b"- a\n\nx\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let (lists, paras) = doc.blocks.iter().fold((0, 0), |(l, p), b| {
+            match b {
+                crate::ast::Block::List(_) => (l + 1, p),
+                crate::ast::Block::Paragraph(_) => (l, p + 1),
+                _ => (l, p),
+            }
+        });
+        assert_eq!((lists, paras), (1, 1));
+        assert_roundtrip(src);
+    }
+
+    /// A fence inside an item doesn't swallow a following unmarked line:
+    /// `- ``` `\n  code\nx` = item{fence{code}} + paragraph{x}.
+    #[test]
+    fn list_fence_does_not_lazy_continue() {
+        let src = b"- ```\n  code\nx\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|b| matches!(b, crate::ast::Block::Paragraph(_))),
+            "unmarked line after a fenced item must be a paragraph outside"
+        );
+        assert_roundtrip(src);
+    }
+
+    /// Fenced code inside a quote does NOT lazy-continue — an unmarked line
+    /// after `> ``` ` must not be swallowed into the fence.
+    #[test]
+    fn block_quote_fence_does_not_lazy_continue() {
+        let src = b"> ```\n> code\noutside\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse");
+        let bq = doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b, crate::ast::Block::BlockQuote(_)))
+            .expect("quote");
+        // The quote must end before `outside` — that line belongs to a new
+        // paragraph, not the quote's inner fence.
+        assert!(bq.span().end.0 < src.len() as u64);
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|b| matches!(b, crate::ast::Block::Paragraph(_))),
+            "unmarked line after a quoted fence must be a paragraph outside"
+        );
+        assert_roundtrip(src);
     }
 
     #[test]
@@ -558,6 +939,80 @@ mod tests {
         assert_roundtrip(b"- Item A\n\n1. First\n2. Second\n");
     }
 
+    /// `parse_range` at a nonzero offset must rebase *all* document-coordinate
+    /// spans — nested inline spans, table row/cell spans, and list item spans —
+    /// not just the top-level block meta. De-marked children (block quote and
+    /// list item content blocks) must stay in their container-relative space.
+    #[test]
+    fn parse_range_rebases_nested_spans() {
+        let prefix = b"# Intro\n\n";
+        let body = b"| A | B |\n| - | - |\n| *x* | `y` |\n\nPara with **bold** text.\n\n- item one\n- item two\n";
+        let mut src = prefix.to_vec();
+        src.extend_from_slice(body);
+        let offset = prefix.len() as u64;
+        let blocks = parse_range(&src, offset, body.len() as u64, MarkdownProfile::Gfm)
+            .expect("parse_range");
+
+        // Find the table and check cell + inline spans are absolute.
+        let table = blocks.iter().find_map(|b| match b {
+            Block::Table(t) => Some(t),
+            _ => None,
+        }).expect("table block");
+        let data_row = table.rows.iter().find(|r| !r.header).expect("data row");
+        let cell_text = span_text(data_row.cells[0].meta.span, &src);
+        assert_eq!(String::from_utf8_lossy(cell_text).trim(), "*x*");
+        // The emphasis inline inside the cell must also be rebased.
+        let em = data_row.cells[0].inlines.iter().find_map(|i| match i {
+            Inline::Emphasis(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("emphasis inline");
+        assert_eq!(span_text(em.span, &src), b"*x*");
+        let code = data_row.cells[1].inlines.iter().find_map(|i| match i {
+            Inline::CodeSpan(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("code span");
+        assert_eq!(span_text(code.span, &src), b"`y`");
+
+        // Paragraph inlines (Strong) must be rebased.
+        let para = blocks.iter().find_map(|b| match b {
+            Block::Paragraph(p) => Some(p),
+            _ => None,
+        }).expect("paragraph");
+        let strong = para.inlines.iter().find_map(|i| match i {
+            Inline::Strong(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("strong inline");
+        assert_eq!(span_text(strong.span, &src), b"**bold**");
+
+        // List item meta spans are document coordinates and must be rebased.
+        let list = blocks.iter().find_map(|b| match b {
+            Block::List(l) => Some(l),
+            _ => None,
+        }).expect("list");
+        let item0 = span_text(list.items[0].meta.span, &src);
+        assert_eq!(item0, b"- item one\n");
+    }
+
+    /// Every document-coordinate span must be within the parsed window.
+    #[test]
+    fn parse_range_spans_stay_within_window() {
+        let prefix = b"prefix\n\n";
+        let body = b"- [ ] task\n- plain\n";
+        let mut src = prefix.to_vec();
+        src.extend_from_slice(body);
+        let offset = prefix.len() as u64;
+        let blocks = parse_range(&src, offset, body.len() as u64, MarkdownProfile::Gfm)
+            .expect("parse_range");
+        let list = blocks.iter().find_map(|b| match b {
+            Block::List(l) => Some(l),
+            _ => None,
+        }).expect("list");
+        for item in &list.items {
+            assert!(item.meta.span.start.0 >= offset, "item span not rebased");
+            assert!(item.meta.span.end.0 <= offset + body.len() as u64);
+        }
+    }
+
     #[test]
     fn chunked_parse_preserves_full_coverage() {
         // Simulates large-file chunking: parse the first half, then parse
@@ -622,5 +1077,403 @@ mod tests {
         } else {
             panic!("expected a paragraph");
         }
+    }
+
+    /// The task checkbox `[ ] `/`[x] ` is re-emitted from `item.task` — it must
+    /// not also remain in the children's text (double checkbox on render and
+    /// on dirty regenerate).
+    #[test]
+    fn task_item_children_exclude_checkbox() {
+        let src = b"- [ ] todo item\n- [x] done item\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::List(l) = &doc.blocks[0] else { panic!("expected list") };
+        assert_eq!(l.items[0].task, Some(TaskState::Open));
+        assert_eq!(l.items[1].task, Some(TaskState::Done));
+        let first_text = match &l.items[0].children[0] {
+            Block::Paragraph(p) => crate::serialize::serialize_inlines(&p.inlines),
+            _ => panic!("expected paragraph child"),
+        };
+        assert_eq!(first_text, "todo item");
+        let second_text = match &l.items[1].children[0] {
+            Block::Paragraph(p) => crate::serialize::serialize_inlines(&p.inlines),
+            _ => panic!("expected paragraph child"),
+        };
+        assert_eq!(second_text, "done item");
+    }
+
+    /// Dirty block quote regeneration: clean children must emit THEIR bytes
+    /// (de-marked coordinates), not coincident document bytes.
+    #[test]
+    fn dirty_block_quote_regen_uses_demarked_source() {
+        let src = b"para text that makes the doc long\n\n> hello world\n> second line\n";
+        let mut doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let quote = doc.blocks.iter_mut().find_map(|b| match b {
+            Block::BlockQuote(bq) => Some(bq),
+            _ => None,
+        }).expect("quote block");
+        quote.meta.dirty = true;
+        let out = serialize(&doc, src);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "para text that makes the doc long\n\n> hello world\n> second line\n"
+        );
+    }
+
+    /// Dirty list regeneration: item children must resolve against the item's
+    /// de-marked buffer, and the task checkbox must appear exactly once.
+    #[test]
+    fn dirty_list_regen_uses_demarked_source_and_single_checkbox() {
+        let src = b"para text that makes the doc long\n\n- [ ] first item\n- second item\n";
+        let mut doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let list = doc.blocks.iter_mut().find_map(|b| match b {
+            Block::List(l) => Some(l),
+            _ => None,
+        }).expect("list block");
+        list.meta.dirty = true;
+        let out = serialize(&doc, src);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "para text that makes the doc long\n\n- [ ] first item\n- second item\n"
+        );
+    }
+
+    /// Ordered list dirty regen keeps the `)` delimiter and numbering.
+    #[test]
+    fn dirty_ordered_list_regen_preserves_marker() {
+        let src = b"3) alpha\n4) beta\n";
+        let mut doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let list = doc.blocks.iter_mut().find_map(|b| match b {
+            Block::List(l) => Some(l),
+            _ => None,
+        }).expect("list block");
+        list.meta.dirty = true;
+        let out = serialize(&doc, src);
+        assert_eq!(String::from_utf8_lossy(&out), "3) alpha\n4) beta\n");
+    }
+
+    /// Dirty regen of a list whose item has a lazy continuation line: the
+    /// rebuilt de-marked buffer must keep the unindented `lazy` line verbatim
+    /// (strip = min(marker width, line indent)), so the child's span reads the
+    /// right bytes — before the fix the fixed strip ate `la` of `lazy`.
+    #[test]
+    fn dirty_list_regen_lazy_continuation_line() {
+        let src = b"- a\nlazy\n";
+        let mut doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let list = doc.blocks.iter_mut().find_map(|b| match b {
+            Block::List(l) => Some(l),
+            _ => None,
+        }).expect("list block");
+        // The item must contain a single paragraph covering `a\nlazy`.
+        let item = &list.items[0];
+        assert_eq!(item.children.len(), 1);
+        list.meta.dirty = true;
+        let out = serialize(&doc, src);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("lazy"), "lazy line must survive regen: {text:?}");
+        assert!(text.contains("- a"), "marker+text must survive regen: {text:?}");
+    }
+
+    /// An unresolved reference-style link is literal text, not a link with an
+    /// empty destination (CommonMark; also prevents `[t]()` on regen).
+    #[test]
+    fn unresolved_reference_is_literal_text() {
+        let src = b"see [nope][missing] here\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        assert!(
+            p.inlines.iter().all(|i| !matches!(i, Inline::Link(_))),
+            "unresolved reference must not produce a Link node"
+        );
+    }
+
+    /// A closing fence LONGER than the opening run still closes the block
+    /// (CommonMark: the closer needs at least the opener's length).
+    #[test]
+    fn longer_closing_fence_terminates_block() {
+        let src = b"```rust\ncode\n`````\nafter\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let code = doc.blocks.iter().find_map(|b| match b {
+            Block::CodeBlock(cb) => Some(cb),
+            _ => None,
+        }).expect("code block");
+        // The 5-backtick line closes the block; "after" must be a new block.
+        assert_eq!(code.meta.span.end.0 as usize, src.len() - 6);
+        let last = doc.blocks.last().unwrap();
+        assert!(matches!(last, Block::Paragraph(_)), "trailing line must be a paragraph");
+    }
+
+    /// Nested inline spans (depth >= 2: emphasis inside strong, emphasis inside
+    /// a link) must be rebased to document coordinates, not left relative to
+    /// the inner parse region.
+    #[test]
+    fn nested_inline_spans_are_document_absolute() {
+        let src = b"para **bold *it* text** and [`c` link](http://x)\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        let strong = p.inlines.iter().find_map(|i| match i {
+            Inline::Strong(m, c, _) => Some((*m, c)),
+            _ => None,
+        }).expect("strong");
+        assert_eq!(span_text(strong.0.span, src), b"**bold *it* text**");
+        let em = strong.1.iter().find_map(|i| match i {
+            Inline::Emphasis(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("nested emphasis");
+        assert_eq!(span_text(em.span, src), b"*it*", "nested emphasis span must be document-absolute");
+
+        let link = p.inlines.iter().find_map(|i| match i {
+            Inline::Link(l) => Some(l),
+            _ => None,
+        }).expect("link");
+        let code = link.inlines.iter().find_map(|i| match i {
+            Inline::CodeSpan(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("code inside link");
+        assert_eq!(span_text(code.span, src), b"`c`", "link child span must be document-absolute");
+    }
+
+    /// CRLF line endings must round-trip byte-identically — spans include the
+    /// `\r\n` verbatim, so no block loses or gains bytes.
+    #[test]
+    fn roundtrip_crlf_document() {
+        assert_roundtrip(b"# Title\r\n\r\nParagraph with **bold**.\r\n\r\n- item\r\n- [ ] task\r\n");
+    }
+
+    /// Deeper nesting (emphasis inside strong inside strikethrough, code inside
+    /// emphasis) — every level's span must be document-absolute after rebasing.
+    #[test]
+    fn deeply_nested_inline_spans_are_document_absolute() {
+        let src = b"p **a ~~b *c* d~~ e**\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        let strong = p.inlines.iter().find_map(|i| match i {
+            Inline::Strong(m, c, _) => Some((*m, c)),
+            _ => None,
+        }).expect("strong");
+        assert_eq!(span_text(strong.0.span, src), b"**a ~~b *c* d~~ e**");
+        let strike = strong.1.iter().find_map(|i| match i {
+            Inline::Strikethrough(m, c) => Some((*m, c)),
+            _ => None,
+        }).expect("strikethrough");
+        assert_eq!(span_text(strike.0.span, src), b"~~b *c* d~~");
+        let em = strike.1.iter().find_map(|i| match i {
+            Inline::Emphasis(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("emphasis at depth 3");
+        assert_eq!(span_text(em.span, src), b"*c*", "depth-3 inline must be doc-absolute");
+    }
+
+    /// Same-marker nested emphasis `*a *b* c*`: the outer closer must pair
+    /// with the LAST run (after the inner `*b*` closes), not the first inner
+    /// run — otherwise the tree flattens wrongly.
+    #[test]
+    fn nested_same_marker_emphasis_pairs_correctly() {
+        let src = b"p *a *b* c*\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        let em = p.inlines.iter().find_map(|i| match i {
+            Inline::Emphasis(m, c, _) => Some((*m, c)),
+            _ => None,
+        }).expect("outer emphasis");
+        assert_eq!(span_text(em.0.span, src), b"*a *b* c*");
+        let inner = em.1.iter().find_map(|i| match i {
+            Inline::Emphasis(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("inner emphasis");
+        assert_eq!(span_text(inner.span, src), b"*b*");
+    }
+
+    /// `**bold *em***` — the `***` run must close BOTH the inner `*` and the
+    /// outer `**` (strong containing emphasis, not literal text).
+    #[test]
+    fn cascading_closer_run_pairs_inner_and_outer() {
+        let src = b"p **bold *em***\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        let strong = p.inlines.iter().find_map(|i| match i {
+            Inline::Strong(m, c, _) => Some((*m, c)),
+            _ => None,
+        }).expect("strong");
+        assert_eq!(span_text(strong.0.span, src), b"**bold *em***");
+        let em = strong.1.iter().find_map(|i| match i {
+            Inline::Emphasis(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("nested emphasis");
+        assert_eq!(span_text(em.span, src), b"*em*");
+    }
+
+    /// Delimiter flanking rules (CommonMark §emphasis):
+    /// - `_` inside a word is literal (`snake_case` is not emphasis)
+    /// - a `*` followed by whitespace cannot open (`a * b`)
+    /// - `_a_b` has no valid closer (intraword `_` can't close)
+    /// - `a*b*c` IS valid (`*` may be intraword)
+    #[test]
+    fn emphasis_flanking_rules() {
+        for src in [&b"snake_case_name\n"[..], b"a * b * tail\n", b"_a_b\n"] {
+            let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+            let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+            assert!(
+                p.inlines.iter().all(|i| !matches!(i, Inline::Emphasis(..) | Inline::Strong(..))),
+                "no emphasis expected in {:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
+        // In `a * b *c* tail` the lone `*` is literal but `*c*` IS emphasis —
+        // only one pair forms.
+        let doc = parse(b"a * b *c* tail\n", MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        let ems: Vec<_> = p.inlines.iter().filter_map(|i| match i {
+            Inline::Emphasis(m, _, _) => Some(*m),
+            _ => None,
+        }).collect();
+        assert_eq!(ems.len(), 1);
+        assert_eq!(span_text(ems[0].span, b"a * b *c* tail\n"), b"*c*");
+        let doc = parse(b"a*b*c\n", MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        let em = p.inlines.iter().find_map(|i| match i {
+            Inline::Emphasis(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("intraword `*` emphasis");
+        assert_eq!(span_text(em.span, b"a*b*c\n"), b"*b*");
+    }
+
+    /// `_foo_bar_` emphasizes "foo_bar" — the intraword `_` is not a delimiter.
+    #[test]
+    fn underscore_intraword_inside_emphasis() {
+        let src = b"_foo_bar_\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        let em = p.inlines.iter().find_map(|i| match i {
+            Inline::Emphasis(m, _, _) => Some(*m),
+            _ => None,
+        }).expect("emphasis");
+        assert_eq!(span_text(em.span, src), b"_foo_bar_");
+    }
+
+    /// An unresolved shortcut reference `[nope]` (no `[]`/label) must stay
+    /// literal text — CommonMark requires a matching definition.
+    #[test]
+    fn unresolved_shortcut_is_literal_text() {
+        let src = b"see [nope] here\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        assert!(
+            p.inlines.iter().all(|i| !matches!(i, Inline::Link(_))),
+            "unresolved shortcut must not produce a Link node"
+        );
+        assert_roundtrip(src);
+    }
+
+    /// An unresolved collapsed reference `[nope][]` must also stay literal.
+    #[test]
+    fn unresolved_collapsed_is_literal_text() {
+        let src = b"see [nope][] here\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &doc.blocks[0] else { panic!("expected paragraph") };
+        assert!(
+            p.inlines.iter().all(|i| !matches!(i, Inline::Link(_))),
+            "unresolved collapsed ref must not produce a Link node"
+        );
+    }
+
+    /// A fence that never closes consumes the rest of the document and still
+    /// round-trips (CommonMark: unterminated fence runs to EOF).
+    #[test]
+    fn unterminated_fence_consumes_to_eof() {
+        let src = b"```rust\ncode\nmore code\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        assert_eq!(doc.blocks.len(), 1);
+        assert!(matches!(doc.blocks[0], Block::CodeBlock(_)));
+        assert_eq!(doc.blocks[0].meta().span.end.0 as usize, src.len());
+        assert_roundtrip(src);
+    }
+
+    /// Tilde fences: a longer closing run still terminates (same rule as backticks).
+    #[test]
+    fn tilde_fence_longer_closer_terminates() {
+        let src = b"~~~x\ncode\n~~~~~\nafter\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let code = doc.blocks.iter().find_map(|b| match b {
+            Block::CodeBlock(cb) => Some(cb),
+            _ => None,
+        }).expect("code block");
+        assert_eq!(code.fence_char, b'~');
+        assert_eq!(code.meta.span.end.0 as usize, src.len() - 6);
+        assert!(matches!(doc.blocks.last().unwrap(), Block::Paragraph(_)));
+    }
+
+    /// Seven or more `#` is a paragraph, not a heading (CommonMark: 1–6 only).
+    #[test]
+    fn seven_hashes_is_paragraph() {
+        let src = b"####### not a heading\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        assert!(matches!(doc.blocks[0], Block::Paragraph(_)), "7+ hashes must be a paragraph");
+        assert_roundtrip(src);
+    }
+
+    /// `#` must be followed by space/EOL — `#x` is a paragraph, `# ` is an
+    /// empty h1; both round-trip.
+    #[test]
+    fn atx_heading_space_requirement() {
+        let src = b"#x not heading\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        assert!(matches!(doc.blocks[0], Block::Paragraph(_)));
+        assert_roundtrip(b"# \n#x\n");
+    }
+
+    /// Block-quote child spans live in the de-marked buffer's coordinate
+    /// space (0-based, `> ` stripped) — they must NOT index the document.
+    #[test]
+    fn block_quote_children_spans_are_demarked() {
+        let src = b"> hello world\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let bq = doc.blocks.iter().find_map(|b| match b {
+            Block::BlockQuote(bq) => Some(bq),
+            _ => None,
+        }).expect("quote");
+        let child = &bq.children[0];
+        // The child's span indexes the de-marked buffer ("hello world\n"),
+        // so it starts at 0 even though the document text is at offset 2.
+        assert_eq!(child.meta().span.start.0, 0, "child span must be de-marked-relative");
+    }
+
+    /// List-item child spans are likewise de-marked-relative.
+    #[test]
+    fn list_item_children_spans_are_demarked() {
+        let src = b"- hello world\n";
+        let doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let list = doc.blocks.iter().find_map(|b| match b {
+            Block::List(l) => Some(l),
+            _ => None,
+        }).expect("list");
+        let child = &list.items[0].children[0];
+        assert_eq!(child.meta().span.start.0, 0, "item child span must be de-marked-relative");
+    }
+
+    /// Dirty paragraph regen must preserve the backslash of an escaped
+    /// punctuation char — dropping it would change `\*x\*` into emphasis.
+    #[test]
+    fn dirty_paragraph_regen_keeps_escapes() {
+        let src = b"see \\*not emphasis\\* here\n";
+        let mut doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let Block::Paragraph(p) = &mut doc.blocks[0] else { panic!("expected paragraph") };
+        p.meta.dirty = true;
+        let out = serialize(&doc, src);
+        assert_eq!(out, src, "escaped punctuation must survive dirty regen");
+    }
+
+    /// Nested quote inside a list item: dirty regen of the whole list must
+    /// reproduce the nested content exactly.
+    #[test]
+    fn dirty_list_regen_nested_quote() {
+        let src = b"- item\n\n  > quoted\n  > lines\n";
+        let mut doc = parse(src, MarkdownProfile::Gfm).expect("parse failed");
+        let list = doc.blocks.iter_mut().find_map(|b| match b {
+            Block::List(l) => Some(l),
+            _ => None,
+        }).expect("list block");
+        list.meta.dirty = true;
+        let out = serialize(&doc, src);
+        assert_eq!(String::from_utf8_lossy(&out), String::from_utf8_lossy(src));
     }
 }

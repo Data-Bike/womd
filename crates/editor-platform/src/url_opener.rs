@@ -79,6 +79,11 @@ mod tests {
         assert!(!is_safe_url("ftp://example.com"));
         assert!(!is_safe_url(""));
         assert!(!is_safe_url("http://"));
+        // Empty mailto payload and whitespace-prefixed schemes are rejected,
+        // not sanitized — the caller sees a refusal, not a mangled URL.
+        assert!(!is_safe_url("mailto:"));
+        assert!(!is_safe_url(" https://example.com"));
+        assert!(!is_safe_url("\thttps://example.com"));
     }
 
     #[test]

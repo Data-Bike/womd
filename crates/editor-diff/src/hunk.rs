@@ -69,11 +69,11 @@ pub fn group_into_hunks(changes: &[LineChange], config: HunkConfig) -> Vec<Hunk>
         }
     }
 
-    // Compute old/new start line numbers for each window from the change at window start.
+    // Compute old/new start line numbers for each window.
     merged
         .into_iter()
         .map(|(start, end)| {
-            let (old_start, new_start) = line_numbers_at(changes, start);
+            let (old_start, new_start) = line_numbers_at(changes, start, end);
             Hunk {
                 old_start,
                 new_start,
@@ -83,13 +83,14 @@ pub fn group_into_hunks(changes: &[LineChange], config: HunkConfig) -> Vec<Hunk>
         .collect()
 }
 
-/// Compute the (old_no, new_no) line numbers that would appear at flat index `i` by
-/// walking from the start. Equal lines carry both numbers; deletes carry old_no; inserts
-/// carry new_no.
-fn line_numbers_at(changes: &[LineChange], i: usize) -> (u32, u32) {
+/// Compute the `@@ -old_start +new_start @@` header numbers for the hunk window
+/// `changes[start..end]`. When the window contains no lines of one side (a pure
+/// insert or pure delete hunk), git reports the number of lines already passed
+/// on that side — e.g. `-0,0` for an insertion at the top of the file.
+fn line_numbers_at(changes: &[LineChange], start: usize, end: usize) -> (u32, u32) {
     let mut old = 0u32;
     let mut new = 0u32;
-    for c in &changes[..i] {
+    for c in &changes[..start] {
         match c {
             LineChange::Equal { .. } => {
                 old += 1;
@@ -99,12 +100,16 @@ fn line_numbers_at(changes: &[LineChange], i: usize) -> (u32, u32) {
             LineChange::Insert { .. } => new += 1,
         }
     }
-    // The line at index i: report the number it *will have* (1-based) on its side.
-    match &changes[i] {
-        LineChange::Equal { old_no, new_no, .. } => (*old_no, *new_no),
-        LineChange::Delete { old_no, .. } => (*old_no, new + 1),
-        LineChange::Insert { new_no, .. } => (old + 1, *new_no),
-    }
+    let has_old = changes[start..end]
+        .iter()
+        .any(|c| !matches!(c, LineChange::Insert { .. }));
+    let has_new = changes[start..end]
+        .iter()
+        .any(|c| !matches!(c, LineChange::Delete { .. }));
+    (
+        if has_old { old + 1 } else { old },
+        if has_new { new + 1 } else { new },
+    )
 }
 
 #[cfg(test)]
@@ -147,6 +152,46 @@ mod tests {
     fn no_changes_produce_no_hunks() {
         let changes = line_diff(b"a\nb\n", b"a\nb\n");
         assert!(group_into_hunks(&changes, HunkConfig::DEFAULT).is_empty());
+    }
+
+    /// A pure-insert hunk has no old-side lines: git reports the old position
+    /// as the number of lines already passed (`-1,0` for an insert after line
+    /// 1), not `old+1` which would point inside the hunk that doesn't exist.
+    #[test]
+    fn pure_insert_hunk_reports_passed_line_count() {
+        let old = b"a\nb\n";
+        let new = b"a\nx\nb\n";
+        let changes = line_diff(old, new);
+        let hunks = group_into_hunks(&changes, HunkConfig { context: 0 });
+        assert_eq!(hunks.len(), 1);
+        let h = &hunks[0];
+        assert_eq!(h.old_start, 1, "insert after old line 1 -> -1,0");
+        assert_eq!(h.new_start, 2);
+    }
+
+    /// A pure-insert hunk at the very top of the file reports `-0,0` (zero
+    /// old-side lines passed) — matching `git diff` output for top insertions.
+    #[test]
+    fn pure_insert_hunk_at_top_reports_zero_old_start() {
+        let old = b"a\nb\n";
+        let new = b"x\na\nb\n";
+        let changes = line_diff(old, new);
+        let hunks = group_into_hunks(&changes, HunkConfig { context: 0 });
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 0, "top insert -> -0,0 like git");
+        assert_eq!(hunks[0].new_start, 1);
+    }
+
+    /// A pure-delete hunk at EOF reports `+N,0` with N = new lines passed.
+    #[test]
+    fn pure_delete_hunk_at_eof_reports_new_passed_count() {
+        let old = b"a\nb\nc\n";
+        let new = b"a\nb\n";
+        let changes = line_diff(old, new);
+        let hunks = group_into_hunks(&changes, HunkConfig { context: 0 });
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 3);
+        assert_eq!(hunks[0].new_start, 2, "deleted last line -> +2,0");
     }
 
     #[test]

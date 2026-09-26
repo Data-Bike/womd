@@ -275,6 +275,34 @@ impl PieceTable {
         kept.append(&mut tail);
         kept.sort_unstable();
         kept.dedup();
+        // Boundary fixup: `compute_line_starts` drops the line start at `total`
+        // when the document ends in `\n`. The kept prefix therefore may lack a
+        // legitimate start at `old_start` (insert at EOF after a trailing
+        // newline) — re-derive it from the byte preceding `old_start`.
+        if old_start > 0
+            && old_start < self.total_len
+            && self
+                .extract_bytes(ByteRange::new(ByteOffset(old_start - 1), ByteOffset(old_start)))
+                .first()
+                == Some(&b'\n')
+            && kept.binary_search(&old_start).is_err()
+        {
+            kept.push(old_start);
+            kept.sort_unstable();
+        }
+        // Mirror `compute_line_starts`: a document ending in `\n` has no line
+        // start at `total` — the newline does not open an extra empty line.
+        if self.total_len > 0
+            && self
+                .extract_bytes(ByteRange::new(
+                    ByteOffset(self.total_len - 1),
+                    ByteOffset(self.total_len),
+                ))
+                .first()
+                == Some(&b'\n')
+        {
+            kept.retain(|&v| v != self.total_len);
+        }
         self.line_starts = kept;
     }
 }
@@ -335,5 +363,70 @@ mod tests {
         let mut table = PieceTable::from_bytes(b"Hello, world!".to_vec());
         table.delete(ByteRange::new(ByteOffset(5), ByteOffset(7)));
         assert_eq!(table.to_bytes(), b"Helloworld!");
+    }
+
+    /// Incremental `line_starts` must always match a fresh `compute_line_starts`
+    /// over the same bytes — across a battery of edits at every position.
+    #[test]
+    fn line_starts_incremental_matches_fresh_index() {
+        let docs: Vec<&[u8]> = vec![b"", b"a", b"a\n", b"a\nb", b"a\nb\n", b"\n", b"\n\n", b"a\n\nb\n"];
+        let edits: Vec<&[u8]> = vec![b"x", b"x\n", b"\nx", b"\n", b""];
+        for doc in &docs {
+            let len = doc.len() as u64;
+            for pos in 0..=len {
+                for ins in &edits {
+                    let mut table = PieceTable::from_bytes(doc.to_vec());
+                    table.insert(ByteOffset(pos), ins);
+                    let fresh = PieceTable::from_bytes(table.to_bytes());
+                    assert_eq!(
+                        table.line_starts(),
+                        fresh.line_starts(),
+                        "doc={:?} insert {:?} at {}",
+                        String::from_utf8_lossy(doc),
+                        String::from_utf8_lossy(ins),
+                        pos
+                    );
+                }
+            }
+            // Also check replacements of each byte range.
+            for start in 0..len {
+                for end in start..len {
+                    let mut table = PieceTable::from_bytes(doc.to_vec());
+                    table.replace(
+                        ByteRange::new(ByteOffset(start), ByteOffset(end + 1)),
+                        b"z\n",
+                    );
+                    let fresh = PieceTable::from_bytes(table.to_bytes());
+                    assert_eq!(
+                        table.line_starts(),
+                        fresh.line_starts(),
+                        "doc={:?} replace [{},{})",
+                        String::from_utf8_lossy(doc),
+                        start,
+                        end + 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// Inserting at EOF after a trailing newline must create a line start at
+    /// the insertion point (the old index dropped it via the trailing-'\n' pop).
+    #[test]
+    fn insert_at_eof_after_trailing_newline_adds_line_start() {
+        let mut table = PieceTable::from_bytes(b"a\n".to_vec());
+        table.insert(ByteOffset(2), b"x");
+        assert_eq!(table.to_bytes(), b"a\nx");
+        assert_eq!(table.line_starts(), &[0, 2]);
+    }
+
+    /// Replacing a middle segment ending in '\n' at the very end must not leave
+    /// a phantom line start at `total`.
+    #[test]
+    fn replace_ending_in_newline_at_eof_has_no_phantom_start() {
+        let mut table = PieceTable::from_bytes(b"a\nX\n".to_vec());
+        table.replace(ByteRange::new(ByteOffset(2), ByteOffset(4)), b"Y\n");
+        assert_eq!(table.to_bytes(), b"a\nY\n");
+        assert_eq!(table.line_starts(), &[0, 2]);
     }
 }

@@ -12,7 +12,41 @@ export function escapeHtml(s) {
 }
 
 export function escapeAttr(s) {
-  return String(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  // `&` must be escaped: the browser entity-decodes attribute values AFTER
+  // our URL sanitization, so `javascript&colon;alert(1)` would otherwise
+  // re-assemble into `javascript:alert(1)` and execute. Escaping `&` makes
+  // the decoded value identical to the string we checked.
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Sanitize link/image destinations: a Markdown file can carry
+// `javascript:`/`vbscript:`/`data:` URLs that HTML-escaping does NOT make safe
+// (the scheme still executes when the link is activated). Control characters
+// and whitespace can smuggle the scheme past a naive prefix check
+// ("java\tscript:"), so strip them before probing.
+function sanitizeUrl(url, { allowDataImage = false } = {}) {
+  const raw = String(url);
+  const probe = raw.replace(/[\u0000-\u0020]+/g, "").toLowerCase();
+  if (probe.startsWith("javascript:") || probe.startsWith("vbscript:")) {
+    return "#";
+  }
+  if (probe.startsWith("data:")) {
+    return allowDataImage && probe.startsWith("data:image/") ? raw : "#";
+  }
+  return raw;
+}
+
+export function safeHref(url) {
+  return sanitizeUrl(url);
+}
+
+export function safeSrc(url) {
+  return sanitizeUrl(url, { allowDataImage: true });
 }
 
 export function renderBlockHtml(block) {
@@ -76,11 +110,11 @@ export function renderAstNode(node) {
     case "CodeSpan":
       return `<code>${escapeHtml(node.text)}</code>`;
     case "Link":
-      return `<a href="${escapeAttr(node.destination)}"${node.title ? ` title="${escapeAttr(node.title)}"` : ""}>${renderAstChildren(node.children)}</a>`;
+      return `<a href="${escapeAttr(safeHref(node.destination))}"${node.title ? ` title="${escapeAttr(node.title)}"` : ""}>${renderAstChildren(node.children)}</a>`;
     case "Image":
-      return `<img alt="${escapeAttr(node.alt)}" src="${escapeAttr(node.destination)}"${node.title ? ` title="${escapeAttr(node.title)}"` : ""} />`;
+      return `<img alt="${escapeAttr(node.alt)}" src="${escapeAttr(safeSrc(node.destination))}"${node.title ? ` title="${escapeAttr(node.title)}"` : ""} />`;
     case "Autolink":
-      return `<a href="${escapeAttr(node.url)}">${escapeHtml(node.url)}</a>`;
+      return `<a href="${escapeAttr(safeHref(node.url))}">${escapeHtml(node.url)}</a>`;
     case "HardBreak":
       return "<br/>";
     case "RawHtml":

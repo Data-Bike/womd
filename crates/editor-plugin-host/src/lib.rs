@@ -123,12 +123,14 @@ impl PluginHost {
         let _ = reason;
     }
 
-    /// Check whether a plugin has a capability (§68). Default deny.
+    /// Check whether a plugin has a capability (§68). Default deny — and only
+    /// *active* plugins may exercise capabilities at all: a crashed or
+    /// deactivated plugin must not retain permissions (Invariant 8).
     pub fn has_capability(&self, id: &PluginId, cap: Capability) -> bool {
         self.plugins
             .iter()
             .find(|p| &p.manifest.id == id)
-            .map(|p| p.manifest.permissions.contains(&cap))
+            .map(|p| p.state == PluginState::Active && p.manifest.permissions.contains(&cap))
             .unwrap_or(false)
     }
 
@@ -254,5 +256,29 @@ api_version = "1"
         let id = host.register_manifest(VALID_MANIFEST).expect("register");
         host.deactivate(&id, PluginState::Deactivated);
         assert_eq!(host.active().filter(|p| &p.manifest.id == &id).count(), 0);
+    }
+
+    /// A crashed/deactivated plugin keeps its manifest but must lose all
+    /// capabilities — otherwise a crashed plugin could still exercise
+    /// permissions through `require_capability` (Invariant 8).
+    #[test]
+    fn crashed_plugin_loses_capabilities() {
+        let mut host = PluginHost::new();
+        let id = host.register_manifest(VALID_MANIFEST).expect("register");
+        assert!(host.has_capability(&id, Capability::Network));
+        host.handle_crash(&id, "trap");
+        assert!(!host.has_capability(&id, Capability::Network));
+        assert!(matches!(
+            host.require_capability(&id, Capability::Network),
+            Err(PluginError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn deactivated_plugin_loses_capabilities() {
+        let mut host = PluginHost::new();
+        let id = host.register_manifest(VALID_MANIFEST).expect("register");
+        host.deactivate(&id, PluginState::Deactivated);
+        assert!(!host.has_capability(&id, Capability::Network));
     }
 }
