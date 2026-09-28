@@ -45,11 +45,21 @@ impl PieceTable {
         let line_starts = compute_line_starts(original.as_bytes());
         let total_len = original.len() as u64;
         let pieces = if total_len > 0 {
-            vec![Piece { source: PieceSource::Original, start: 0, len: total_len }]
+            vec![Piece {
+                source: PieceSource::Original,
+                start: 0,
+                len: total_len,
+            }]
         } else {
             Vec::new()
         };
-        Self { original, edit_log: Vec::new(), pieces, total_len, line_starts }
+        Self {
+            original,
+            edit_log: Vec::new(),
+            pieces,
+            total_len,
+            line_starts,
+        }
     }
 
     /// Create from a owned byte vector (convenience for tests / small docs).
@@ -135,7 +145,11 @@ impl PieceTable {
         let _ = removed; // discarded bytes (no longer referenced)
 
         let new_piece = if inserted_len > 0 {
-            Some(Piece { source: PieceSource::EditLog, start: edit_log_start, len: inserted_len })
+            Some(Piece {
+                source: PieceSource::EditLog,
+                start: edit_log_start,
+                len: inserted_len,
+            })
         } else {
             None
         };
@@ -173,7 +187,9 @@ impl PieceTable {
                 let orig = self.original.as_bytes();
                 &orig[piece.start as usize..(piece.start + piece.len) as usize]
             }
-            PieceSource::EditLog => &self.edit_log[piece.start as usize..(piece.start + piece.len) as usize],
+            PieceSource::EditLog => {
+                &self.edit_log[piece.start as usize..(piece.start + piece.len) as usize]
+            }
         }
     }
 
@@ -201,7 +217,11 @@ impl PieceTable {
             let local_end = (end - cursor).min(piece.len);
             // Head before start.
             if local_start > 0 {
-                left.push(Piece { source: piece.source, start: piece.start, len: local_start });
+                left.push(Piece {
+                    source: piece.source,
+                    start: piece.start,
+                    len: local_start,
+                });
             }
             // Removed middle.
             if local_end > local_start {
@@ -293,12 +313,18 @@ impl PieceTable {
         if old_start > 0
             && kept.last() == Some(&old_start)
             && self
-                .extract_bytes(ByteRange::new(ByteOffset(old_start - 1), ByteOffset(old_start)))
+                .extract_bytes(ByteRange::new(
+                    ByteOffset(old_start - 1),
+                    ByteOffset(old_start),
+                ))
                 .first()
                 == Some(&b'\r')
             && old_start < self.total_len
             && self
-                .extract_bytes(ByteRange::new(ByteOffset(old_start), ByteOffset(old_start + 1)))
+                .extract_bytes(ByteRange::new(
+                    ByteOffset(old_start),
+                    ByteOffset(old_start + 1),
+                ))
                 .first()
                 == Some(&b'\n')
         {
@@ -340,12 +366,11 @@ impl PieceTable {
         // does not open an extra empty line.
         if self.total_len > 0
             && matches!(
-                self
-                    .extract_bytes(ByteRange::new(
-                        ByteOffset(self.total_len - 1),
-                        ByteOffset(self.total_len),
-                    ))
-                    .first(),
+                self.extract_bytes(ByteRange::new(
+                    ByteOffset(self.total_len - 1),
+                    ByteOffset(self.total_len),
+                ))
+                .first(),
                 Some(&b'\n') | Some(&b'\r')
             )
         {
@@ -392,7 +417,10 @@ mod tests {
         // Replace "beautiful" with "great".
         let word_start = original.windows(9).position(|w| w == b"beautiful").unwrap();
         table.replace(
-            ByteRange::new(ByteOffset(word_start as u64), ByteOffset((word_start + 9) as u64)),
+            ByteRange::new(
+                ByteOffset(word_start as u64),
+                ByteOffset((word_start + 9) as u64),
+            ),
             b"great",
         );
         let result = table.to_bytes();
@@ -423,11 +451,26 @@ mod tests {
     #[test]
     fn line_starts_incremental_matches_fresh_index() {
         let docs: Vec<&[u8]> = vec![
-            b"", b"a", b"a\n", b"a\nb", b"a\nb\n", b"\n", b"\n\n", b"a\n\nb\n",
+            b"",
+            b"a",
+            b"a\n",
+            b"a\nb",
+            b"a\nb\n",
+            b"\n",
+            b"\n\n",
+            b"a\n\nb\n",
             // Bare-CR (classic Mac) and CRLF families — the index must count
             // `\r` not followed by `\n` as a break too.
-            b"a\rb", b"a\r", b"a\rb\rc", b"a\r\nb", b"a\r\nb\r\nc", b"\r", b"\r\n",
-            b"a\r\n\rb", b"\ra", b"\r\na",
+            b"a\rb",
+            b"a\r",
+            b"a\rb\rc",
+            b"a\r\nb",
+            b"a\r\nb\r\nc",
+            b"\r",
+            b"\r\n",
+            b"a\r\n\rb",
+            b"\ra",
+            b"\r\na",
         ];
         let edits: Vec<&[u8]> = vec![
             b"x", b"x\n", b"\nx", b"\n", b"",
@@ -457,10 +500,7 @@ mod tests {
                 for end in start..len {
                     for rep in [&b"z\n"[..], &b"\r"[..], &b"z\r\n"[..]] {
                         let mut table = PieceTable::from_bytes(doc.to_vec());
-                        table.replace(
-                            ByteRange::new(ByteOffset(start), ByteOffset(end + 1)),
-                            rep,
-                        );
+                        table.replace(ByteRange::new(ByteOffset(start), ByteOffset(end + 1)), rep);
                         let fresh = PieceTable::from_bytes(table.to_bytes());
                         assert_eq!(
                             table.line_starts(),

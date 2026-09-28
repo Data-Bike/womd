@@ -67,8 +67,12 @@ function renderMath(content, display) {
 export function renderAstNode(node) {
   if (!node) return "";
   switch (node.type) {
-    case "Heading":
-      return `<h${node.level}>${renderAstChildren(node.children)}</h${node.level}>`;
+    case "Heading": {
+      // `v-html` sink: numeric fields come from the backend AST, but clamp
+      // anyway — a tampered IPC payload must not inject attribute/markup.
+      const level = Math.min(6, Math.max(1, Math.trunc(Number(node.level) || 1)));
+      return `<h${level}>${renderAstChildren(node.children)}</h${level}>`;
+    }
     case "Paragraph":
       // A single display-math paragraph is rendered as a block-level formula,
       // not wrapped in a <p>, to keep KaTeX's display output valid.
@@ -131,7 +135,8 @@ export function renderAstChildren(children) {
 
 export function renderAstList(node) {
   const tag = node.ordered ? "ol" : "ul";
-  let html = `<${tag}${node.ordered && node.start !== 1 ? ` start="${node.start}"` : ""}>`;
+  const start = Math.trunc(Number(node.start) || 1);
+  let html = `<${tag}${node.ordered && start !== 1 ? ` start="${start}"` : ""}>`;
   for (const item of node.items) {
     if (item.task) {
       const checked = item.task === "done";
@@ -146,11 +151,17 @@ export function renderAstList(node) {
   return html;
 }
 
+// Only these CSS values may reach `style="text-align:…"` — the AST alignment
+// string is interpolated unescaped, so anything else is dropped to "none".
+function safeAlign(a) {
+  return a === "left" || a === "right" || a === "center" ? a : "none";
+}
+
 export function renderAstTable(node) {
   let html = "<table><thead><tr>";
   for (let i = 0; i < node.header.length; i++) {
     const cell = node.header[i];
-    const align = node.alignments[i] || "none";
+    const align = safeAlign(node.alignments[i]);
     const style = align !== "none" ? ` style="text-align:${align}"` : "";
     html += `<th${style}>${renderAstChildren(cell.children)}</th>`;
   }
@@ -159,7 +170,7 @@ export function renderAstTable(node) {
     html += "<tr>";
     for (let i = 0; i < row.length; i++) {
       const cell = row[i];
-      const align = node.alignments[i] || "none";
+      const align = safeAlign(node.alignments[i]);
       const style = align !== "none" ? ` style="text-align:${align}"` : "";
       html += `<td${style}>${renderAstChildren(cell.children)}</td>`;
     }

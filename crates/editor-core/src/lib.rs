@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use editor_domain::{ByteOffset, ByteRange, DocumentMeta, MarkdownProfile, Selection};
-use editor_markdown::{serialize, Document, SourceSpan};
+use editor_markdown::{Document, SourceSpan, serialize};
 use editor_text::PieceTable;
 
 /// A single atomic byte-range replacement (§60). `removed` is filled in by
@@ -25,13 +25,25 @@ pub struct TextEdit {
 
 impl TextEdit {
     pub fn replace(range: ByteRange, replacement: impl Into<Vec<u8>>) -> Self {
-        Self { range, replacement: replacement.into(), removed: Vec::new() }
+        Self {
+            range,
+            replacement: replacement.into(),
+            removed: Vec::new(),
+        }
     }
     pub fn insert(at: ByteOffset, text: impl Into<Vec<u8>>) -> Self {
-        Self { range: ByteRange::empty(at), replacement: text.into(), removed: Vec::new() }
+        Self {
+            range: ByteRange::empty(at),
+            replacement: text.into(),
+            removed: Vec::new(),
+        }
     }
     pub fn delete(range: ByteRange) -> Self {
-        Self { range, replacement: Vec::new(), removed: Vec::new() }
+        Self {
+            range,
+            replacement: Vec::new(),
+            removed: Vec::new(),
+        }
     }
     /// Net byte length delta of this edit.
     pub fn delta(&self) -> i64 {
@@ -49,7 +61,11 @@ pub struct EditTransaction {
 
 impl EditTransaction {
     pub fn new(edits: Vec<TextEdit>, before: Selection, after: Selection) -> Self {
-        Self { edits, selection_before: before, selection_after: after }
+        Self {
+            edits,
+            selection_before: before,
+            selection_after: after,
+        }
     }
     pub fn single(edit: TextEdit, before: Selection, after: Selection) -> Self {
         Self::new(vec![edit], before, after)
@@ -64,7 +80,10 @@ pub struct UndoManager {
 
 impl UndoManager {
     pub fn new() -> Self {
-        Self { undo: Vec::new(), redo: Vec::new() }
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
     }
     pub fn push(&mut self, tx: EditTransaction) {
         self.undo.push(tx);
@@ -102,10 +121,15 @@ pub struct SelectionModel {
 
 impl SelectionModel {
     pub fn new() -> Self {
-        Self { selections: vec![Selection::caret(ByteOffset::ZERO)] }
+        Self {
+            selections: vec![Selection::caret(ByteOffset::ZERO)],
+        }
     }
     pub fn primary(&self) -> Selection {
-        *self.selections.last().unwrap_or(&Selection::caret(ByteOffset::ZERO))
+        *self
+            .selections
+            .last()
+            .unwrap_or(&Selection::caret(ByteOffset::ZERO))
     }
     pub fn set_primary(&mut self, sel: Selection) {
         self.selections = vec![sel];
@@ -135,14 +159,23 @@ pub struct DocumentBuffer {
 
 impl DocumentBuffer {
     /// Open a document from raw bytes (the storage layer supplies these).
-    pub fn open(bytes: Vec<u8>, meta: DocumentMeta, profile: MarkdownProfile) -> Result<Self, editor_domain::DocumentError> {
-        let original: Arc<dyn editor_domain::ByteSource> = Arc::new(editor_domain::ArcByteSource::new(bytes));
+    pub fn open(
+        bytes: Vec<u8>,
+        meta: DocumentMeta,
+        profile: MarkdownProfile,
+    ) -> Result<Self, editor_domain::DocumentError> {
+        let original: Arc<dyn editor_domain::ByteSource> =
+            Arc::new(editor_domain::ArcByteSource::new(bytes));
         Self::open_from_buffer(original, meta, profile)
     }
 
     /// Open a document from a shared immutable buffer (zero-copy for mmap-backed files).
     /// The buffer is shared with the PieceTable as its immutable original (Invariant 1, 6).
-    pub fn open_from_buffer(original: Arc<dyn editor_domain::ByteSource>, meta: DocumentMeta, profile: MarkdownProfile) -> Result<Self, editor_domain::DocumentError> {
+    pub fn open_from_buffer(
+        original: Arc<dyn editor_domain::ByteSource>,
+        meta: DocumentMeta,
+        profile: MarkdownProfile,
+    ) -> Result<Self, editor_domain::DocumentError> {
         let table = PieceTable::from_original(Arc::clone(&original));
         let syntax = editor_markdown::parse_with(original.as_bytes(), profile.clone())?;
         Ok(Self {
@@ -174,12 +207,8 @@ impl DocumentBuffer {
         // split a line between chunks (prevents corrupted block boundaries).
         let first_chunk_end = round_to_next_line_end(&table, target_end, total_len);
         // Parse only the first chunk. Blocks beyond this are loaded on demand.
-        let syntax = editor_markdown::parse_range(
-            original.as_bytes(),
-            0,
-            first_chunk_end,
-            profile.clone(),
-        )?;
+        let syntax =
+            editor_markdown::parse_range(original.as_bytes(), 0, first_chunk_end, profile.clone())?;
         let syntax = editor_markdown::Document::from_blocks(syntax);
         Ok(Self {
             meta,
@@ -196,7 +225,11 @@ impl DocumentBuffer {
     /// Parse the next chunk of the document starting at `offset`.
     /// Returns the byte offset where parsing stopped (end of chunk or end of file).
     /// The parsed blocks are merged into the syntax tree.
-    pub fn parse_next_chunk(&mut self, offset: u64, chunk_size: usize) -> Result<u64, editor_domain::DocumentError> {
+    pub fn parse_next_chunk(
+        &mut self,
+        offset: u64,
+        chunk_size: usize,
+    ) -> Result<u64, editor_domain::DocumentError> {
         let total_len = self.table.len();
         if offset >= total_len {
             return Ok(total_len);
@@ -251,12 +284,8 @@ impl DocumentBuffer {
         // buffer is stale and would produce blocks that disagree with the piece
         // table (replace_block would then corrupt the document).
         let window = self.table.to_range(offset, chunk_end);
-        let mut new_blocks = editor_markdown::parse_range(
-            &window,
-            0,
-            window.len() as u64,
-            self.profile.clone(),
-        )?;
+        let mut new_blocks =
+            editor_markdown::parse_range(&window, 0, window.len() as u64, self.profile.clone())?;
         // `parse_range` on a window slice returns 0-based spans; rebase to
         // absolute document offsets.
         for b in &mut new_blocks {
@@ -281,7 +310,11 @@ impl DocumentBuffer {
         while content.last() == Some(&b'\n') || content.last() == Some(&b'\r') {
             content = &content[..content.len() - 1];
         }
-        let last_nl = content.iter().rposition(|&b| b == b'\n' || b == b'\r').map(|i| i + 1).unwrap_or(0);
+        let last_nl = content
+            .iter()
+            .rposition(|&b| b == b'\n' || b == b'\r')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let last_line = &content[last_nl..];
         // A single-line block can't be closed: its last line IS the opener
         // (` "```\n" ` right at the chunk boundary) — the fence continues into
@@ -512,10 +545,8 @@ impl DocumentBuffer {
                 for prev in tx.edits[..i].iter().rev() {
                     let s = prev.range.start.0;
                     let e = s + prev.replacement.len() as u64;
-                    self.table.replace(
-                        ByteRange::new(ByteOffset(s), ByteOffset(e)),
-                        &prev.removed,
-                    );
+                    self.table
+                        .replace(ByteRange::new(ByteOffset(s), ByteOffset(e)), &prev.removed);
                 }
                 return Err(editor_domain::DocumentError::InvalidEdit);
             }
@@ -579,8 +610,29 @@ impl DocumentBuffer {
             // first" replace-all batches, or cumulative coordinates), so a single
             // contiguous affected window cannot be derived reliably. Fall back to
             // a full reparse — correctness over speed for the batch path.
+            // Same contract as the single-edit path: a reparse failure must
+            // report "no change" — the bytes are already edited and the undo
+            // entry recorded, so roll the table back and drop the entry
+            // before propagating the error.
             let bytes = self.table.to_bytes();
-            self.syntax = editor_markdown::parse_with(&bytes, self.profile.clone())?;
+            match editor_markdown::parse_with(&bytes, self.profile.clone()) {
+                Ok(syn) => self.syntax = syn,
+                Err(e) => {
+                    if let Some(rolled) = self.undo.undo.pop() {
+                        for prev in rolled.edits.iter().rev() {
+                            let s = prev.range.start.0;
+                            let end = s + prev.replacement.len() as u64;
+                            self.table.replace(
+                                ByteRange::new(ByteOffset(s), ByteOffset(end)),
+                                &prev.removed,
+                            );
+                        }
+                        self.selection.set_primary(rolled.selection_before);
+                    }
+                    self.update_dirty();
+                    return Err(e);
+                }
+            }
         }
         self.update_dirty();
         Ok(())
@@ -939,7 +991,7 @@ fn round_to_next_line_end(table: &PieceTable, target: u64, total_len: u64) -> u6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use editor_domain::{ids::DocumentId, ArcByteSource, ByteSource};
+    use editor_domain::{ArcByteSource, ByteSource, ids::DocumentId};
     use editor_markdown::Block;
     use std::sync::Arc;
 
@@ -967,10 +1019,15 @@ mod tests {
         let src = b"# Test\n\nHello beautiful world.\n";
         let mut buf = open(src);
         // Find the paragraph span.
-        let para = buf.syntax().blocks.iter().find_map(|b| match b {
-            Block::Paragraph(p) => Some(p.meta.span),
-            _ => None,
-        }).expect("paragraph");
+        let para = buf
+            .syntax()
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(p) => Some(p.meta.span),
+                _ => None,
+            })
+            .expect("paragraph");
         buf.replace_text_run(para, "beautiful", "great").unwrap();
         let out = buf.serialize();
         assert_eq!(out, b"# Test\n\nHello great world.\n");
@@ -1035,7 +1092,10 @@ mod tests {
         ins(&mut buf, "Z", 1); // aZYXb — dirty again
         assert!(buf.is_dirty());
         buf.undo().unwrap(); // back to saved bytes
-        assert!(!buf.is_dirty(), "undo to the saved revision must clear dirty");
+        assert!(
+            !buf.is_dirty(),
+            "undo to the saved revision must clear dirty"
+        );
         buf.redo().unwrap();
         assert!(buf.is_dirty());
     }
@@ -1057,9 +1117,9 @@ mod tests {
         let mut buf = open(b"ab\n");
         ins(&mut buf, "X", 1); // aXb  — depth 1
         ins(&mut buf, "Y", 1); // aYXb — depth 2
-        buf.mark_saved();      // saved at depth 2, content "aYXb\n"
-        buf.undo().unwrap();   // depth 1
-        buf.undo().unwrap();   // depth 0, content "ab\n"
+        buf.mark_saved(); // saved at depth 2, content "aYXb\n"
+        buf.undo().unwrap(); // depth 1
+        buf.undo().unwrap(); // depth 0, content "ab\n"
         // Diverge: two new pushes bring depth back to 2 == saved_revision.
         ins(&mut buf, "P", 1); // depth 1
         ins(&mut buf, "Q", 1); // depth 2 — same depth as saved, content differs
@@ -1074,7 +1134,10 @@ mod tests {
         buf.undo().unwrap();
         buf.undo().unwrap();
         assert_eq!(buf.serialize(), b"ab\n");
-        assert!(buf.is_dirty(), "post-divergence states are never at the saved revision");
+        assert!(
+            buf.is_dirty(),
+            "post-divergence states are never at the saved revision"
+        );
     }
 
     #[test]
@@ -1140,7 +1203,11 @@ mod tests {
         buf.apply(tx).unwrap();
         assert_eq!(buf.serialize(), b"bbb XXX ddd\n");
         buf.undo().unwrap();
-        assert_eq!(buf.serialize(), b"aaa bbb ccc ddd\n", "undo must restore exact original bytes");
+        assert_eq!(
+            buf.serialize(),
+            b"aaa bbb ccc ddd\n",
+            "undo must restore exact original bytes"
+        );
         buf.redo().unwrap();
         assert_eq!(buf.serialize(), b"bbb XXX ddd\n");
     }
@@ -1178,18 +1245,27 @@ mod tests {
             Selection::caret(ByteOffset(7)),
         );
         buf.apply(tx).unwrap();
-        assert_eq!(buf.serialize(), b"# XXXXXTitle\n\n- [ ] task one\n- [ ] task two\n");
+        assert_eq!(
+            buf.serialize(),
+            b"# XXXXXTitle\n\n- [ ] task one\n- [ ] task two\n"
+        );
         // The list item span must point at the shifted source bytes.
-        let list = buf.syntax().blocks.iter().find_map(|b| match b {
-            Block::List(l) => Some(l),
-            _ => None,
-        }).expect("list");
+        let list = buf
+            .syntax()
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::List(l) => Some(l),
+                _ => None,
+            })
+            .expect("list");
         let out = buf.serialize();
-        let item0 = &out[list.items[0].meta.span.start.0 as usize..list.items[0].meta.span.end.0 as usize];
+        let item0 =
+            &out[list.items[0].meta.span.start.0 as usize..list.items[0].meta.span.end.0 as usize];
         assert_eq!(item0, b"- [ ] task one\n");
         // Toggling must edit the checkbox at the *shifted* offset, not stale bytes.
-        let toggled = editor_markdown::serialize::toggle_task_item(&out, &list.items[0])
-            .expect("toggle");
+        let toggled =
+            editor_markdown::serialize::toggle_task_item(&out, &list.items[0]).expect("toggle");
         assert!(toggled.windows(15).any(|w| w == b"- [x] task one\n"));
     }
 
@@ -1204,7 +1280,10 @@ mod tests {
                 .iter()
                 .map(|&s| {
                     TextEdit::replace(
-                        editor_domain::ByteRange::new(ByteOffset(s as u64), ByteOffset(s as u64 + 3)),
+                        editor_domain::ByteRange::new(
+                            ByteOffset(s as u64),
+                            ByteOffset(s as u64 + 3),
+                        ),
                         b"X",
                     )
                 })
@@ -1223,25 +1302,41 @@ mod tests {
         let src = b"# Title\n\nFirst paragraph.\n\nSecond paragraph.\n";
         let mut buf = open(src);
         // Edit the first paragraph only.
-        let para_span = buf.syntax().blocks.iter().find_map(|b| match b {
-            Block::Paragraph(p) => {
-                let text = String::from_utf8_lossy(&src[p.meta.span.start.0 as usize..p.meta.span.end.0 as usize]);
-                if text.contains("First") { Some(p.meta.span) } else { None }
-            }
-            _ => None,
-        }).expect("first paragraph");
+        let para_span = buf
+            .syntax()
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(p) => {
+                    let text = String::from_utf8_lossy(
+                        &src[p.meta.span.start.0 as usize..p.meta.span.end.0 as usize],
+                    );
+                    if text.contains("First") {
+                        Some(p.meta.span)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .expect("first paragraph");
         buf.replace_text_run(para_span, "First", "Changed").unwrap();
         let out = buf.serialize();
         assert_eq!(out, b"# Title\n\nChanged paragraph.\n\nSecond paragraph.\n");
         // The second paragraph block should still exist and have a valid span.
         let has_second = buf.syntax().blocks.iter().any(|b| match b {
             Block::Paragraph(p) => {
-                let text = String::from_utf8_lossy(&out[p.meta.span.start.0 as usize..p.meta.span.end.0 as usize]);
+                let text = String::from_utf8_lossy(
+                    &out[p.meta.span.start.0 as usize..p.meta.span.end.0 as usize],
+                );
                 text.contains("Second paragraph.")
             }
             _ => false,
         });
-        assert!(has_second, "second paragraph should be preserved by incremental reparse");
+        assert!(
+            has_second,
+            "second paragraph should be preserved by incremental reparse"
+        );
     }
 
     #[test]
@@ -1259,7 +1354,11 @@ mod tests {
         let out = buf.serialize();
         assert_eq!(out, b"# Title\n\nSome text.\n\nNew paragraph.\n");
         // Should have more blocks than before (heading + blank + para + blank + para).
-        assert!(buf.syntax().blocks.len() >= 4, "block count should grow: got {}", buf.syntax().blocks.len());
+        assert!(
+            buf.syntax().blocks.len() >= 4,
+            "block count should grow: got {}",
+            buf.syntax().blocks.len()
+        );
     }
 
     #[test]
@@ -1267,7 +1366,8 @@ mod tests {
         // Build a source with a block quote that spans past a small chunk boundary,
         // forcing the chunk boundary to fall inside the quote. With line-boundary
         // alignment, parsing should still be byte-identical.
-        let src = b"# Title\n\nParagraph one.\n\n> quote line one\n> quote line two\n\nParagraph two.\n";
+        let src =
+            b"# Title\n\nParagraph one.\n\n> quote line one\n> quote line two\n\nParagraph two.\n";
         let original: Arc<dyn ByteSource> = Arc::new(ArcByteSource::new(src.to_vec()));
         let meta = DocumentMeta {
             id: DocumentId::new("test"),
@@ -1281,7 +1381,10 @@ mod tests {
         let mut buf = DocumentBuffer::open_lazy(original, meta, MarkdownProfile::Gfm, 24).unwrap();
 
         // First chunk should be parsed (and aligned to a line boundary).
-        assert!(!buf.syntax().blocks.is_empty(), "first chunk should produce blocks");
+        assert!(
+            !buf.syntax().blocks.is_empty(),
+            "first chunk should produce blocks"
+        );
 
         // Parse the next chunk(s) until the document is fully parsed.
         let mut parsed = buf.parsed_offset();
@@ -1293,8 +1396,15 @@ mod tests {
         }
 
         // Should be fully parsed and byte-identical.
-        assert_eq!(parsed, total, "parser should reach total length: parsed={parsed}, total={total}");
-        assert_eq!(buf.serialize(), src, "lazy chunked parse must be byte-identical");
+        assert_eq!(
+            parsed, total,
+            "parser should reach total length: parsed={parsed}, total={total}"
+        );
+        assert_eq!(
+            buf.serialize(),
+            src,
+            "lazy chunked parse must be byte-identical"
+        );
     }
 
     /// A fenced code block spanning a chunk boundary must stay ONE block:
@@ -1320,14 +1430,20 @@ mod tests {
             .iter()
             .filter(|b| matches!(b, Block::CodeBlock(_)))
             .count();
-        assert_eq!(code_blocks, 1, "fence must survive the chunk boundary as one block");
+        assert_eq!(
+            code_blocks, 1,
+            "fence must survive the chunk boundary as one block"
+        );
         let paragraphs = buf
             .syntax()
             .blocks
             .iter()
             .filter(|b| matches!(b, Block::Paragraph(_)))
             .count();
-        assert_eq!(paragraphs, 1, "only the tail paragraph — fence body must not produce paragraphs");
+        assert_eq!(
+            paragraphs, 1,
+            "only the tail paragraph — fence body must not produce paragraphs"
+        );
         assert_eq!(buf.serialize(), src);
     }
 
@@ -1353,7 +1469,10 @@ mod tests {
             .iter()
             .filter(|b| matches!(b, Block::CodeBlock(_)))
             .count();
-        assert_eq!(code_blocks, 1, "fence body must not be re-parsed as Markdown");
+        assert_eq!(
+            code_blocks, 1,
+            "fence body must not be re-parsed as Markdown"
+        );
         // No paragraph for the code body — only the leading paragraph.
         let paragraphs = buf
             .syntax()
@@ -1512,9 +1631,16 @@ mod tests {
             .iter()
             .filter(|b| matches!(b, Block::Paragraph(_)))
             .count();
-        assert_eq!(paras, 1, "`#x` must lazily continue the paragraph, not split it");
         assert_eq!(
-            buf.syntax().blocks.iter().filter(|b| matches!(b, Block::Heading(_))).count(),
+            paras, 1,
+            "`#x` must lazily continue the paragraph, not split it"
+        );
+        assert_eq!(
+            buf.syntax()
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, Block::Heading(_)))
+                .count(),
             0
         );
     }
@@ -1554,13 +1680,15 @@ mod tests {
             it += 1;
         }
         assert_eq!(buf.serialize(), src);
-        let (paras, lists) = buf.syntax().blocks.iter().fold((0, 0), |(p, l), b| {
-            match b {
+        let (paras, lists) = buf
+            .syntax()
+            .blocks
+            .iter()
+            .fold((0, 0), |(p, l), b| match b {
                 Block::Paragraph(_) => (p + 1, l),
                 Block::List(_) => (p, l + 1),
                 _ => (p, l),
-            }
-        });
+            });
         assert_eq!((paras, lists), (1, 1));
     }
 
@@ -1672,13 +1800,15 @@ mod tests {
             it += 1;
         }
         assert_eq!(buf.serialize(), src);
-        let (quotes, paras) = buf.syntax().blocks.iter().fold((0, 0), |(q, p), b| {
-            match b {
+        let (quotes, paras) = buf
+            .syntax()
+            .blocks
+            .iter()
+            .fold((0, 0), |(q, p), b| match b {
                 Block::BlockQuote(_) => (q + 1, p),
                 Block::Paragraph(_) => (q, p + 1),
                 _ => (q, p),
-            }
-        });
+            });
         assert_eq!((quotes, paras), (1, 1));
     }
 
@@ -1687,14 +1817,26 @@ mod tests {
     #[test]
     fn logical_lines_handles_all_terminators() {
         let lines: Vec<&[u8]> = logical_lines(b"a\r\nb\r\nc").collect();
-        assert_eq!(lines, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            lines,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
         let lines: Vec<&[u8]> = logical_lines(b"a\rb\rc").collect();
-        assert_eq!(lines, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            lines,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
         let lines: Vec<&[u8]> = logical_lines(b"a\nb\nc").collect();
-        assert_eq!(lines, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            lines,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
         // Mixed families, and a real blank line is still reported.
         let lines: Vec<&[u8]> = logical_lines(b"a\r\n\rb").collect();
-        assert_eq!(lines, vec![b"a".as_slice(), b"".as_slice(), b"b".as_slice()]);
+        assert_eq!(
+            lines,
+            vec![b"a".as_slice(), b"".as_slice(), b"b".as_slice()]
+        );
     }
 
     /// A bare-CR (classic Mac) document parsed lazily: the quote spanning the
@@ -1719,7 +1861,10 @@ mod tests {
             .iter()
             .filter(|b| matches!(b, Block::BlockQuote(_)))
             .count();
-        assert_eq!(quotes, 1, "CR quote spanning the boundary must be one block");
+        assert_eq!(
+            quotes, 1,
+            "CR quote spanning the boundary must be one block"
+        );
     }
 
     /// Same for a boundary-split paragraph in a bare-CR document.
@@ -1765,8 +1910,11 @@ mod tests {
 
         // Edit entirely inside the unparsed region (past the first chunk).
         let at = src.windows(4).position(|w| w == b"tail").unwrap() as u64;
-        assert!(at >= buf.parsed_offset(),
-            "edit at {at} must be past the frontier {}", buf.parsed_offset());
+        assert!(
+            at >= buf.parsed_offset(),
+            "edit at {at} must be past the frontier {}",
+            buf.parsed_offset()
+        );
         let tx = EditTransaction::single(
             TextEdit::replace(
                 editor_domain::ByteRange::new(ByteOffset(at), ByteOffset(at + 4)),
@@ -1788,8 +1936,11 @@ mod tests {
         }
         assert_eq!(parsed, total);
         let out = buf.serialize();
-        assert!(out.windows(9).any(|w| w == b"TAIL text"),
-            "chunk parse must see edited bytes: {}", String::from_utf8_lossy(&out));
+        assert!(
+            out.windows(9).any(|w| w == b"TAIL text"),
+            "chunk parse must see edited bytes: {}",
+            String::from_utf8_lossy(&out)
+        );
         assert!(!out.windows(9).any(|w| w == b"tail text"));
     }
 
@@ -1810,8 +1961,11 @@ mod tests {
             Selection::caret(ByteOffset(12)),
         );
         buf.apply(tx).unwrap();
-        assert_eq!(buf.parsed_offset(), frontier + 10,
-            "parsed_offset must shift with the edit delta");
+        assert_eq!(
+            buf.parsed_offset(),
+            frontier + 10,
+            "parsed_offset must shift with the edit delta"
+        );
 
         // Chunks parsed afterwards must still be byte-identical.
         let mut parsed = buf.parsed_offset();
@@ -1845,8 +1999,11 @@ mod tests {
             Selection::caret(ByteOffset(end + 8)),
         );
         buf.apply(tx).unwrap();
-        assert_eq!(buf.parsed_offset(), frontier,
-            "frontier must not move for edits in the unparsed region");
+        assert_eq!(
+            buf.parsed_offset(),
+            frontier,
+            "frontier must not move for edits in the unparsed region"
+        );
         assert_eq!(buf.syntax().blocks.len(), block_count);
         // Chunk parsing then picks the appended text up naturally.
         let mut parsed = buf.parsed_offset();
@@ -1907,7 +2064,11 @@ mod tests {
         buf.undo().unwrap();
         assert_eq!(buf.serialize(), src, "undo must restore original bytes");
         buf.redo().unwrap();
-        assert_eq!(buf.serialize(), b"AA bbb CCCC\n", "redo must reapply both edits");
+        assert_eq!(
+            buf.serialize(),
+            b"AA bbb CCCC\n",
+            "redo must reapply both edits"
+        );
     }
 
     /// A multi-edit transaction entirely beyond the parsed frontier must keep
@@ -1939,7 +2100,11 @@ mod tests {
             Selection::caret(ByteOffset(tail)),
         );
         buf.apply(tx).unwrap();
-        assert_eq!(buf.parsed_offset(), frontier, "parsed tree must be untouched");
+        assert_eq!(
+            buf.parsed_offset(),
+            frontier,
+            "parsed tree must be untouched"
+        );
         assert!(buf.serialize().ends_with(b"tail FOO BAR\n"));
 
         buf.undo().unwrap();
@@ -1987,7 +2152,10 @@ mod tests {
     fn parse_next_chunk_saturates_on_huge_offsets() {
         let mut buf = open(b"tiny\n");
         let total = buf.total_len();
-        assert_eq!(buf.parse_next_chunk(u64::MAX - 1, usize::MAX).unwrap(), total);
+        assert_eq!(
+            buf.parse_next_chunk(u64::MAX - 1, usize::MAX).unwrap(),
+            total
+        );
         assert_eq!(buf.parse_next_chunk(0, usize::MAX).unwrap(), total);
     }
 
@@ -2011,7 +2179,10 @@ mod tests {
             encoding: editor_domain::Encoding::Utf8,
         };
         let mut buf = DocumentBuffer::open_lazy(original, meta, MarkdownProfile::Gfm, 64).unwrap();
-        assert!(buf.parsed_offset() < buf.total_len(), "must start partially parsed");
+        assert!(
+            buf.parsed_offset() < buf.total_len(),
+            "must start partially parsed"
+        );
 
         // Edit inside the parsed region (heading text).
         let pos = buf.parsed_offset() - 2;
@@ -2092,21 +2263,27 @@ mod tests {
         let mut buf = open(src);
         // Remove the "```\n" closer (bytes 9..13).
         let tx = EditTransaction::single(
-            TextEdit::replace(
-                ByteRange::new(ByteOffset(9), ByteOffset(13)),
-                b"",
-            ),
+            TextEdit::replace(ByteRange::new(ByteOffset(9), ByteOffset(13)), b""),
             Selection::caret(ByteOffset(9)),
             Selection::caret(ByteOffset(9)),
         );
         buf.apply(tx).unwrap();
         // Full-parse equivalence is the oracle: "```\ncode\n\npara\n" is one
         // unterminated fenced code block swallowing the paragraph.
-        let oracle = editor_markdown::parse_with(b"```\ncode\n\npara\n", MarkdownProfile::Gfm).unwrap();
+        let oracle =
+            editor_markdown::parse_with(b"```\ncode\n\npara\n", MarkdownProfile::Gfm).unwrap();
         let blocks = &buf.syntax().blocks;
-        assert_eq!(blocks.len(), oracle.blocks.len(), "block count must match full reparse");
+        assert_eq!(
+            blocks.len(),
+            oracle.blocks.len(),
+            "block count must match full reparse"
+        );
         for (a, b) in blocks.iter().zip(oracle.blocks.iter()) {
-            assert_eq!(a.meta().span, b.meta().span, "span mismatch vs full reparse");
+            assert_eq!(
+                a.meta().span,
+                b.meta().span,
+                "span mismatch vs full reparse"
+            );
         }
         assert_eq!(buf.serialize(), b"```\ncode\n\npara\n");
     }
@@ -2147,7 +2324,8 @@ mod tests {
             Selection::caret(ByteOffset(5)),
         );
         buf.apply(tx).unwrap();
-        let oracle = editor_markdown::parse_with(b"aaa\n\nbbb\n\nrest\n", MarkdownProfile::Gfm).unwrap();
+        let oracle =
+            editor_markdown::parse_with(b"aaa\n\nbbb\n\nrest\n", MarkdownProfile::Gfm).unwrap();
         let blocks = &buf.syntax().blocks;
         assert_eq!(blocks.len(), oracle.blocks.len());
         for (a, b) in blocks.iter().zip(oracle.blocks.iter()) {

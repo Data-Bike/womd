@@ -355,8 +355,15 @@ const commands = {
     if (!p) throw new Error('no file path to save to');
     vfs.set(p, toS(t.bytes));
     t.path = p; t.name = p.split(/[\\/]/).pop(); t.dirty = false;
-    return true;
+    // Mirrors the real backend: { saved, commit_sha, overwrote_external }.
+    return { saved: true, commit_sha: null, overwrote_external: false };
   },
+  reload_document: () => {
+    const t = activeTab(); if (!t) throw new Error('no active tab');
+    if (t.path && vfs.has(t.path)) t.bytes = toB(vfs.get(t.path));
+    return docInfo(t);
+  },
+  get_commit_diff: () => '',
   get_document_text: () => toS(activeTab().bytes),
   get_parsed_offset: () => { const l = activeTab().bytes.length; return [l, l]; },
   parse_next_chunk: () => { const l = activeTab().bytes.length; return [l, l, parseBlocks(toS(activeTab().bytes)).length]; },

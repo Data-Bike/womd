@@ -8,6 +8,14 @@
 //! `unsafe` is required to create a memory map (the OS guarantees the mapping is stable
 //! for the lifetime of the `Mmap` handle). This module locally re-enables `unsafe_code`
 //! for that single operation; all other crates remain `unsafe_code = "deny"`.
+//!
+//! Known limitation: if another process TRUNCATES the file while it is mapped,
+//! touching pages beyond the new EOF raises SIGBUS (Unix) / an access violation
+//! (Windows) that aborts the process — no safe-Rust guard can intercept a
+//! hardware fault on the mapped range. The UI mitigates this by watching open
+//! files and reopening (remapping) within ~750 ms of an external write; the
+//! remaining exposure window is the truncation→reload gap. Callers that cannot
+//! tolerate a crash must use the read-based `DocumentStorage` paths instead.
 
 #![allow(unsafe_code)]
 
@@ -15,7 +23,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use editor_domain::{errors::StorageError, ByteOffset, ByteSource, DocumentId};
+use editor_domain::{ByteOffset, ByteSource, DocumentId, errors::StorageError};
 
 use crate::{ByteChunk, DocumentStorage, StorageResult};
 
@@ -37,7 +45,7 @@ pub struct MmapSource {
 impl MmapSource {
     /// Open a file read-only and create a zero-copy byte source.
     pub fn open(path: impl AsRef<std::path::Path>) -> StorageResult<Self> {
-        let file = File::open(path.as_ref()).map_err(|e| StorageError::Io(e.to_string()))?;
+        let file = open_regular(path.as_ref())?;
         let map = map_file(&file)?;
         Ok(Self { map })
     }
@@ -48,15 +56,34 @@ impl MmapSource {
     }
 }
 
+/// Open `path` read-only after proving it is a regular file. `File::open`
+/// on a FIFO blocks forever waiting for a writer, on a device it can have
+/// side effects — `metadata()` doesn't block, so check before touching it.
+/// (`metadata` follows symlinks: a link TO a regular file still opens.)
+fn open_regular(path: &std::path::Path) -> StorageResult<File> {
+    let md = path
+        .metadata()
+        .map_err(|e| StorageError::Io(e.to_string()))?;
+    if !md.is_file() {
+        return Err(StorageError::Io(format!(
+            "not a regular file: {}",
+            path.display()
+        )));
+    }
+    File::open(path).map_err(|e| StorageError::Io(e.to_string()))
+}
+
 /// Map a file, returning `None` for a zero-length file (empty maps are
 /// rejected by the OS).
 fn map_file(file: &File) -> StorageResult<Option<Arc<memmap2::Mmap>>> {
-    let len = file.metadata().map_err(|e| StorageError::Io(e.to_string()))?.len();
+    let len = file
+        .metadata()
+        .map_err(|e| StorageError::Io(e.to_string()))?
+        .len();
     if len == 0 {
         return Ok(None);
     }
-    let map = unsafe { memmap2::Mmap::map(file) }
-        .map_err(|e| StorageError::Io(e.to_string()))?;
+    let map = unsafe { memmap2::Mmap::map(file) }.map_err(|e| StorageError::Io(e.to_string()))?;
     Ok(Some(Arc::new(map)))
 }
 
@@ -90,7 +117,7 @@ impl MmapStorage {
     /// Open a file read-only and map it.
     pub fn open(path: impl Into<PathBuf>, id: DocumentId) -> StorageResult<Self> {
         let path = path.into();
-        let file = File::open(&path).map_err(|e| StorageError::Io(e.to_string()))?;
+        let file = open_regular(&path)?;
         let map = map_file(&file)?;
         Ok(Self { id, path, map })
     }
@@ -189,7 +216,9 @@ mod tests {
         assert!(storage.len().unwrap() > 10 * 1024 * 1024);
         // Read a 2 MB window from the middle (§52).
         let mid = 5 * 1024 * 1024;
-        let chunk = storage.read_range(ByteOffset(mid), 2 * 1024 * 1024).unwrap();
+        let chunk = storage
+            .read_range(ByteOffset(mid), 2 * 1024 * 1024)
+            .unwrap();
         assert_eq!(chunk.bytes.len(), 2 * 1024 * 1024);
         // The window starts at a line boundary (mid is a multiple of line length? not
         // necessarily), but content is deterministic so just check we got bytes.
@@ -206,10 +235,16 @@ mod tests {
         // [0,3) = "ab\n" ends on a newline -> not partial.
         let chunk = storage.read_range(ByteOffset(0), 3).unwrap();
         assert_eq!(chunk.bytes, b"ab\n");
-        assert!(!chunk.trailing_partial, "chunk ending on \\n must be complete");
+        assert!(
+            !chunk.trailing_partial,
+            "chunk ending on \\n must be complete"
+        );
         // [0,2) = "ab" ends mid-line -> partial.
         let chunk = storage.read_range(ByteOffset(0), 2).unwrap();
-        assert!(chunk.trailing_partial, "chunk ending before \\n must be partial");
+        assert!(
+            chunk.trailing_partial,
+            "chunk ending before \\n must be partial"
+        );
         // [3,6) = "cd\n" -> complete.
         let chunk = storage.read_range(ByteOffset(3), 3).unwrap();
         assert!(!chunk.trailing_partial);
@@ -230,6 +265,33 @@ mod tests {
         assert!(chunk.bytes.is_empty());
         assert!(!chunk.leading_partial && !chunk.trailing_partial);
         assert!(MmapSource::open(&path).unwrap().as_bytes().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Opening a DIRECTORY must fail — and on Unix a FIFO must fail fast
+    /// too (File::open on a FIFO blocks forever waiting for a writer, so
+    /// the check must happen before the open syscall).
+    #[test]
+    fn mmap_rejects_directories() {
+        let dir = std::env::temp_dir();
+        assert!(MmapStorage::open(dir.clone(), DocumentId::new("d")).is_err());
+        assert!(MmapSource::open(&dir).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mmap_rejects_fifo() {
+        let path = std::env::temp_dir().join(format!("womd_fifo_test_{}", std::process::id()));
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return; // mkfifo unavailable on this unix — skip.
+        }
+        assert!(MmapStorage::open(&path, DocumentId::new("f")).is_err());
+        assert!(MmapSource::open(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 

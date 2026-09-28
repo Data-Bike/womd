@@ -18,7 +18,9 @@ pub struct InMemorySecureStorage {
 
 impl InMemorySecureStorage {
     pub fn new() -> Self {
-        Self { secrets: std::sync::Mutex::new(std::collections::HashMap::new()) }
+        Self {
+            secrets: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 }
 
@@ -30,19 +32,27 @@ impl Default for InMemorySecureStorage {
 
 impl SecureStorage for InMemorySecureStorage {
     fn store(&self, key: &str, secret: &[u8]) -> Result<(), PlatformError> {
-        self.secrets.lock().unwrap().insert(key.to_string(), secret.to_vec());
+        // A poisoned mutex must not panic the caller: the map is still
+        // consistent (no mutation panics mid-update), so recover the guard.
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), secret.to_vec());
         Ok(())
     }
     fn load(&self, key: &str) -> Result<Vec<u8>, PlatformError> {
         self.secrets
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(key)
             .cloned()
             .ok_or_else(|| PlatformError::NotFound(key.to_string()))
     }
     fn delete(&self, key: &str) -> Result<(), PlatformError> {
-        self.secrets.lock().unwrap().remove(key);
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
         Ok(())
     }
 }
@@ -64,7 +74,10 @@ mod tests {
     #[test]
     fn load_missing_key_errors() {
         let store = InMemorySecureStorage::new();
-        assert!(matches!(store.load("nonexistent"), Err(PlatformError::NotFound(_))));
+        assert!(matches!(
+            store.load("nonexistent"),
+            Err(PlatformError::NotFound(_))
+        ));
     }
 
     #[test]

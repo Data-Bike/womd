@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-pub mod ids;
 pub mod coords;
 pub mod errors;
+pub mod ids;
 pub mod profile;
 
 pub use coords::{ByteOffset, ByteRange, LineColumn, LineIndex, ScalarIndex};
@@ -31,7 +31,10 @@ pub struct Selection {
 
 impl Selection {
     pub fn caret(at: ByteOffset) -> Self {
-        Self { anchor: at, focus: at }
+        Self {
+            anchor: at,
+            focus: at,
+        }
     }
     /// The smaller of anchor/focus.
     pub fn start(&self) -> ByteOffset {
@@ -113,7 +116,9 @@ pub struct ArcByteSource {
 
 impl ArcByteSource {
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes: Arc::from(bytes.into_boxed_slice()) }
+        Self {
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        }
     }
     pub fn from_arc(bytes: Arc<[u8]>) -> Self {
         Self { bytes }

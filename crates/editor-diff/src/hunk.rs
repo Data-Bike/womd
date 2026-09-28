@@ -28,11 +28,15 @@ pub struct Hunk {
 impl Hunk {
     /// First changed line index within `lines`, if any.
     pub fn first_change_index(&self) -> Option<usize> {
-        self.lines.iter().position(|c| !matches!(c, LineChange::Equal { .. }))
+        self.lines
+            .iter()
+            .position(|c| !matches!(c, LineChange::Equal { .. }))
     }
     /// Last changed line index within `lines`, if any.
     pub fn last_change_index(&self) -> Option<usize> {
-        self.lines.iter().rposition(|c| !matches!(c, LineChange::Equal { .. }))
+        self.lines
+            .iter()
+            .rposition(|c| !matches!(c, LineChange::Equal { .. }))
     }
 }
 
@@ -127,7 +131,11 @@ mod tests {
         let h = &hunks[0];
         // Context 1 around the changed line: b, X, d.
         assert!(h.lines.len() >= 3);
-        assert!(h.lines.iter().any(|c| matches!(c, LineChange::Insert { bytes, .. } if bytes == b"X")));
+        assert!(
+            h.lines
+                .iter()
+                .any(|c| matches!(c, LineChange::Insert { bytes, .. } if bytes == b"X"))
+        );
     }
 
     #[test]

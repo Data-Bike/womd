@@ -107,3 +107,63 @@ describe('renderAstNode link safety', () => {
     expect(html).not.toContain('javascript:');
   });
 });
+
+describe('numeric/enum field hardening', () => {
+  it('clamps heading level to 1..6', () => {
+    const html = renderAstNode({ type: 'Heading', level: 99, children: [{ type: 'Text', text: 'x' }] });
+    expect(html).toBe('<h6>x</h6>');
+  });
+
+  it('a tampered heading level cannot inject markup', () => {
+    const html = renderAstNode({
+      type: 'Heading',
+      level: '1 onload=alert(1) data-x="',
+      children: [{ type: 'Text', text: 'x' }],
+    });
+    expect(html).toBe('<h1>x</h1>');
+  });
+
+  it('a tampered list start cannot inject attributes', () => {
+    const html = renderAstNode({
+      type: 'List',
+      ordered: true,
+      start: '5" onclick="alert(1)',
+      items: [{ task: null, children: [{ type: 'Text', text: 'a' }] }],
+    });
+    // Tampered non-numeric start falls back to 1 — no attribute emitted.
+    expect(html).toBe('<ol><li>a</li></ol>');
+  });
+
+  it('a numeric list start renders as start attribute', () => {
+    const html = renderAstNode({
+      type: 'List',
+      ordered: true,
+      start: 5,
+      items: [{ task: null, children: [{ type: 'Text', text: 'a' }] }],
+    });
+    expect(html).toContain('start="5"');
+  });
+});
+
+describe('renderAstTable alignment hardening', () => {
+  it('accepts only left/center/right', () => {
+    const html = renderAstNode({
+      type: 'Table',
+      header: [{ children: [{ type: 'Text', text: 'h' }] }],
+      rows: [[{ children: [{ type: 'Text', text: 'c' }] }]],
+      alignments: ['left'],
+    });
+    expect(html).toContain('text-align:left');
+  });
+
+  it('a tampered alignment cannot inject CSS/markup', () => {
+    const html = renderAstNode({
+      type: 'Table',
+      header: [{ children: [{ type: 'Text', text: 'h' }] }],
+      rows: [[{ children: [{ type: 'Text', text: 'c' }] }]],
+      alignments: ['x" onmouseover="alert(1)'],
+    });
+    expect(html).not.toContain('onmouseover');
+    expect(html).not.toContain('text-align:x');
+  });
+});

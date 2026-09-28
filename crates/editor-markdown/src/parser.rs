@@ -5,7 +5,7 @@
 //! property of the serializer. Inline parser partitions paragraph/heading/cell content into
 //! inline nodes for navigation and minimal-diff editing.
 
-use editor_domain::{errors::DocumentError, ByteOffset, MarkdownProfile};
+use editor_domain::{ByteOffset, MarkdownProfile, errors::DocumentError};
 
 use crate::ast::*;
 
@@ -14,10 +14,14 @@ pub fn parse(source: &[u8], profile: MarkdownProfile) -> Result<Document, Docume
     let len = source.len() as u64;
     // Two-pass: first collect link reference definitions so that reference/collapsed/
     // shortcut links resolve against definitions appearing later in the document (§100).
-    let preliminary = parse_block_sequence(source, 0, len, 0, &profile, &Refs::default())?;
+    let preliminary = parse_block_sequence(source, 0, len, 0, 0, &profile, &Refs::default())?;
     let refs = collect_references(&preliminary);
-    let blocks = parse_block_sequence(source, 0, len, 0, &profile, &refs)?;
-    Ok(Document { span: SourceSpan::new(ByteOffset(0), ByteOffset(len)), blocks, parsed_offset: len })
+    let blocks = parse_block_sequence(source, 0, len, 0, 0, &profile, &refs)?;
+    Ok(Document {
+        span: SourceSpan::new(ByteOffset(0), ByteOffset(len)),
+        blocks,
+        parsed_offset: len,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +59,11 @@ fn collect_lines(bytes: &[u8], start: u64, end: u64) -> Vec<Line> {
         } else {
             j
         };
-        out.push(Line { start: line_start, end: line_end, content_end });
+        out.push(Line {
+            start: line_start,
+            end: line_end,
+            content_end,
+        });
         i = line_end;
     }
     out
@@ -79,12 +87,18 @@ fn is_blank(content: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 fn trim_start_bytes(s: &[u8]) -> &[u8] {
-    let i = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    let i = s
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(s.len());
     &s[i..]
 }
 
 fn trim_end_bytes(s: &[u8]) -> &[u8] {
-    let i = s.iter().rposition(|&b| b != b' ' && b != b'\t').map_or(0, |p| p + 1);
+    let i = s
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map_or(0, |p| p + 1);
     &s[..i]
 }
 
@@ -94,7 +108,10 @@ fn trim_bytes(s: &[u8]) -> &[u8] {
 
 fn trim_matches_bytes(s: &[u8], matcher: impl Fn(u8) -> bool) -> &[u8] {
     let i = s.iter().position(|&b| !matcher(b)).unwrap_or(s.len());
-    let j = s[i..].iter().rposition(|&b| !matcher(b)).map_or(i, |p| i + p + 1);
+    let j = s[i..]
+        .iter()
+        .rposition(|&b| !matcher(b))
+        .map_or(i, |p| i + p + 1);
     &s[i..j]
 }
 
@@ -111,17 +128,29 @@ pub fn parse_block_sequence_export(
     base_indent: u32,
     profile: &MarkdownProfile,
 ) -> Result<Vec<Block>, DocumentError> {
-    parse_block_sequence(bytes, start, end, base_indent, profile, &Refs::default())
+    parse_block_sequence(bytes, start, end, base_indent, 0, profile, &Refs::default())
 }
+
+/// Recursion depth cap for nested containers (block quote inside block
+/// quote, list item inside list item). Without it, `> > > ...` repeated
+/// tens of thousands of times overflows the stack mid-parse — one crafted
+/// document could crash the editor or the MCP server. Beyond the cap the
+/// container keeps its own span (round-trip preserved verbatim) with empty
+/// children — the same non-fatal shape parse errors already use.
+const MAX_CONTAINER_DEPTH: u32 = 64;
 
 fn parse_block_sequence(
     bytes: &[u8],
     start: u64,
     end: u64,
     base_indent: u32,
+    depth: u32,
     profile: &MarkdownProfile,
     refs: &Refs,
 ) -> Result<Vec<Block>, DocumentError> {
+    if depth > MAX_CONTAINER_DEPTH {
+        return Ok(Vec::new());
+    }
     let lines = collect_lines(bytes, start, end);
     let mut blocks = Vec::new();
     let mut idx = 0;
@@ -162,7 +191,10 @@ fn parse_block_sequence(
         if is_thematic_break(stripped) {
             let span = SourceSpan::new(ByteOffset(line.start), ByteOffset(line.end));
             let marker = thematic_marker(stripped).unwrap_or(b'-');
-            blocks.push(Block::ThematicBreak(ThematicBreak { meta: NodeMeta { span, dirty: false }, marker }));
+            blocks.push(Block::ThematicBreak(ThematicBreak {
+                meta: NodeMeta { span, dirty: false },
+                marker,
+            }));
             idx += 1;
             continue;
         }
@@ -177,7 +209,7 @@ fn parse_block_sequence(
 
         // Block quote.
         if stripped.first() == Some(&b'>') {
-            let (blk, next) = parse_block_quote(bytes, &lines, idx, profile, refs);
+            let (blk, next) = parse_block_quote(bytes, &lines, idx, depth, profile, refs);
             blocks.push(blk);
             idx = next;
             continue;
@@ -201,7 +233,7 @@ fn parse_block_sequence(
 
         // List.
         if let Some(marker) = list_marker(stripped) {
-            let (list, next) = parse_list(bytes, &lines, idx, marker, profile, refs);
+            let (list, next) = parse_list(bytes, &lines, idx, marker, depth, profile, refs);
             blocks.push(Block::List(list));
             idx = next;
             continue;
@@ -273,7 +305,7 @@ fn try_atx_heading(bytes: &[u8], line: Line, stripped: &[u8], refs: &Refs) -> Op
     let content_rel = hashes + (after_hashes.len() - rest.len());
     let content_start = line.start + ind as u64 + content_rel as u64;
     let content_end = content_start + content.len() as u64;
-    let inlines = parse_inlines(bytes, content_start, content_end, refs);
+    let inlines = parse_inlines(bytes, content_start, content_end, 0, refs);
     let span = SourceSpan::new(ByteOffset(line.start), ByteOffset(line.end));
     Some(Heading {
         meta: NodeMeta { span, dirty: false },
@@ -287,7 +319,11 @@ fn try_atx_heading(bytes: &[u8], line: Line, stripped: &[u8], refs: &Refs) -> Op
 }
 
 fn is_thematic_break(s: &[u8]) -> bool {
-    let chars: Vec<u8> = s.iter().filter(|&&b| b != b' ' && b != b'\t').copied().collect();
+    let chars: Vec<u8> = s
+        .iter()
+        .filter(|&&b| b != b' ' && b != b'\t')
+        .copied()
+        .collect();
     if chars.is_empty() {
         return false;
     }
@@ -374,7 +410,12 @@ fn parse_fenced_code(
     )
 }
 
-fn parse_indented_code(bytes: &[u8], lines: &[Line], idx: usize, base_indent: u32) -> (Block, usize) {
+fn parse_indented_code(
+    bytes: &[u8],
+    lines: &[Line],
+    idx: usize,
+    base_indent: u32,
+) -> (Block, usize) {
     let start = lines[idx].start;
     let mut j = idx;
     while j < lines.len() {
@@ -386,7 +427,9 @@ fn parse_indented_code(bytes: &[u8], lines: &[Line], idx: usize, base_indent: u3
             while k < lines.len() && is_blank(line_content(bytes, lines[k])) {
                 k += 1;
             }
-            if k < lines.len() && (leading_indent(line_content(bytes, lines[k])) as u32) >= 4 + base_indent {
+            if k < lines.len()
+                && (leading_indent(line_content(bytes, lines[k])) as u32) >= 4 + base_indent
+            {
                 j = k;
                 continue;
             }
@@ -397,9 +440,22 @@ fn parse_indented_code(bytes: &[u8], lines: &[Line], idx: usize, base_indent: u3
         }
         j += 1;
     }
-    let end = if j > idx { lines[j - 1].end } else { lines[idx].end };
+    let end = if j > idx {
+        lines[j - 1].end
+    } else {
+        lines[idx].end
+    };
     let span = SourceSpan::new(ByteOffset(start), ByteOffset(end));
-    (Block::CodeBlock(CodeBlock { meta: NodeMeta { span, dirty: false }, fenced: false, fence_char: 0, fence_len: 0, info_string: String::new() }), j)
+    (
+        Block::CodeBlock(CodeBlock {
+            meta: NodeMeta { span, dirty: false },
+            fenced: false,
+            fence_char: 0,
+            fence_len: 0,
+            info_string: String::new(),
+        }),
+        j,
+    )
 }
 
 /// ATX-heading-like: 1–6 `#` followed by space/tab/EOL. `#x` is NOT a
@@ -446,15 +502,25 @@ fn deepest_is_paragraph(s: &[u8], depth: u32) -> bool {
     }
     if c.first() == Some(&b'>') {
         let inner = &c[1..];
-        let inner = if inner.first() == Some(&b' ') { &inner[1..] } else { inner };
+        let inner = if inner.first() == Some(&b' ') {
+            &inner[1..]
+        } else {
+            inner
+        };
         return deepest_is_paragraph(inner, depth + 1);
     }
     if let Some(mk) = list_marker(c) {
         let ml = if mk.ordered { count_digits(c) + 1 } else { 1 };
         let inner = &c[ml.min(c.len())..];
-        let ws = inner.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        let ws = inner
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
         let inner = &inner[ws.min(inner.len())..];
-        let inner = if inner.starts_with(b"[ ] ") || inner.starts_with(b"[x] ") || inner.starts_with(b"[X] ") {
+        let inner = if inner.starts_with(b"[ ] ")
+            || inner.starts_with(b"[x] ")
+            || inner.starts_with(b"[X] ")
+        {
             &inner[4.min(inner.len())..]
         } else {
             inner
@@ -497,7 +563,14 @@ fn track_fence(state: &mut Option<(u8, usize)>, line: &[u8]) -> bool {
     false
 }
 
-fn parse_block_quote(bytes: &[u8], lines: &[Line], idx: usize, profile: &MarkdownProfile, refs: &Refs) -> (Block, usize) {
+fn parse_block_quote(
+    bytes: &[u8],
+    lines: &[Line],
+    idx: usize,
+    depth: u32,
+    profile: &MarkdownProfile,
+    refs: &Refs,
+) -> (Block, usize) {
     let start = lines[idx].start;
     let mut j = idx;
     let mut inner_end = start;
@@ -540,7 +613,11 @@ fn parse_block_quote(bytes: &[u8], lines: &[Line], idx: usize, profile: &Markdow
         // inside an open fence every line is fence content; a 4+-indented
         // line leaves para_open unchanged (para continuation or code leaf).
         let after_gt = &s[1..];
-        let after_sp = if after_gt.first() == Some(&b' ') { &after_gt[1..] } else { after_gt };
+        let after_sp = if after_gt.first() == Some(&b' ') {
+            &after_gt[1..]
+        } else {
+            after_gt
+        };
         if track_fence(&mut fence, after_sp) || is_blank(after_sp) {
             para_open = false;
         } else if leading_indent(after_sp) < 4 {
@@ -562,7 +639,11 @@ fn parse_block_quote(bytes: &[u8], lines: &[Line], idx: usize, profile: &Markdow
         let out_line = if s.first() == Some(&b'>') {
             // Strip leading `>` and one optional space after it.
             let after_gt = &s[1..];
-            if after_gt.first() == Some(&b' ') { &after_gt[1..] } else { after_gt }
+            if after_gt.first() == Some(&b' ') {
+                &after_gt[1..]
+            } else {
+                after_gt
+            }
         } else {
             // Lazy continuation line: keep verbatim including its indent —
             // the indent is content (`> a\n    ---` is paragraph text inside
@@ -578,9 +659,24 @@ fn parse_block_quote(bytes: &[u8], lines: &[Line], idx: usize, profile: &Markdow
     } else {
         // Recursively parse the de-marked content. Errors are non-fatal: empty children
         // preserve round-trip via the parent span.
-        parse_block_sequence(&de_marked, 0, de_marked.len() as u64, 0, profile, refs).unwrap_or_default()
+        parse_block_sequence(
+            &de_marked,
+            0,
+            de_marked.len() as u64,
+            0,
+            depth + 1,
+            profile,
+            refs,
+        )
+        .unwrap_or_default()
     };
-    (Block::BlockQuote(BlockQuote { meta: NodeMeta { span, dirty: false }, children }), j)
+    (
+        Block::BlockQuote(BlockQuote {
+            meta: NodeMeta { span, dirty: false },
+            children,
+        }),
+        j,
+    )
 }
 
 fn list_marker(s: &[u8]) -> Option<ListMarker> {
@@ -591,7 +687,11 @@ fn list_marker(s: &[u8]) -> Option<ListMarker> {
     if c == b'-' || c == b'*' || c == b'+' {
         // must be followed by space or end
         if s.len() == 1 || s[1] == b' ' || s[1] == b'\t' {
-            return Some(ListMarker { ordered: false, marker: c, start: 1 });
+            return Some(ListMarker {
+                ordered: false,
+                marker: c,
+                start: 1,
+            });
         }
         return None;
     }
@@ -611,7 +711,11 @@ fn list_marker(s: &[u8]) -> Option<ListMarker> {
         return None;
     }
     let start: u32 = String::from_utf8_lossy(&s[..digits]).parse().unwrap_or(1);
-    Some(ListMarker { ordered: true, marker: *after, start })
+    Some(ListMarker {
+        ordered: true,
+        marker: *after,
+        start,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -621,7 +725,15 @@ struct ListMarker {
     start: u32,
 }
 
-fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: &MarkdownProfile, refs: &Refs) -> (List, usize) {
+fn parse_list(
+    bytes: &[u8],
+    lines: &[Line],
+    idx: usize,
+    m: ListMarker,
+    depth: u32,
+    profile: &MarkdownProfile,
+    refs: &Refs,
+) -> (List, usize) {
     let start = lines[idx].start;
     let mut j = idx;
     let mut items: Vec<ListItem> = Vec::new();
@@ -657,7 +769,11 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
             // determine content start after marker
             let marker_len = if nm.ordered { count_digits(s) + 1 } else { 1 };
             let after_marker = &s[marker_len.min(s.len())..];
-            let content_indent = marker_len + after_marker.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+            let content_indent = marker_len
+                + after_marker
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
             // The first line's content (after marker + checkbox) decides the
             // initial lazy-continuation state: only an open paragraph can be
             // lazily continued by an under-indented line.
@@ -698,8 +814,8 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
                     // the item — it's always paragraph continuation.
                     if !prev_blank && para_open && (nind >= 4 || !line_starts_new_block(ns2)) {
                         if nind < 4 {
-                            para_open = !track_fence(&mut fence, ns2)
-                                && deepest_is_paragraph(ns2, 0);
+                            para_open =
+                                !track_fence(&mut fence, ns2) && deepest_is_paragraph(ns2, 0);
                         }
                         prev_blank = false;
                         k += 1;
@@ -713,9 +829,8 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
                 // longer lazily continue).
                 let strip = (ind as usize) + content_indent;
                 let dc = &nc[strip.min(nc.len())..];
-                para_open = !track_fence(&mut fence, dc)
-                    && !is_blank(dc)
-                    && deepest_is_paragraph(dc, 0);
+                para_open =
+                    !track_fence(&mut fence, dc) && !is_blank(dc) && deepest_is_paragraph(dc, 0);
                 prev_blank = false;
                 k += 1;
             }
@@ -745,7 +860,12 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
                 let lc = line_content(bytes, lines[line_idx]);
                 if line_idx == j {
                     // First line: skip marker + trailing spaces after marker.
-                    let mut skip = (ind as usize) + marker_len + after_marker.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                    let mut skip = (ind as usize)
+                        + marker_len
+                        + after_marker
+                            .iter()
+                            .take_while(|&&b| b == b' ' || b == b'\t')
+                            .count();
                     // A task checkbox is re-emitted from `item.task` — keep it out
                     // of the children's buffer or it would render/serialize twice.
                     if task.is_some() {
@@ -759,14 +879,32 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
                     let strip = ((ind as usize) + content_indent).min(leading_indent(lc));
                     de_marked.extend_from_slice(&lc[strip.min(lc.len())..]);
                 }
-                de_marked.extend_from_slice(&bytes[lines[line_idx].content_end as usize..lines[line_idx].end as usize]);
+                de_marked.extend_from_slice(
+                    &bytes[lines[line_idx].content_end as usize..lines[line_idx].end as usize],
+                );
             }
             let children = if de_marked.is_empty() {
                 Vec::new()
             } else {
-                parse_block_sequence(&de_marked, 0, de_marked.len() as u64, 0, profile, refs).unwrap_or_default()
+                parse_block_sequence(
+                    &de_marked,
+                    0,
+                    de_marked.len() as u64,
+                    0,
+                    depth + 1,
+                    profile,
+                    refs,
+                )
+                .unwrap_or_default()
             };
-            items.push(ListItem { meta: NodeMeta { span: item_span, dirty: false }, task, children });
+            items.push(ListItem {
+                meta: NodeMeta {
+                    span: item_span,
+                    dirty: false,
+                },
+                task,
+                children,
+            });
             j = k;
         } else {
             // not a marker; if indented enough it's continuation, else stop
@@ -777,10 +915,24 @@ fn parse_list(bytes: &[u8], lines: &[Line], idx: usize, m: ListMarker, profile: 
             break;
         }
     }
-    let end = if j > idx { lines[j - 1].end } else { lines[idx].end };
+    let end = if j > idx {
+        lines[j - 1].end
+    } else {
+        lines[idx].end
+    };
     // trim trailing blanks for list span
     let span = SourceSpan::new(ByteOffset(start), ByteOffset(end));
-    (List { meta: NodeMeta { span, dirty: false }, ordered: m.ordered, marker: m.marker, start: m.start, tight, items }, j)
+    (
+        List {
+            meta: NodeMeta { span, dirty: false },
+            ordered: m.ordered,
+            marker: m.marker,
+            start: m.start,
+            tight,
+            items,
+        },
+        j,
+    )
 }
 
 fn count_digits(s: &[u8]) -> usize {
@@ -792,7 +944,11 @@ fn task_like(s: &[u8]) -> bool {
     s.starts_with(b"[ ] ") || s.starts_with(b"[x] ") || s.starts_with(b"[X] ")
 }
 
-fn try_link_reference_def(bytes: &[u8], lines: &[Line], idx: usize) -> Option<(LinkReferenceDefinition, usize)> {
+fn try_link_reference_def(
+    bytes: &[u8],
+    lines: &[Line],
+    idx: usize,
+) -> Option<(LinkReferenceDefinition, usize)> {
     let c = line_content(bytes, lines[idx]);
     let s = &c[leading_indent(c).min(c.len())..];
     if !s.starts_with(b"[") {
@@ -815,10 +971,7 @@ fn try_link_reference_def(bytes: &[u8], lines: &[Line], idx: usize) -> Option<(L
             Some(gt) => (String::from_utf8_lossy(&rest[1..gt]).to_string(), gt + 1),
             // Unclosed `<` — fall back to token parsing so the definition
             // still round-trips rather than being dropped.
-            None => (
-                String::from_utf8_lossy(rest).to_string(),
-                rest.len(),
-            ),
+            None => (String::from_utf8_lossy(rest).to_string(), rest.len()),
         }
     } else {
         let end = rest
@@ -833,7 +986,10 @@ fn try_link_reference_def(bytes: &[u8], lines: &[Line], idx: usize) -> Option<(L
             None
         } else {
             // Strip surrounding quotes if present (CommonMark allows "..." or '...').
-            let stripped = if t.len() >= 2 && ((t[0] == b'"' && t[t.len() - 1] == b'"') || (t[0] == b'\'' && t[t.len() - 1] == b'\'')) {
+            let stripped = if t.len() >= 2
+                && ((t[0] == b'"' && t[t.len() - 1] == b'"')
+                    || (t[0] == b'\'' && t[t.len() - 1] == b'\''))
+            {
                 &t[1..t.len() - 1]
             } else {
                 t
@@ -845,7 +1001,12 @@ fn try_link_reference_def(bytes: &[u8], lines: &[Line], idx: usize) -> Option<(L
     };
     let span = SourceSpan::new(ByteOffset(lines[idx].start), ByteOffset(lines[idx].end));
     Some((
-        LinkReferenceDefinition { meta: NodeMeta { span, dirty: false }, label, destination, title },
+        LinkReferenceDefinition {
+            meta: NodeMeta { span, dirty: false },
+            label,
+            destination,
+            title,
+        },
         1,
     ))
 }
@@ -867,7 +1028,12 @@ fn parse_html_block(bytes: &[u8], lines: &[Line], idx: usize) -> (Block, usize) 
     }
     let end = lines[j - 1].end;
     let span = SourceSpan::new(ByteOffset(start), ByteOffset(end));
-    (Block::HtmlBlock(HtmlBlock { meta: NodeMeta { span, dirty: false } }), j)
+    (
+        Block::HtmlBlock(HtmlBlock {
+            meta: NodeMeta { span, dirty: false },
+        }),
+        j,
+    )
 }
 
 fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Block, usize) {
@@ -887,7 +1053,11 @@ fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Bl
         // can't interrupt a paragraph), not an underline.
         if j > idx && ind < 4 && is_setext_underline(s) {
             setext_level = Some(if s[0] == b'=' { 1 } else { 2 });
-            setext_underline_len = s.iter().filter(|&&b| b == b'=' || b == b'-').count().min(u8::MAX as usize) as u8;
+            setext_underline_len = s
+                .iter()
+                .filter(|&&b| b == b'=' || b == b'-')
+                .count()
+                .min(u8::MAX as usize) as u8;
             j += 1;
             break;
         }
@@ -895,7 +1065,13 @@ fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Bl
         // html). Block starts need indent < 4 too — `    ---`/`    # h`
         // continue the paragraph rather than starting a block.
         if j > idx && ind < 4 {
-            if is_thematic_break(s) || parse_fence_open(s).is_some() || try_atx_heading(bytes, lines[j], s, refs).is_some() || s.first() == Some(&b'>') || list_marker(s).is_some() || (s.starts_with(b"<") && looks_like_html_block(s)) {
+            if is_thematic_break(s)
+                || parse_fence_open(s).is_some()
+                || try_atx_heading(bytes, lines[j], s, refs).is_some()
+                || s.first() == Some(&b'>')
+                || list_marker(s).is_some()
+                || (s.starts_with(b"<") && looks_like_html_block(s))
+            {
                 break;
             }
         }
@@ -905,10 +1081,14 @@ fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Bl
         }
     }
     let last = if j > idx { j - 1 } else { idx };
-    let content_end = if setext_level.is_some() { lines[last - 1].content_end } else { lines[last].content_end };
+    let content_end = if setext_level.is_some() {
+        lines[last - 1].content_end
+    } else {
+        lines[last].content_end
+    };
     let para_end = lines[j - 1].end;
     let span = SourceSpan::new(ByteOffset(start), ByteOffset(para_end));
-    let inlines = parse_inlines(bytes, start, content_end, refs);
+    let inlines = parse_inlines(bytes, start, content_end, 0, refs);
     if let Some(level) = setext_level {
         return (
             Block::Heading(Heading {
@@ -923,7 +1103,13 @@ fn parse_paragraph(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> (Bl
             j,
         );
     }
-    (Block::Paragraph(Paragraph { meta: NodeMeta { span, dirty: false }, inlines }), j)
+    (
+        Block::Paragraph(Paragraph {
+            meta: NodeMeta { span, dirty: false },
+            inlines,
+        }),
+        j,
+    )
 }
 
 fn is_setext_underline(s: &[u8]) -> bool {
@@ -942,7 +1128,12 @@ fn is_setext_underline(s: &[u8]) -> bool {
 // GFM table
 // ---------------------------------------------------------------------------
 
-fn try_parse_table(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> Option<(Table, usize)> {
+fn try_parse_table(
+    bytes: &[u8],
+    lines: &[Line],
+    idx: usize,
+    refs: &Refs,
+) -> Option<(Table, usize)> {
     let header_line = line_content(bytes, lines[idx]);
     let hindent = leading_indent(header_line).min(header_line.len());
     let hs = &header_line[hindent..];
@@ -966,12 +1157,22 @@ fn try_parse_table(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> Opt
             let abs_s = *s + hbase as u64;
             let abs_e = *e + hbase as u64;
             TableCell {
-                meta: NodeMeta { span: SourceSpan::new(ByteOffset(abs_s), ByteOffset(abs_e)), dirty: false },
-                inlines: parse_inlines(bytes, abs_s, abs_e, refs),
+                meta: NodeMeta {
+                    span: SourceSpan::new(ByteOffset(abs_s), ByteOffset(abs_e)),
+                    dirty: false,
+                },
+                inlines: parse_inlines(bytes, abs_s, abs_e, 0, refs),
             }
         })
         .collect();
-    rows.push(TableRow { meta: NodeMeta { span: hspan, dirty: false }, header: true, cells: hcells });
+    rows.push(TableRow {
+        meta: NodeMeta {
+            span: hspan,
+            dirty: false,
+        },
+        header: true,
+        cells: hcells,
+    });
     let mut j = idx + 2;
     while j < lines.len() {
         let c = line_content(bytes, lines[j]);
@@ -993,17 +1194,38 @@ fn try_parse_table(bytes: &[u8], lines: &[Line], idx: usize, refs: &Refs) -> Opt
                 let abs_s = *s + cbase as u64;
                 let abs_e = *e + cbase as u64;
                 TableCell {
-                    meta: NodeMeta { span: SourceSpan::new(ByteOffset(abs_s), ByteOffset(abs_e)), dirty: false },
-                    inlines: parse_inlines(bytes, abs_s, abs_e, refs),
+                    meta: NodeMeta {
+                        span: SourceSpan::new(ByteOffset(abs_s), ByteOffset(abs_e)),
+                        dirty: false,
+                    },
+                    inlines: parse_inlines(bytes, abs_s, abs_e, 0, refs),
                 }
             })
             .collect();
-        rows.push(TableRow { meta: NodeMeta { span: rspan, dirty: false }, header: false, cells: rcells });
+        rows.push(TableRow {
+            meta: NodeMeta {
+                span: rspan,
+                dirty: false,
+            },
+            header: false,
+            cells: rcells,
+        });
         j += 1;
     }
-    let end = if j > idx + 1 { lines[j - 1].end } else { lines[idx + 1].end };
+    let end = if j > idx + 1 {
+        lines[j - 1].end
+    } else {
+        lines[idx + 1].end
+    };
     let span = SourceSpan::new(ByteOffset(lines[idx].start), ByteOffset(end));
-    Some((Table { meta: NodeMeta { span, dirty: false }, alignments: aligns, rows }, j))
+    Some((
+        Table {
+            meta: NodeMeta { span, dirty: false },
+            alignments: aligns,
+            rows,
+        },
+        j,
+    ))
 }
 
 fn parse_delim_row(s: &[u8]) -> Option<Vec<TableAlign>> {
@@ -1049,7 +1271,11 @@ fn split_table_cells(s: &[u8]) -> Vec<(u64, u64)> {
     // If there is a trailing pipe, the last cell ends before it; otherwise the last
     // cell runs to the end of the line.
     let trailing_pipe = s.last() == Some(&b'|');
-    let end_limit = if trailing_pipe { s.len().saturating_sub(1) } else { s.len() };
+    let end_limit = if trailing_pipe {
+        s.len().saturating_sub(1)
+    } else {
+        s.len()
+    };
     while i < end_limit {
         let b = s[i];
         if b == b'\\' && i + 1 < s.len() {
@@ -1086,7 +1312,19 @@ struct Refs {
 /// Parse inline content in `bytes[start..end)` into a list of inline nodes whose spans
 /// partition the range. For the foundation this handles the common cases; full CommonMark
 /// delimiter-run nuance is a follow-up (ADR-003).
-fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline> {
+fn parse_inlines(bytes: &[u8], start: u64, end: u64, depth: u32, refs: &Refs) -> Vec<Inline> {
+    if depth > MAX_CONTAINER_DEPTH || start >= end || start as usize >= bytes.len() {
+        // Depth-capped: emit the region as raw text. Beyond-cap nested
+        // delimiters (`*a *b *c ... ` thousands deep) would otherwise
+        // overflow the stack; a Text node keeps the bytes visible and the
+        // parent's own span keeps non-dirty round-trip verbatim.
+        if start >= end || start as usize >= bytes.len() {
+            return Vec::new();
+        }
+        let span = SourceSpan::new(ByteOffset(start), ByteOffset(end));
+        let s = String::from_utf8_lossy(&bytes[start as usize..end as usize]).to_string();
+        return vec![Inline::Text(NodeMeta { span, dirty: false }, s)];
+    }
     let region = &bytes[start as usize..end as usize];
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -1116,7 +1354,11 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
                     let span = SourceSpan::new(abs(i), abs(math_end + 2));
                     let math = String::from_utf8_lossy(&region[math_start..math_end]).to_string();
                     let display = open_br == b'[';
-                    out.push(Inline::MathSpan(NodeMeta { span, dirty: false }, math, display));
+                    out.push(Inline::MathSpan(
+                        NodeMeta { span, dirty: false },
+                        math,
+                        display,
+                    ));
                     i = math_end + 2;
                     text_start = i;
                     continue;
@@ -1131,7 +1373,10 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
             // regeneration emits `\*`, not a bare `*` (which would silently
             // change emphasis semantics).
             let span = SourceSpan::new(abs(i), abs(i + 2));
-            out.push(Inline::Text(NodeMeta { span, dirty: false }, String::from_utf8_lossy(&region[i..i + 2]).to_string()));
+            out.push(Inline::Text(
+                NodeMeta { span, dirty: false },
+                String::from_utf8_lossy(&region[i..i + 2]).to_string(),
+            ));
             i += 2;
             text_start = i;
             continue;
@@ -1176,7 +1421,11 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
                 flush_text(&mut out, text_start, i);
                 let span = SourceSpan::new(abs(i), abs(code_end));
                 let inner = String::from_utf8_lossy(&region[i + n..i + n + cl]).to_string();
-                out.push(Inline::CodeSpan(NodeMeta { span, dirty: false }, inner, n as u8));
+                out.push(Inline::CodeSpan(
+                    NodeMeta { span, dirty: false },
+                    inner,
+                    n as u8,
+                ));
                 i = code_end;
                 text_start = i;
                 continue;
@@ -1191,13 +1440,16 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
             }
             // Left-flanking: a delimiter run can't open emphasis when the byte
             // after the run is whitespace (`a * b` keeps a literal `*`).
-            let next_ok = region.get(i + n).map_or(false, |&nb| !nb.is_ascii_whitespace());
+            let next_ok = region
+                .get(i + n)
+                .map_or(false, |&nb| !nb.is_ascii_whitespace());
             // `_` cannot open inside a word (`snake_case` stays literal);
             // `*` may open intraword (`a*b*` is valid emphasis).
-            let prev_ok = i == 0 || region[i - 1].is_ascii_whitespace() || is_ascii_punct(region[i - 1]);
+            let prev_ok =
+                i == 0 || region[i - 1].is_ascii_whitespace() || is_ascii_punct(region[i - 1]);
             let can_open = next_ok && (b == b'*' || prev_ok);
             if can_open {
-                if let Some(em) = try_emphasis(&region, i, n, b, start, refs) {
+                if let Some(em) = try_emphasis(&region, i, n, b, start, depth, refs) {
                     flush_text(&mut out, text_start, i);
                     out.push(em.node);
                     i = em.end;
@@ -1214,8 +1466,17 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
                 let inner_start = i + 2;
                 let inner_end = i + 2 + close;
                 let span = SourceSpan::new(abs(i), abs(inner_end + 2));
-                let children = parse_inlines(bytes, start + inner_start as u64, start + inner_end as u64, refs);
-                out.push(Inline::Strikethrough(NodeMeta { span, dirty: false }, children));
+                let children = parse_inlines(
+                    bytes,
+                    start + inner_start as u64,
+                    start + inner_end as u64,
+                    depth + 1,
+                    refs,
+                );
+                out.push(Inline::Strikethrough(
+                    NodeMeta { span, dirty: false },
+                    children,
+                ));
                 i = inner_end + 2;
                 text_start = i;
                 continue;
@@ -1224,7 +1485,7 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
 
         // Image.
         if b == b'!' && region.get(i + 1) == Some(&b'[') {
-            if let Some(img) = try_image(&region, i, start, refs) {
+            if let Some(img) = try_image(&region, i, start, depth, refs) {
                 flush_text(&mut out, text_start, i);
                 out.push(img.node);
                 i = img.end;
@@ -1235,7 +1496,7 @@ fn parse_inlines(bytes: &[u8], start: u64, end: u64, refs: &Refs) -> Vec<Inline>
 
         // Link.
         if b == b'[' {
-            if let Some(link) = try_link(&region, i, start, refs) {
+            if let Some(link) = try_link(&region, i, start, depth, refs) {
                 flush_text(&mut out, text_start, i);
                 out.push(link.node);
                 i = link.end;
@@ -1359,10 +1620,8 @@ fn find_delim_close(after: &[u8], ch: u8, need: usize) -> Option<usize> {
         }
         // `_` openers can't be intraword either (roughly: the byte before the
         // run must be whitespace or punctuation).
-        let open_ok = !strict
-            || p == 0
-            || after[p - 1].is_ascii_whitespace()
-            || is_ascii_punct(after[p - 1]);
+        let open_ok =
+            !strict || p == 0 || after[p - 1].is_ascii_whitespace() || is_ascii_punct(after[p - 1]);
         if left_flank && open_ok {
             stack.push(k);
         }
@@ -1371,30 +1630,66 @@ fn find_delim_close(after: &[u8], ch: u8, need: usize) -> Option<usize> {
     None
 }
 
-fn try_emphasis(region: &[u8], i: usize, n: usize, ch: u8, base: u64, refs: &Refs) -> Option<Parsed> {
+fn try_emphasis(
+    region: &[u8],
+    i: usize,
+    n: usize,
+    ch: u8,
+    base: u64,
+    depth: u32,
+    refs: &Refs,
+) -> Option<Parsed> {
     // Strong if n >= 2 and a closing run of >=2 exists; else emphasis if n >= 1.
-    let kind = if ch == b'*' { EmphasisKind::Asterisk } else { EmphasisKind::Underscore };
+    let kind = if ch == b'*' {
+        EmphasisKind::Asterisk
+    } else {
+        EmphasisKind::Underscore
+    };
     let after = &region[i + n..];
     // Try strong (consume 2 delimiters).
     if n >= 2 {
         if let Some(close) = find_delim_close(after, ch, 2) {
             let inner_start = i + 2;
             let inner_end = i + 2 + close;
-            let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + (inner_end + 2) as u64));
-            let children = parse_inlines(region, inner_start as u64, inner_end as u64, refs);
+            let span = SourceSpan::new(
+                ByteOffset(base + i as u64),
+                ByteOffset(base + (inner_end + 2) as u64),
+            );
+            let children = parse_inlines(
+                region,
+                inner_start as u64,
+                inner_end as u64,
+                depth + 1,
+                refs,
+            );
             // Adjust children spans to absolute using base offset of region start (0 here).
             let children = rebase_inlines(children, base as i64);
-            return Some(Parsed { node: Inline::Strong(NodeMeta { span, dirty: false }, children, kind), end: inner_end + 2 });
+            return Some(Parsed {
+                node: Inline::Strong(NodeMeta { span, dirty: false }, children, kind),
+                end: inner_end + 2,
+            });
         }
     }
     // Emphasis with 1 delimiter.
     if let Some(close) = find_delim_close(after, ch, 1) {
         let inner_start = i + 1;
         let inner_end = i + 1 + close;
-        let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + (inner_end + 1) as u64));
-        let children = parse_inlines(region, inner_start as u64, inner_end as u64, refs);
+        let span = SourceSpan::new(
+            ByteOffset(base + i as u64),
+            ByteOffset(base + (inner_end + 1) as u64),
+        );
+        let children = parse_inlines(
+            region,
+            inner_start as u64,
+            inner_end as u64,
+            depth + 1,
+            refs,
+        );
         let children = rebase_inlines(children, base as i64);
-        return Some(Parsed { node: Inline::Emphasis(NodeMeta { span, dirty: false }, children, kind), end: inner_end + 1 });
+        return Some(Parsed {
+            node: Inline::Emphasis(NodeMeta { span, dirty: false }, children, kind),
+            end: inner_end + 1,
+        });
     }
     None
 }
@@ -1404,7 +1699,10 @@ fn try_emphasis(region: &[u8], i: usize, n: usize, ch: u8, base: u64, refs: &Ref
 /// `region`). The returned spans are relative to `region` start (offset 0 = region start).
 /// We need them absolute in the document, so add `base` (the document offset of `region[0]`).
 fn rebase_inlines(inlines: Vec<Inline>, delta: i64) -> Vec<Inline> {
-    inlines.into_iter().map(|il| rebase_inline(il, delta)).collect()
+    inlines
+        .into_iter()
+        .map(|il| rebase_inline(il, delta))
+        .collect()
 }
 
 fn rebase_inline(mut il: Inline, delta: i64) -> Inline {
@@ -1413,11 +1711,17 @@ fn rebase_inline(mut il: Inline, delta: i64) -> Inline {
         m.span.end = ByteOffset((m.span.end.0 as i64 + delta).max(0) as u64);
     }
     match &mut il {
-        Inline::Text(m, _) | Inline::CodeSpan(m, _, _) | Inline::MathSpan(m, _, _)
-        | Inline::Autolink(m, _) | Inline::HardBreak(m) | Inline::RawHtml(m) | Inline::UnknownInline(m) => {
+        Inline::Text(m, _)
+        | Inline::CodeSpan(m, _, _)
+        | Inline::MathSpan(m, _, _)
+        | Inline::Autolink(m, _)
+        | Inline::HardBreak(m)
+        | Inline::RawHtml(m)
+        | Inline::UnknownInline(m) => {
             shift(m, delta);
         }
-        Inline::Emphasis(m, children, _) | Inline::Strong(m, children, _)
+        Inline::Emphasis(m, children, _)
+        | Inline::Strong(m, children, _)
         | Inline::Strikethrough(m, children) => {
             shift(m, delta);
             *children = rebase_inlines(core::mem::take(children), delta);
@@ -1433,7 +1737,7 @@ fn rebase_inline(mut il: Inline, delta: i64) -> Inline {
     il
 }
 
-fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
+fn try_link(region: &[u8], i: usize, base: u64, nesting: u32, refs: &Refs) -> Option<Parsed> {
     // Find matching `]`.
     let mut depth = 1i32;
     let mut j = i + 1;
@@ -1473,16 +1777,24 @@ fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
                 depth += 1;
             } else if b == b')' {
                 depth -= 1;
-                if depth == 0 { close = k; break; }
+                if depth == 0 {
+                    close = k;
+                    break;
+                }
             }
             k += 1;
         }
-        if close == 0 { return None; }
+        if close == 0 {
+            return None;
+        }
         let inner = &after[1..close];
         let (dest, title) = split_link_dest(inner);
         let span_end = text_end + 1 + close + 1;
-        let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + span_end as u64));
-        let children = parse_inlines(region, (i + 1) as u64, text_end as u64, refs);
+        let span = SourceSpan::new(
+            ByteOffset(base + i as u64),
+            ByteOffset(base + span_end as u64),
+        );
+        let children = parse_inlines(region, (i + 1) as u64, text_end as u64, nesting + 1, refs);
         let children = rebase_inlines(children, base as i64);
         return Some(Parsed {
             node: Inline::Link(Link {
@@ -1502,15 +1814,23 @@ fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
         let close2 = after.iter().position(|&b| b == b']')?;
         let id_bytes = &after[1..close2];
         let label = if id_bytes.is_empty() {
-            String::from_utf8_lossy(&region[i + 1..text_end]).trim().to_string()
+            String::from_utf8_lossy(&region[i + 1..text_end])
+                .trim()
+                .to_string()
         } else {
             String::from_utf8_lossy(id_bytes).trim().to_string()
         };
-        let style = if id_bytes.is_empty() { LinkStyle::Collapsed } else { LinkStyle::Reference };
+        let style = if id_bytes.is_empty() {
+            LinkStyle::Collapsed
+        } else {
+            LinkStyle::Reference
+        };
         (label, style, close2 + 1)
     } else {
         // shortcut: [text]
-        let label = String::from_utf8_lossy(&region[i + 1..text_end]).trim().to_string();
+        let label = String::from_utf8_lossy(&region[i + 1..text_end])
+            .trim()
+            .to_string();
         (label, LinkStyle::Shortcut, 0usize)
     };
     let normalized = normalize_label(&label);
@@ -1520,8 +1840,11 @@ fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
     // an undefined label.)
     let (destination, title) = refs.map.get(&normalized).cloned()?;
     let span_end = text_end + 1 + ref_consumed;
-    let span = SourceSpan::new(ByteOffset(base + i as u64), ByteOffset(base + span_end as u64));
-    let children = parse_inlines(region, (i + 1) as u64, text_end as u64, refs);
+    let span = SourceSpan::new(
+        ByteOffset(base + i as u64),
+        ByteOffset(base + span_end as u64),
+    );
+    let children = parse_inlines(region, (i + 1) as u64, text_end as u64, nesting + 1, refs);
     let children = rebase_inlines(children, base as i64);
     Some(Parsed {
         node: Inline::Link(Link {
@@ -1536,9 +1859,9 @@ fn try_link(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
     })
 }
 
-fn try_image(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> {
+fn try_image(region: &[u8], i: usize, base: u64, depth: u32, refs: &Refs) -> Option<Parsed> {
     // `![alt](dest)` or reference.
-    let link = try_link(region, i + 1, base, refs)?;
+    let link = try_link(region, i + 1, base, depth, refs)?;
     let mut span = link.node.span();
     span.start = ByteOffset(base + i as u64);
     let end = link.end;
@@ -1547,7 +1870,12 @@ fn try_image(region: &[u8], i: usize, base: u64, refs: &Refs) -> Option<Parsed> 
         _ => String::new(),
     };
     let (style, destination, title, reference) = match &link.node {
-        Inline::Link(l) => (l.style, l.destination.clone(), l.title.clone(), l.reference.clone()),
+        Inline::Link(l) => (
+            l.style,
+            l.destination.clone(),
+            l.title.clone(),
+            l.reference.clone(),
+        ),
         _ => return None,
     };
     Some(Parsed {

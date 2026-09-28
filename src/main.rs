@@ -8,7 +8,7 @@
 
 use editor_core::{DocumentBuffer, EditTransaction, TextEdit};
 use editor_domain::{
-    ids::DocumentId, ByteOffset, DocumentMeta, Encoding, LineEnding, MarkdownProfile, Selection,
+    ByteOffset, DocumentMeta, Encoding, LineEnding, MarkdownProfile, Selection, ids::DocumentId,
 };
 
 fn main() {

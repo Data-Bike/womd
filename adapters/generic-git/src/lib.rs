@@ -30,7 +30,7 @@ impl GenericGitAdapter {
         Self {
             provider: ProviderId::from_str_unchecked("generic-git"),
             work_dir: work_dir.into(),
-            git_bin: std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string()),
+            git_bin: resolve_on_path("git", "GIT_BIN"),
         }
     }
 
@@ -39,12 +39,124 @@ impl GenericGitAdapter {
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
         } else {
-            Err(AdapterError::Other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+            Err(AdapterError::Other(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            ))
         }
     }
 }
 
+/// Resolve `name` to an absolute path found on PATH.
+///
+/// `Command::new(name)` with `current_dir(work_dir)` is dangerous on
+/// Windows: `CreateProcessW` searches the working directory before PATH, so
+/// a `git.exe` planted inside the repository (e.g. a malicious checkout)
+/// would run instead of the real binary. An absolute path removes the
+/// working directory from the search entirely (same hardening as
+/// `editor-git`'s `resolve_git_binary`).
+///
+/// `env_var` overrides everything (operator/test control). Falls back to
+/// the bare name when nothing is found on PATH — same behaviour as before.
+fn resolve_on_path(name: &str, env_var: &str) -> String {
+    if let Ok(b) = std::env::var(env_var) {
+        // Keep it absolute: a relative override resolves through the
+        // child's working directory — the same hole this function closes.
+        if let Ok(abs) = Path::new(&b).canonicalize() {
+            return abs.to_string_lossy().to_string();
+        }
+        return b;
+    }
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    find_on_path(name, std::env::split_paths(&path_var)).unwrap_or_else(|| name.to_string())
+}
+
+/// Search `dirs` for `name` (plus PATHEXT extensions on Windows) and return
+/// the canonical — hence absolute — first hit.
+fn find_on_path(name: &str, dirs: impl Iterator<Item = PathBuf>) -> Option<String> {
+    #[cfg(windows)]
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';')
+        .map(|e| e.to_lowercase())
+        .collect();
+    for dir in dirs {
+        #[cfg(windows)]
+        let cands: Vec<PathBuf> = exts
+            .iter()
+            .map(|ext| dir.join(format!("{name}{ext}")))
+            .collect();
+        #[cfg(not(windows))]
+        let cands: Vec<PathBuf> = vec![dir.join(name)];
+        for cand in cands {
+            // `canonicalize` makes even a relative PATH entry absolute —
+            // a "." entry would otherwise resolve through the child's
+            // working directory (the hole this exists to close).
+            if cand.is_file()
+                && let Ok(abs) = cand.canonicalize()
+            {
+                return Some(abs.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
 const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Maximum bytes read from each child pipe. A misbehaving tool cannot
+/// exhaust memory: once the cap is hit the pipe fills, the child blocks on
+/// write, and the deadline kills it (surfaced as "timed out").
+const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+
+/// Grace period for pipe readers to hit EOF after the child exits — a
+/// detached grandchild inheriting the pipe's write end keeps it open
+/// forever, and joining the reader thread would hang despite the timeout.
+const EOF_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shared pipe drain: the reader appends up to `cap` bytes, `done` flips on
+/// EOF/error. Bytes stay readable even while the thread is blocked.
+struct PipeDrain {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn spawn_pipe_drain(mut pipe: impl std::io::Read + Send + 'static, cap: usize) -> PipeDrain {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let b = buf.clone();
+    let d = done.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            let room = {
+                let g = b.lock().unwrap_or_else(|e| e.into_inner());
+                cap.saturating_sub(g.len())
+            };
+            if room == 0 {
+                break;
+            }
+            let want = room.min(chunk.len());
+            match pipe.read(&mut chunk[..want]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut g = b.lock().unwrap_or_else(|e| e.into_inner());
+                    g.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+        d.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    PipeDrain { buf, done }
+}
+
+fn collect_drain(drain: &PipeDrain, grace: std::time::Duration) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + grace;
+    while !drain.done.load(std::sync::atomic::Ordering::Relaxed)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::mem::take(&mut *drain.buf.lock().unwrap_or_else(|e| e.into_inner()))
+}
 
 /// `Command::output()` has no timeout — a wedged git (stale lock waiting on a
 /// dead mount, credential prompt on a non-existent terminal) hangs forever.
@@ -56,7 +168,6 @@ fn run_with_timeout(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, AdapterError> {
-    use std::io::Read;
     let mut child = Command::new(bin)
         .current_dir(dir)
         .args(args)
@@ -66,21 +177,14 @@ fn run_with_timeout(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| AdapterError::Other(e.to_string()))?;
-    let mut out_pipe = child.stdout.take().expect("piped");
-    let mut err_pipe = child.stderr.take().expect("piped");
-    let out_reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = out_pipe.read_to_end(&mut v);
-        v
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = err_pipe.read_to_end(&mut v);
-        v
-    });
+    let out_drain = spawn_pipe_drain(child.stdout.take().expect("piped"), MAX_OUTPUT);
+    let err_drain = spawn_pipe_drain(child.stderr.take().expect("piped"), MAX_OUTPUT);
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
-        match child.try_wait().map_err(|e| AdapterError::Other(e.to_string()))? {
+        match child
+            .try_wait()
+            .map_err(|e| AdapterError::Other(e.to_string()))?
+        {
             Some(s) => break s,
             None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -88,16 +192,14 @@ fn run_with_timeout(
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = out_reader.join();
-                let _ = err_reader.join();
                 return Err(AdapterError::Other(format!("{} timed out", bin)));
             }
         }
     };
     Ok(std::process::Output {
         status,
-        stdout: out_reader.join().unwrap_or_default(),
-        stderr: err_reader.join().unwrap_or_default(),
+        stdout: collect_drain(&out_drain, EOF_GRACE),
+        stderr: collect_drain(&err_drain, EOF_GRACE),
     })
 }
 
@@ -106,7 +208,9 @@ impl RepositoryHostAdapter for GenericGitAdapter {
         self.provider.clone()
     }
     fn authenticate(&self) -> Result<AuthSession, AdapterError> {
-        Err(AdapterError::Auth("generic git has no provider auth".to_string()))
+        Err(AdapterError::Auth(
+            "generic git has no provider auth".to_string(),
+        ))
     }
     fn repository_metadata(&self) -> Result<RepositoryMetadata, AdapterError> {
         let remote_url = self
@@ -149,7 +253,10 @@ impl RepositoryHostAdapter for GenericGitAdapter {
             if sha.is_empty() || name.is_empty() || name.contains(' ') {
                 continue; // malformed line or symref entry (HEAD)
             }
-            branches.push(RemoteBranch { name: name.to_string(), sha: sha.to_string() });
+            branches.push(RemoteBranch {
+                name: name.to_string(),
+                sha: sha.to_string(),
+            });
         }
         Ok(branches)
     }
@@ -181,7 +288,11 @@ fn extract_repo_name(url: &str) -> String {
     } else {
         url
     };
-    path.trim_matches(['/', '\\']).trim_end_matches(".git").to_string()
+    // Strip `.git` first, then re-trim separators: `o/.git` -> `o`, not `o/`.
+    path.trim_matches(['/', '\\'])
+        .trim_end_matches(".git")
+        .trim_matches(['/', '\\'])
+        .to_string()
 }
 
 #[cfg(test)]
@@ -190,14 +301,22 @@ mod tests {
     use std::fs;
 
     fn git_available() -> bool {
-        Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     fn make_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string());
         let run = |args: &[&str]| {
-            Command::new(&git).current_dir(dir.path()).args(args).output().expect("git");
+            Command::new(&git)
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .expect("git");
         };
         run(&["init", "-q"]);
         run(&["config", "user.name", "Test"]);
@@ -229,7 +348,10 @@ mod tests {
         }
         let dir = make_repo();
         let adapter = GenericGitAdapter::new(dir.path());
-        assert!(matches!(adapter.pull_requests(), Err(AdapterError::NotSupported)));
+        assert!(matches!(
+            adapter.pull_requests(),
+            Err(AdapterError::NotSupported)
+        ));
     }
 
     #[test]
@@ -252,7 +374,10 @@ mod tests {
             extract_repo_name("https://github.com/owner/repo.git"),
             "owner/repo"
         );
-        assert_eq!(extract_repo_name("git@github.com:owner/repo.git"), "owner/repo");
+        assert_eq!(
+            extract_repo_name("git@github.com:owner/repo.git"),
+            "owner/repo"
+        );
         assert_eq!(
             extract_repo_name("ssh://git@github.com/owner/repo.git"),
             "owner/repo"
@@ -267,6 +392,32 @@ mod tests {
         assert!(!extract_repo_name("C:\\repos\\x.git").is_empty());
         assert_eq!(extract_repo_name(""), "");
         assert_eq!(extract_repo_name("   "), "");
+        // A repo literally named ".git" trims to its owner, not "o/".
+        assert_eq!(extract_repo_name("https://h/o/.git"), "o");
+        assert_eq!(extract_repo_name("https://h/o/repo.git/"), "o/repo");
+    }
+
+    /// `find_on_path` must return an ABSOLUTE path — a relative hit would
+    /// resolve through the child's working directory on Windows
+    /// (CreateProcessW searches it before PATH), re-opening the planted-
+    /// `git.exe` hole this function exists to close.
+    #[test]
+    fn find_on_path_returns_absolute_hit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(windows)]
+        let bin = dir.path().join("fake-tool.exe");
+        #[cfg(not(windows))]
+        let bin = dir.path().join("fake-tool");
+        fs::write(&bin, b"x").expect("write");
+        let found = find_on_path("fake-tool", [dir.path().to_path_buf()].into_iter())
+            .expect("binary must be found");
+        assert!(Path::new(&found).is_absolute(), "{found}");
+        // A missing name yields None (caller falls back to the bare name).
+        assert!(find_on_path("no-such-tool-xyz", [dir.path().to_path_buf()].into_iter()).is_none());
+        // Not a file → skipped.
+        let sub = dir.path().join("adir");
+        fs::create_dir(&sub).unwrap();
+        assert!(find_on_path("adir", [dir.path().to_path_buf()].into_iter()).is_none());
     }
 
     /// A real clone registers `refs/remotes/origin/HEAD` (a symref to the

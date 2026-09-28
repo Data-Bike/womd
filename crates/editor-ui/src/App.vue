@@ -110,6 +110,13 @@
       @toggle-git="toggleGit"
       @settings="settingsOpen = true"
     />
+    <ExternalChangeBanner
+      v-if="activeBanner"
+      :conflict="activeBanner"
+      @reload="reloadSavedVersion"
+      @view-diff="viewExternalDiff"
+      @dismiss="dismissExternalBanner"
+    />
     <div id="main-area">
       <FileTree
         :visible="fileTreeVisible"
@@ -160,6 +167,8 @@
     <SettingsModal v-model:open="settingsOpen" />
     <AboutModal v-model:open="aboutOpen" />
     <HelpModal v-model:open="helpOpen" />
+    <DiffModal v-model:open="diffModalOpen" :title="diffModalTitle" :diff="diffModalDiff" />
+    <div id="toast" :class="{ hidden: !toast }">{{ toast }}</div>
 
     <StatusBar
       :cursor-pos="cursorText"
@@ -190,6 +199,8 @@ import HelpModal from './components/HelpModal.vue';
 import MenuBar from './components/MenuBar.vue';
 import ContextMenu from './components/ContextMenu.vue';
 import FindBar from './components/FindBar.vue';
+import ExternalChangeBanner from './components/ExternalChangeBanner.vue';
+import DiffModal from './components/DiffModal.vue';
 import { detectLineEndingSampled } from './lib/lineEndings.js';
 
 const tabs = ref([]);
@@ -213,6 +224,13 @@ const editorRef = ref(null);
 const ctxShow = ref(false);
 const ctxX = ref(0);
 const ctxY = ref(0);
+// External writes (MCP server / other tools) detected by the backend watcher,
+// keyed by tab id — a conflict persists until the user resolves it.
+const externalBanners = ref({});
+const toast = ref('');
+const diffModalOpen = ref(false);
+const diffModalTitle = ref('');
+const diffModalDiff = ref('');
 
 let autosaveTimer = null;
 let resizeHandler = null;
@@ -226,7 +244,15 @@ const activeDoc = computed(() => {
 const activeFileName = computed(() => activeTab.value?.name || 'untitled.md');
 const activeFilePath = computed(() => activeTab.value?.path || '');
 const activeIsDirty = computed(() => activeTab.value?.dirty || false);
+const activeBanner = computed(() => externalBanners.value[activeTabId.value] || null);
 const cursorText = computed(() => `Ln ${cursorPos.value.line}, Col ${cursorPos.value.col}`);
+
+let toastTimer = null;
+function showToast(text) {
+  toast.value = text;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (toast.value = ''), 5000);
+}
 
 function parentDir(p) {
   if (!p) return '';
@@ -330,7 +356,9 @@ async function pickSavePath() {
   });
 }
 
-async function saveFile() {
+// quiet === true suppresses the toast — autosave calls it that way so a
+// periodic save doesn't keep flashing notifications.
+async function saveFile(quiet) {
   if (!activeDoc.value) return;
   try {
     if (editorRef.value?.save) {
@@ -345,13 +373,34 @@ async function saveFile() {
       path = await pickSavePath();
       if (!path) return; // user cancelled the dialog
     }
-    await invoke('save_document', { path });
+    const res = await invoke('save_document', { path });
     const t = activeTab.value;
     if (t) t.dirty = false;
+    // Saving resolves an external-change conflict for this tab: the user
+    // chose their buffer as the version to keep.
+    delete externalBanners.value[t?.id];
+    const base = res?.commit_sha
+      ? `Saved — version ${res.commit_sha.slice(0, 8)} created`
+      : 'Saved';
+    if (res?.overwrote_external) {
+      // Even an autosave overwrote a version someone else wrote — surface it
+      // (the replaced content survives in git history).
+      showToast(
+        `${base}. Note: the file had changed on disk — that version is preserved in git history.`
+      );
+    } else if (quiet !== true) {
+      showToast(base);
+    }
     await refreshTabs();
   } catch (e) {
     console.error('saveFile:', e);
-    alert('Failed to save: ' + e);
+    // Autosave failures must not pop a modal every interval — a toast
+    // still surfaces the problem without blocking the user.
+    if (quiet === true) {
+      showToast('Autosave failed: ' + e);
+    } else {
+      alert('Failed to save: ' + e);
+    }
   }
 }
 
@@ -363,9 +412,18 @@ async function saveFileAs() {
     if (editorRef.value?.save) {
       if (await editorRef.value.save() === false) return;
     }
-    await invoke('save_document', { path });
+    const res = await invoke('save_document', { path });
     const t = activeTab.value;
     if (t) t.dirty = false;
+    delete externalBanners.value[t?.id];
+    const base = res?.commit_sha
+      ? `Saved — version ${res.commit_sha.slice(0, 8)} created`
+      : 'Saved';
+    showToast(
+      res?.overwrote_external
+        ? `${base}. Note: the file had changed on disk — that version is preserved in git history.`
+        : base
+    );
     await refreshTabs();
   } catch (e) {
     console.error('saveFileAs:', e);
@@ -435,6 +493,9 @@ async function closeTab(tabId) {
   }
   try {
     await invoke('close_tab', { tabId });
+    // A conflict banner belongs to the closed tab — drop it so a later tab
+    // can't inherit a stale warning.
+    delete externalBanners.value[tabId];
     await refreshTabs();
   } catch (e) {
     console.error('closeTab:', e);
@@ -730,7 +791,7 @@ function scheduleAutosave() {
     // off during the 30s window — a stale timer must not save anyway.
     if (!autosave.value) return;
     if (activeIsDirty.value && activeFilePath.value) {
-      try { await saveFile(); } catch (e) { console.error('autosave:', e); }
+      try { await saveFile(true); } catch (e) { console.error('autosave:', e); }
     }
   }, 30000);
 }
@@ -756,10 +817,104 @@ async function checkForUpdate() {
   }
 }
 
+// External-change handling: the backend watcher emits `external-change` when
+// an open file is written outside the editor (MCP server, other tools).
+// - "reloaded": clean buffer was refreshed — reload the view and inform the
+//   user which version the content now reflects.
+// - "conflict": the tab has unsaved edits — keep them and raise a banner
+//   naming the version the external change was committed as.
+// - "removed": the file vanished — keep the buffer, banner offers context.
+function onExternalChange(ev) {
+  const p = ev.payload ?? ev;
+  const banner = {
+    kind: p.kind,
+    fileName: p.file_name,
+    versionSha: p.version_sha || null,
+    versionMessage: p.version_message || null,
+    fromMcp: !!p.from_mcp,
+  };
+  if (p.kind === 'reloaded') {
+    if (p.tab_id === activeTabId.value) {
+      // The backend already swapped the buffer; just re-render the blocks.
+      // A pending block edit targets the OLD snapshot — warn rather than
+      // silently discarding the typed text.
+      const openEdit = editorRef.value?.editingBlockIndex;
+      const editingIdx = openEdit?.value ?? openEdit;
+      if (typeof editingIdx === 'number' && editingIdx >= 0) {
+        alert(
+          'The document changed on disk and was reloaded. The uncommitted edit in the open block could not be applied to the new content.'
+        );
+      }
+      editorRef.value?.loadDocument?.();
+    }
+    externalBanners.value[p.tab_id] = banner;
+    showToast(
+      `${p.file_name} updated ${p.from_mcp ? 'by AI (MCP)' : 'on disk'}` +
+        (banner.versionSha ? ` — version ${banner.versionSha.slice(0, 8)}` : '')
+    );
+    refreshTabs();
+  } else if (p.kind === 'error') {
+    // Transient reload failure — the backend keeps the stale mtime and
+    // retries next poll; clear any previous banner until it resolves.
+    externalBanners.value[p.tab_id] = banner;
+  } else {
+    externalBanners.value[p.tab_id] = banner;
+    refreshTabs();
+  }
+}
+
+async function reloadSavedVersion() {
+  // A pending block edit targets the buffer we are about to discard — confirm
+  // before wiping text the user just typed.
+  const openEdit = editorRef.value?.editingBlockIndex;
+  const editingIdx = openEdit?.value ?? openEdit;
+  if (typeof editingIdx === 'number' && editingIdx >= 0) {
+    if (
+      !confirm(
+        'The uncommitted edit in the open block will be discarded. Load the saved version anyway?'
+      )
+    )
+      return;
+  }
+  try {
+    await invoke('reload_document');
+    delete externalBanners.value[activeTabId.value];
+    await editorRef.value?.loadDocument?.();
+    await refreshTabs();
+  } catch (e) {
+    console.error('reloadSavedVersion:', e);
+    alert('Failed to reload: ' + e);
+  }
+}
+
+async function viewExternalDiff() {
+  const b = activeBanner.value;
+  if (!b?.versionSha) return;
+  try {
+    diffModalDiff.value = await invoke('get_commit_diff', {
+      filePath: activeFilePath.value,
+      sha: b.versionSha,
+    });
+    diffModalTitle.value =
+      `Version ${b.versionSha.slice(0, 8)}` +
+      (b.versionMessage ? ` — ${b.versionMessage}` : '');
+    diffModalOpen.value = true;
+  } catch (e) {
+    console.error('viewExternalDiff:', e);
+    alert('Failed to load diff: ' + e);
+  }
+}
+
+function dismissExternalBanner() {
+  delete externalBanners.value[activeTabId.value];
+}
+
 let unlistenWorktree = null;
+let unlistenExternal = null;
 
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown);
+  unlistenExternal = await listen('external-change', onExternalChange);
   // Git commands (checkout/pull/merge/stash/reset --hard/...) rewrite files
   // on disk; the backend resyncs open buffers and fires worktree-changed —
   // reload the visible document so it doesn't keep showing stale blocks.
@@ -797,5 +952,6 @@ onUnmounted(() => {
   if (resizeHandler) window.removeEventListener('resize', resizeHandler);
   window.removeEventListener('keydown', onGlobalKeydown);
   if (unlistenWorktree) unlistenWorktree();
+  if (unlistenExternal) unlistenExternal();
 });
 </script>

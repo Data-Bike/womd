@@ -11,14 +11,14 @@
 #![forbid(unsafe_code)]
 
 mod clipboard;
-mod watcher;
 mod secret;
 mod url_opener;
+mod watcher;
 
 pub use clipboard::{Clipboard, InMemoryClipboard, SystemClipboard};
+pub use secret::{InMemorySecureStorage, SecureStorage};
+pub use url_opener::{SystemUrlOpener, UrlOpener};
 pub use watcher::{FileWatcher, PollingFileWatcher, WatchEvent};
-pub use secret::{SecureStorage, InMemorySecureStorage};
-pub use url_opener::{UrlOpener, SystemUrlOpener};
 
 /// Typed platform error (§89).
 #[derive(Debug)]

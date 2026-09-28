@@ -44,7 +44,8 @@ impl std::error::Error for ManifestParseError {}
 
 /// Parse a TOML manifest string into a `PluginManifest`.
 pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ManifestParseError> {
-    let value: toml::Value = toml::from_str(toml_text).map_err(|e| ManifestParseError::Toml(e.to_string()))?;
+    let value: toml::Value =
+        toml::from_str(toml_text).map_err(|e| ManifestParseError::Toml(e.to_string()))?;
 
     let id = value
         .get("id")
@@ -55,11 +56,13 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ManifestParseEr
     let name = value
         .get("name")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
         .ok_or(ManifestParseError::MissingField("name"))?
         .to_string();
     let version = value
         .get("version")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
         .ok_or(ManifestParseError::MissingField("version"))?
         .to_string();
     let api_version_str = value
@@ -174,7 +177,10 @@ name = "x"
 version = "1"
 api_version = "1"
 "#;
-        assert!(matches!(parse_manifest(bad), Err(ManifestParseError::MissingField("id"))));
+        assert!(matches!(
+            parse_manifest(bad),
+            Err(ManifestParseError::MissingField("id"))
+        ));
     }
 
     #[test]
@@ -185,7 +191,10 @@ name = "x"
 version = "1"
 api_version = "abc"
 "#;
-        assert!(matches!(parse_manifest(bad), Err(ManifestParseError::InvalidApiVersion(_))));
+        assert!(matches!(
+            parse_manifest(bad),
+            Err(ManifestParseError::InvalidApiVersion(_))
+        ));
     }
 
     /// Malformed versions must be rejected, not silently coerced:
@@ -195,7 +204,10 @@ api_version = "abc"
         for bad in ["1.x", "1.2.3", "x", "1.", "", ".2"] {
             let m = format!("id = \"p\"\nname = \"p\"\nversion = \"1\"\napi_version = \"{bad}\"\n");
             assert!(
-                matches!(parse_manifest(&m), Err(ManifestParseError::InvalidApiVersion(_))),
+                matches!(
+                    parse_manifest(&m),
+                    Err(ManifestParseError::InvalidApiVersion(_))
+                ),
                 "api_version {bad:?} must be rejected"
             );
         }
@@ -209,7 +221,28 @@ name = "x"
 version = "1"
 api_version = "1"
 "#;
-        assert!(matches!(parse_manifest(m), Err(ManifestParseError::MissingField("id"))));
+        assert!(matches!(
+            parse_manifest(m),
+            Err(ManifestParseError::MissingField("id"))
+        ));
+    }
+
+    #[test]
+    fn empty_name_and_version_rejected() {
+        for field in ["name", "version"] {
+            let (name, version) = if field == "name" {
+                ("   ", "1")
+            } else {
+                ("p", "   ")
+            };
+            let m = format!(
+                "id = \"p\"\nname = \"{name}\"\nversion = \"{version}\"\napi_version = \"1\"\n"
+            );
+            assert!(
+                matches!(parse_manifest(&m), Err(ManifestParseError::MissingField(_))),
+                "empty {field} must be rejected"
+            );
+        }
     }
 
     #[test]

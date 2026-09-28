@@ -8,10 +8,13 @@
 
 mod cli;
 
-pub use cli::{file_history, read_file_at_revision, FileHistoryEntry, GitCli, SystemCredentialProvider};
 pub use cli::GitExtendedImpl;
+pub use cli::{
+    FileHistoryEntry, GitCli, SystemCredentialProvider, file_history, read_file_at_revision,
+    resolve_tool_binary,
+};
 
-use editor_domain::{ids::RepositoryId, ByteRange};
+use editor_domain::{ByteRange, ids::RepositoryId};
 
 /// Typed Git error (§89). Extended as operations are implemented.
 ///
@@ -99,16 +102,35 @@ pub enum DiffRequest {
     WorkingTreeVsIndex,
     IndexVsHead,
     WorkingTreeVsHead,
-    CommitVsCommit { a: CommitId, b: CommitId },
-    BranchVsBranch { a: String, b: String },
-    HeadVsBranch { branch: String },
-    FileVersionVsVersion { path: String, a: CommitId, b: CommitId },
+    CommitVsCommit {
+        a: CommitId,
+        b: CommitId,
+    },
+    BranchVsBranch {
+        a: String,
+        b: String,
+    },
+    HeadVsBranch {
+        branch: String,
+    },
+    FileVersionVsVersion {
+        path: String,
+        a: CommitId,
+        b: CommitId,
+    },
     /// Diff working tree against a specific commit.
-    WorkingTreeVsCommit { commit: CommitId },
+    WorkingTreeVsCommit {
+        commit: CommitId,
+    },
     /// Diff index (staged) against a specific commit.
-    IndexVsCommit { commit: CommitId },
+    IndexVsCommit {
+        commit: CommitId,
+    },
     /// Diff a specific file between working tree and a commit.
-    WorkingTreeVsCommitFile { commit: CommitId, path: String },
+    WorkingTreeVsCommitFile {
+        commit: CommitId,
+        path: String,
+    },
 }
 
 /// A diff result for one file.
@@ -283,7 +305,12 @@ pub trait GitExtended {
     /// Raw unified diff text for a single file (working tree + staged vs HEAD).
     fn diff_file_raw(&self, path: &str) -> GitResult<String>;
     /// Raw unified diff text for a single file between two commits.
-    fn diff_file_commits_raw(&self, path: &str, commit_a: &str, commit_b: &str) -> GitResult<String>;
+    fn diff_file_commits_raw(
+        &self,
+        path: &str,
+        commit_a: &str,
+        commit_b: &str,
+    ) -> GitResult<String>;
     /// Raw unified diff text for a single file vs a specific commit.
     fn diff_file_vs_commit_raw(&self, path: &str, commit: &str) -> GitResult<String>;
     /// Discard local changes to a file (`git checkout -- <file>`).
@@ -302,16 +329,26 @@ pub trait GitExtended {
 /// derived impl would print the secrets into logs and error messages.
 #[derive(Clone)]
 pub enum Credentials {
-    SshKey { key_path: String, passphrase: Option<String> },
+    SshKey {
+        key_path: String,
+        passphrase: Option<String>,
+    },
     SshAgent,
-    HttpsToken { token: String },
-    OAuth { token: String },
+    HttpsToken {
+        token: String,
+    },
+    OAuth {
+        token: String,
+    },
 }
 
 impl core::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::SshKey { key_path, passphrase } => f
+            Self::SshKey {
+                key_path,
+                passphrase,
+            } => f
                 .debug_struct("SshKey")
                 .field("key_path", key_path)
                 .field("passphrase", &passphrase.as_ref().map(|_| "***"))

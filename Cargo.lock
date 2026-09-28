@@ -947,6 +947,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "editor-mcp"
+version = "0.1.0"
+dependencies = [
+ "editor-domain",
+ "editor-git",
+ "editor-markdown",
+ "editor-storage",
+ "regex",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "editor-platform"
 version = "0.1.0"
 dependencies = [

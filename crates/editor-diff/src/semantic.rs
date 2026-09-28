@@ -4,7 +4,7 @@
 //! modified", "table row added", …).
 
 use editor_domain::MarkdownProfile;
-use editor_markdown::{parse, Block, Document};
+use editor_markdown::{Block, Document, parse};
 
 /// A structural unit that can be reported as changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +36,10 @@ impl SemanticUnit {
             Block::CodeBlock(_) => Self::CodeBlock,
             Block::BlockQuote(_) => Self::BlockQuote,
             Block::ThematicBreak(_) => Self::ThematicBreak,
-            Block::HtmlBlock(_) | Block::LinkReferenceDefinition(_) | Block::BlankLine(_) | Block::UnknownBlock(_) => Self::Other,
+            Block::HtmlBlock(_)
+            | Block::LinkReferenceDefinition(_)
+            | Block::BlankLine(_)
+            | Block::UnknownBlock(_) => Self::Other,
         }
     }
     fn label(&self) -> String {
@@ -92,10 +95,23 @@ pub fn semantic_diff(old: &[u8], new: &[u8], profile: MarkdownProfile) -> Vec<Se
     diff_documents(&old_doc, &new_doc, old, new)
 }
 
-fn diff_documents(old: &Document, new: &Document, old_src: &[u8], new_src: &[u8]) -> Vec<SemanticChange> {
+fn diff_documents(
+    old: &Document,
+    new: &Document,
+    old_src: &[u8],
+    new_src: &[u8],
+) -> Vec<SemanticChange> {
     // Skip blank-line trivia; compare meaningful blocks.
-    let old_blocks: Vec<&Block> = old.blocks.iter().filter(|b| !matches!(b, Block::BlankLine(_))).collect();
-    let new_blocks: Vec<&Block> = new.blocks.iter().filter(|b| !matches!(b, Block::BlankLine(_))).collect();
+    let old_blocks: Vec<&Block> = old
+        .blocks
+        .iter()
+        .filter(|b| !matches!(b, Block::BlankLine(_)))
+        .collect();
+    let new_blocks: Vec<&Block> = new
+        .blocks
+        .iter()
+        .filter(|b| !matches!(b, Block::BlankLine(_)))
+        .collect();
 
     // Greedy positional match with kind/text equality; remaining unmatched are added/removed.
     let mut used_new = vec![false; new_blocks.len()];
@@ -103,9 +119,10 @@ fn diff_documents(old: &Document, new: &Document, old_src: &[u8], new_src: &[u8]
 
     for ob in &old_blocks {
         let ou = SemanticUnit::from_block(ob);
-        let matched = new_blocks.iter().enumerate().find(|(j, nb)| {
-            !used_new[*j] && SemanticUnit::from_block(nb) == ou
-        });
+        let matched = new_blocks
+            .iter()
+            .enumerate()
+            .find(|(j, nb)| !used_new[*j] && SemanticUnit::from_block(nb) == ou);
         match matched {
             Some((j, _)) => {
                 used_new[j] = true;
@@ -119,7 +136,9 @@ fn diff_documents(old: &Document, new: &Document, old_src: &[u8], new_src: &[u8]
     }
     for (j, nb) in new_blocks.iter().enumerate() {
         if !used_new[j] {
-            changes.push(SemanticChange::Added { unit: SemanticUnit::from_block(nb) });
+            changes.push(SemanticChange::Added {
+                unit: SemanticUnit::from_block(nb),
+            });
         }
     }
     changes
@@ -150,7 +169,12 @@ mod tests {
         let old = b"# Title\n";
         let new = b"# Title\n\nNew paragraph.\n";
         let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
-        assert!(changes.iter().any(|c| matches!(c, SemanticChange::Added { unit: SemanticUnit::Paragraph })));
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            SemanticChange::Added {
+                unit: SemanticUnit::Paragraph
+            }
+        )));
     }
 
     #[test]
@@ -158,7 +182,11 @@ mod tests {
         let old = b"# Title\n\n## Subtitle\n";
         let new = b"# Title\n";
         let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
-        assert!(changes.iter().any(|c| matches!(c, SemanticChange::Removed { .. })));
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, SemanticChange::Removed { .. }))
+        );
     }
 
     #[test]
@@ -166,7 +194,12 @@ mod tests {
         let old = b"Hello world.\n";
         let new = b"Hello universe.\n";
         let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
-        assert!(changes.iter().any(|c| matches!(c, SemanticChange::Modified { unit: SemanticUnit::Paragraph })));
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            SemanticChange::Modified {
+                unit: SemanticUnit::Paragraph
+            }
+        )));
     }
 
     #[test]
@@ -180,7 +213,11 @@ mod tests {
         let old = b"# Title\n";
         let new = b"# Title\n\nNew para.\n";
         let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
-        let desc = changes.iter().map(|c| c.describe()).collect::<Vec<_>>().join("; ");
+        let desc = changes
+            .iter()
+            .map(|c| c.describe())
+            .collect::<Vec<_>>()
+            .join("; ");
         assert!(desc.contains("Paragraph added"));
     }
 
@@ -192,10 +229,15 @@ mod tests {
         let old = b"abc\n";
         let new = b"xyz\n";
         let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
-        assert!(changes.iter().any(|c| matches!(
-            c,
-            SemanticChange::Modified { unit: SemanticUnit::Paragraph }
-        )), "expected a Modified paragraph, got {changes:?}");
+        assert!(
+            changes.iter().any(|c| matches!(
+                c,
+                SemanticChange::Modified {
+                    unit: SemanticUnit::Paragraph
+                }
+            )),
+            "expected a Modified paragraph, got {changes:?}"
+        );
     }
 
     /// A block whose content is identical but whose span moved (because an
@@ -208,8 +250,17 @@ mod tests {
         let doc_b = parse(b"x y z\n\nshifted text\n", MarkdownProfile::Gfm).unwrap();
         // Both are single-line; take each last paragraph.
         let a = &doc_a.blocks[0];
-        let b = doc_b.blocks.iter().rev().find(|x| matches!(x, Block::Paragraph(_))).unwrap();
-        assert_ne!(a.span(), b.span(), "spans must differ for the test to be meaningful");
+        let b = doc_b
+            .blocks
+            .iter()
+            .rev()
+            .find(|x| matches!(x, Block::Paragraph(_)))
+            .unwrap();
+        assert_ne!(
+            a.span(),
+            b.span(),
+            "spans must differ for the test to be meaningful"
+        );
         assert!(
             super::bytes_equal(a, b, b"shifted text\n", b"x y z\n\nshifted text\n"),
             "identical content at different offsets must compare equal"
@@ -223,10 +274,15 @@ mod tests {
         let old = b"```rust\nlet a = 1;\n```\n";
         let new = b"```rust\nlet a = 2;\n```\n";
         let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
-        assert!(changes.iter().any(|c| matches!(
-            c,
-            SemanticChange::Modified { unit: SemanticUnit::CodeBlock }
-        )), "expected a Modified code block, got {changes:?}");
+        assert!(
+            changes.iter().any(|c| matches!(
+                c,
+                SemanticChange::Modified {
+                    unit: SemanticUnit::CodeBlock
+                }
+            )),
+            "expected a Modified code block, got {changes:?}"
+        );
     }
 
     /// HtmlBlock likewise stores no content — body changes must be detected.
@@ -235,8 +291,12 @@ mod tests {
         let old = b"<div>\n  <p>old</p>\n</div>\n";
         let new = b"<div>\n  <p>new</p>\n</div>\n";
         let changes = semantic_diff(old, new, MarkdownProfile::Gfm);
-        assert!(changes.iter().any(|c| matches!(c, SemanticChange::Modified { .. })),
-            "expected a Modified change, got {changes:?}");
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, SemanticChange::Modified { .. })),
+            "expected a Modified change, got {changes:?}"
+        );
     }
 
     /// Same fence but different code -> Modified; identical block moved by an
@@ -247,14 +307,24 @@ mod tests {
         let moved = b"para edit\n\n```\nbody\n```\n";
         let modified = b"para\n\n```\nchanged\n```\n";
         let moved_changes = semantic_diff(old, moved, MarkdownProfile::Gfm);
-        assert!(moved_changes.iter().all(|c| !matches!(
-            c,
-            SemanticChange::Modified { unit: SemanticUnit::CodeBlock }
-        )), "moved identical code block must not be Modified: {moved_changes:?}");
+        assert!(
+            moved_changes.iter().all(|c| !matches!(
+                c,
+                SemanticChange::Modified {
+                    unit: SemanticUnit::CodeBlock
+                }
+            )),
+            "moved identical code block must not be Modified: {moved_changes:?}"
+        );
         let mod_changes = semantic_diff(old, modified, MarkdownProfile::Gfm);
-        assert!(mod_changes.iter().any(|c| matches!(
-            c,
-            SemanticChange::Modified { unit: SemanticUnit::CodeBlock }
-        )), "expected Modified code block: {mod_changes:?}");
+        assert!(
+            mod_changes.iter().any(|c| matches!(
+                c,
+                SemanticChange::Modified {
+                    unit: SemanticUnit::CodeBlock
+                }
+            )),
+            "expected Modified code block: {mod_changes:?}"
+        );
     }
 }

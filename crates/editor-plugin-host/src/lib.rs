@@ -10,7 +10,7 @@
 
 mod manifest;
 
-pub use manifest::{parse_manifest, ManifestParseError};
+pub use manifest::{ManifestParseError, parse_manifest};
 
 use editor_domain::ids::PluginId;
 use editor_plugin_api::{Capability, PluginManifest};
@@ -19,7 +19,12 @@ use editor_plugin_api::{Capability, PluginManifest};
 #[derive(Debug)]
 pub enum PluginError {
     ManifestInvalid(String),
-    IncompatibleApi { expected: String, got: String },
+    IncompatibleApi {
+        expected: String,
+        got: String,
+    },
+    /// Another ACTIVE plugin already owns this id.
+    DuplicateId(PluginId),
     PermissionDenied(Capability),
     /// The plugin crashed; it has been deactivated (Invariant 8). The editor continues.
     Crash(String),
@@ -34,6 +39,7 @@ impl core::fmt::Display for PluginError {
             Self::IncompatibleApi { expected, got } => {
                 format!("incompatible api: expected {expected}, got {got}")
             }
+            Self::DuplicateId(id) => format!("plugin id already registered: {id}"),
             Self::PermissionDenied(c) => format!("permission denied: {c:?}"),
             Self::Crash(s) => format!("plugin crashed: {s}"),
             Self::NotActive(id) => format!("plugin not active: {id}"),
@@ -83,7 +89,8 @@ impl PluginHost {
 
     /// Validate and register a plugin from a TOML manifest string.
     pub fn register_manifest(&mut self, toml: &str) -> Result<PluginId, PluginError> {
-        let manifest = parse_manifest(toml).map_err(|e| PluginError::ManifestInvalid(e.to_string()))?;
+        let manifest =
+            parse_manifest(toml).map_err(|e| PluginError::ManifestInvalid(e.to_string()))?;
         self.register(manifest)
     }
 
@@ -92,18 +99,29 @@ impl PluginHost {
         if manifest.api_version.major != self.api_version.major {
             return Err(PluginError::IncompatibleApi {
                 expected: format!("{}.x", self.api_version.major),
-                got: format!("{}.{}", manifest.api_version.major, manifest.api_version.minor),
+                got: format!(
+                    "{}.{}",
+                    manifest.api_version.major, manifest.api_version.minor
+                ),
             });
         }
-        // Reject duplicate plugin IDs to prevent capability confusion.
+        // Reject duplicate plugin IDs to prevent capability confusion — but
+        // only when the existing entry is Active: a crashed or deactivated
+        // plugin must be re-registrable (e.g. after the user updates it),
+        // otherwise a crash would permanently block the plugin id.
         let id = manifest.id.clone();
-        if self.plugins.iter().any(|p| p.manifest.id == id) {
-            return Err(PluginError::IncompatibleApi {
-                expected: "unique plugin id".to_string(),
-                got: format!("duplicate: {}", id.0),
-            });
+        if self
+            .plugins
+            .iter()
+            .any(|p| p.manifest.id == id && p.state == PluginState::Active)
+        {
+            return Err(PluginError::DuplicateId(id));
         }
-        self.plugins.push(LoadedPlugin { manifest, state: PluginState::Active });
+        self.plugins.retain(|p| p.manifest.id != id);
+        self.plugins.push(LoadedPlugin {
+            manifest,
+            state: PluginState::Active,
+        });
         Ok(id)
     }
 
@@ -145,12 +163,17 @@ impl PluginHost {
 
     /// Get the state of a plugin.
     pub fn state(&self, id: &PluginId) -> Option<PluginState> {
-        self.plugins.iter().find(|p| &p.manifest.id == id).map(|p| p.state)
+        self.plugins
+            .iter()
+            .find(|p| &p.manifest.id == id)
+            .map(|p| p.state)
     }
 
     /// Only active plugins (excludes deactivated/crashed).
     pub fn active(&self) -> impl Iterator<Item = &LoadedPlugin> {
-        self.plugins.iter().filter(|p| p.state == PluginState::Active)
+        self.plugins
+            .iter()
+            .filter(|p| p.state == PluginState::Active)
     }
 
     pub fn plugins(&self) -> &[LoadedPlugin] {
@@ -280,5 +303,52 @@ api_version = "1"
         let id = host.register_manifest(VALID_MANIFEST).expect("register");
         host.deactivate(&id, PluginState::Deactivated);
         assert!(!host.has_capability(&id, Capability::Network));
+    }
+
+    #[test]
+    fn duplicate_active_id_rejected() {
+        let mut host = PluginHost::new();
+        host.register_manifest(VALID_MANIFEST).expect("register");
+        let err = host.register_manifest(VALID_MANIFEST).unwrap_err();
+        assert!(matches!(err, PluginError::DuplicateId(_)));
+    }
+
+    /// A crashed plugin must be re-registrable: after a crash the user fixes
+    /// or updates the plugin and registers it again — blocking the id forever
+    /// would force an editor restart to recover.
+    #[test]
+    fn crashed_plugin_can_be_reregistered() {
+        let mut host = PluginHost::new();
+        let id = host.register_manifest(VALID_MANIFEST).expect("register");
+        host.handle_crash(&id, "trap");
+        assert_eq!(host.state(&id), Some(PluginState::Crashed));
+
+        // Re-register a FIXED manifest (e.g. with different permissions).
+        let fixed = VALID_MANIFEST
+            .replacen("network = true", "network = false", 1)
+            .replacen("clipboard = false", "clipboard = true", 1);
+        let id2 = host.register_manifest(&fixed).expect("re-register");
+        assert_eq!(id, id2);
+        assert_eq!(host.state(&id), Some(PluginState::Active));
+        // New manifest wins: clipboard granted, network not.
+        assert!(host.has_capability(&id, Capability::Clipboard));
+        assert!(!host.has_capability(&id, Capability::Network));
+        // Exactly one entry for the id — the crashed record was replaced.
+        assert_eq!(
+            host.plugins()
+                .iter()
+                .filter(|p| p.manifest.id == id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn deactivated_plugin_can_be_reregistered() {
+        let mut host = PluginHost::new();
+        let id = host.register_manifest(VALID_MANIFEST).expect("register");
+        host.deactivate(&id, PluginState::Deactivated);
+        host.register_manifest(VALID_MANIFEST).expect("re-register");
+        assert_eq!(host.state(&id), Some(PluginState::Active));
     }
 }

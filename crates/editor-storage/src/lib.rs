@@ -15,15 +15,15 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use editor_domain::{errors::StorageError, ByteOffset, DocumentId};
+use editor_domain::{ByteOffset, DocumentId, errors::StorageError};
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
-mod mmap;
 mod chunk;
+mod mmap;
 
+pub use chunk::{ChunkContext, analyze_context};
 pub use mmap::{MmapSource, MmapStorage};
-pub use chunk::{analyze_context, ChunkContext};
 
 /// A chunk of bytes read from a document, with its absolute start offset and partial-edge
 /// flags (§52–54).
@@ -90,7 +90,12 @@ impl DocumentStorage for InMemoryStorage {
 /// Returns the corrected `(start, end)` byte offsets within `bytes` for the window
 /// starting at `base`. Scans backward/forward to the nearest char boundary and to the
 /// nearest newline boundary.
-pub fn correct_utf8_boundaries(bytes: &[u8], base: usize, offset: usize, length: usize) -> (usize, usize) {
+pub fn correct_utf8_boundaries(
+    bytes: &[u8],
+    base: usize,
+    offset: usize,
+    length: usize,
+) -> (usize, usize) {
     let raw_start = offset.min(bytes.len());
     // `offset + length` can overflow usize for a huge requested length.
     let raw_end = offset.saturating_add(length).min(bytes.len());
@@ -136,7 +141,21 @@ fn temp_name_for(path: &Path) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "document".to_string());
-    format!("{base}.womd-tmp-{}", std::process::id())
+    // High-entropy component so a co-located process cannot pre-create all
+    // candidate names to deny the save (the retry counter alone would give
+    // an attacker the full 16-name list for a given pid).
+    let entropy = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+        );
+        h.finish()
+    };
+    format!("{base}.womd-tmp-{}-{entropy:016x}", std::process::id())
 }
 
 /// Create a fresh temp file next to `path`, refusing to follow a pre-existing
@@ -154,26 +173,46 @@ fn create_temp_file(path: &Path) -> StorageResult<(File, std::path::PathBuf)> {
             format!("{}.{}", temp_name_for(path), attempt)
         };
         tmp_path.set_file_name(name);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp_path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
             Ok(file) => return Ok((file, tmp_path)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(StorageError::Io(e.to_string())),
         }
     }
-    Err(StorageError::Io("could not allocate a unique temp file name".to_string()))
+    Err(StorageError::Io(
+        "could not allocate a unique temp file name".to_string(),
+    ))
+}
+
+/// Permissions of the file being replaced, captured BEFORE the rename —
+/// `rename` swaps inodes, so without this a 0700 script loses +x and a 0600
+/// private file becomes world-readable. Best-effort: unreadable metadata
+/// (new file) yields None.
+fn existing_permissions(path: &Path) -> Option<std::fs::Permissions> {
+    std::fs::metadata(path).ok().map(|m| m.permissions())
 }
 
 pub fn atomic_save(path: &Path, bytes: &[u8]) -> StorageResult<()> {
     let (mut file, tmp_path) = create_temp_file(path)?;
+    let perms = existing_permissions(path);
 
     let result = (|| -> StorageResult<()> {
         {
-            file.write_all(bytes).map_err(|e| StorageError::Io(e.to_string()))?;
+            file.write_all(bytes)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            if let Some(p) = &perms {
+                let _ = file.set_permissions(p.clone());
+            }
             // fsync the temp file BEFORE the rename — `File::sync_all` works
             // cross-platform (fsync on POSIX, FlushFileBuffers on Windows). Without
             // this, a crash between rename and page-cache flush can leave a
             // zero-length target.
-            file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         std::fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))
     })();
@@ -218,6 +257,7 @@ fn atomic_save_chunked_with(
         return Err(StorageError::OutOfRange);
     }
     let (mut file, tmp_path) = create_temp_file(path)?;
+    let perms = existing_permissions(path);
 
     let result = (|| -> StorageResult<()> {
         let mut pos = 0u64;
@@ -227,10 +267,15 @@ fn atomic_save_chunked_with(
             if data.len() as u64 != end - pos {
                 return Err(StorageError::OutOfRange);
             }
-            file.write_all(&data).map_err(|e| StorageError::Io(e.to_string()))?;
+            file.write_all(&data)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
             pos = end;
         }
-        file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
+        if let Some(p) = &perms {
+            let _ = file.set_permissions(p.clone());
+        }
+        file.sync_all()
+            .map_err(|e| StorageError::Io(e.to_string()))?;
         std::fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))
     })();
     if result.is_err() {
@@ -270,6 +315,7 @@ pub fn streaming_save(
     }
 
     let (mut file, tmp_path) = create_temp_file(path)?;
+    let perms = existing_permissions(path);
     let result = (|| -> StorageResult<()> {
         let mut cursor: u64 = 0;
         for (range, replacement) in patches {
@@ -277,17 +323,24 @@ pub fn streaming_save(
             if range.start.0 > cursor {
                 let s = cursor as usize;
                 let e = range.start.0 as usize;
-                file.write_all(&source[s..e]).map_err(|e2| StorageError::Io(e2.to_string()))?;
+                file.write_all(&source[s..e])
+                    .map_err(|e2| StorageError::Io(e2.to_string()))?;
             }
             // Write the replacement.
-            file.write_all(replacement).map_err(|e2| StorageError::Io(e2.to_string()))?;
+            file.write_all(replacement)
+                .map_err(|e2| StorageError::Io(e2.to_string()))?;
             cursor = range.end.0;
         }
         // Trailing unchanged bytes.
         if (cursor as usize) < source.len() {
-            file.write_all(&source[cursor as usize..]).map_err(|e2| StorageError::Io(e2.to_string()))?;
+            file.write_all(&source[cursor as usize..])
+                .map_err(|e2| StorageError::Io(e2.to_string()))?;
         }
-        file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
+        if let Some(p) = &perms {
+            let _ = file.set_permissions(p.clone());
+        }
+        file.sync_all()
+            .map_err(|e| StorageError::Io(e.to_string()))?;
         std::fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))
     })();
     if result.is_err() {
@@ -370,7 +423,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("womd_streaming_oob_test.md");
         let original = b"abc\n";
-        let patches = vec![(ByteRange::new(ByteOffset(0), ByteOffset(100)), b"X".to_vec())];
+        let patches = vec![(
+            ByteRange::new(ByteOffset(0), ByteOffset(100)),
+            b"X".to_vec(),
+        )];
         assert!(matches!(
             streaming_save(&path, original, &patches),
             Err(StorageError::OutOfRange)
@@ -380,7 +436,10 @@ mod tests {
     #[test]
     fn out_of_range() {
         let s = InMemoryStorage::new(DocumentId::new("t"), b"hi\n".to_vec());
-        assert!(matches!(s.read_range(ByteOffset(100), 1), Err(StorageError::OutOfRange)));
+        assert!(matches!(
+            s.read_range(ByteOffset(100), 1),
+            Err(StorageError::OutOfRange)
+        ));
     }
 
     #[test]
@@ -402,8 +461,37 @@ mod tests {
         let payload = b"# Test\n\nHello.\n";
         atomic_save(&path, payload).unwrap();
         let mut read_back = Vec::new();
-        File::open(&path).unwrap().read_to_end(&mut read_back).unwrap();
+        File::open(&path)
+            .unwrap()
+            .read_to_end(&mut read_back)
+            .unwrap();
         assert_eq!(read_back, payload);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The rename swaps inodes — without permission carryover an executable
+    /// script would lose +x (and a private file its 0600) on every save.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("womd_perms_test_{}.sh", std::process::id()));
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        atomic_save(&path, b"#!/bin/sh\necho hi\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "executable bit must survive the save");
+
+        // streaming_save and chunked must carry it too.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        streaming_save(&path, b"abc", &[]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        atomic_save_chunked(&path, 4, |s, e| b"xyzt"[s as usize..e as usize].to_vec()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -460,10 +548,16 @@ mod tests {
         let path = dir.join("womd_streaming_save_test.md");
         let original = b"# Title\n\nHello beautiful world.\n";
         // Replace "beautiful" (offsets 15..24) with "great".
-        let patches = vec![(ByteRange::new(ByteOffset(15), ByteOffset(24)), b"great".to_vec())];
+        let patches = vec![(
+            ByteRange::new(ByteOffset(15), ByteOffset(24)),
+            b"great".to_vec(),
+        )];
         streaming_save(&path, original, &patches).unwrap();
         let mut read_back = Vec::new();
-        File::open(&path).unwrap().read_to_end(&mut read_back).unwrap();
+        File::open(&path)
+            .unwrap()
+            .read_to_end(&mut read_back)
+            .unwrap();
         assert_eq!(read_back, b"# Title\n\nHello great world.\n");
         let _ = std::fs::remove_file(&path);
     }
@@ -521,8 +615,7 @@ mod tests {
     fn atomic_save_chunked_empty_document() {
         let dir = std::env::temp_dir();
         let path = dir.join("womd_chunked_empty_test.md");
-        atomic_save_chunked_with(&path, 0, 4, |_s, _e| panic!("no reads for empty doc"))
-            .unwrap();
+        atomic_save_chunked_with(&path, 0, 4, |_s, _e| panic!("no reads for empty doc")).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), Vec::<u8>::new());
         let _ = std::fs::remove_file(&path);
     }
@@ -542,7 +635,10 @@ mod tests {
         // The save landed on the real target…
         assert_eq!(std::fs::read(&path).unwrap(), b"new doc".to_vec());
         // …and the pre-existing temp file was left exactly as it was.
-        assert_eq!(std::fs::read(&stale).unwrap(), b"precious stale data".to_vec());
+        assert_eq!(
+            std::fs::read(&stale).unwrap(),
+            b"precious stale data".to_vec()
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&stale);

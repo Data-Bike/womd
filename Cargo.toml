@@ -24,6 +24,7 @@ members = [
     "crates/editor-plugin-host",
     "crates/editor-platform",
     "crates/editor-ui",
+    "crates/editor-mcp",
     "adapters/github",
     "adapters/generic-git",
 ]

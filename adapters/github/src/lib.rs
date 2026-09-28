@@ -28,7 +28,7 @@ impl GithubAdapter {
         Self {
             provider: ProviderId::from_str_unchecked("github"),
             work_dir: work_dir.into(),
-            gh_bin: std::env::var("GH_BIN").unwrap_or_else(|_| "gh".to_string()),
+            gh_bin: resolve_on_path("gh", "GH_BIN"),
         }
     }
 
@@ -46,23 +46,137 @@ impl GithubAdapter {
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
         } else {
-            Err(AdapterError::Other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+            Err(AdapterError::Other(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            ))
         }
     }
 
     fn git_text(&self, args: &[&str]) -> Result<String, AdapterError> {
-        let git = std::env::var("GIT_BIN").unwrap_or_else(|_| "git".to_string());
+        let git = resolve_on_path("git", "GIT_BIN");
         let out = run_with_timeout(&git, &self.work_dir, args, CMD_TIMEOUT)?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
         } else {
-            Err(AdapterError::Other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+            Err(AdapterError::Other(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            ))
         }
     }
 }
 
+/// Resolve `name` to an absolute path found on PATH.
+///
+/// `Command::new(name)` with `current_dir(work_dir)` is dangerous on
+/// Windows: `CreateProcessW` searches the working directory before PATH, so
+/// a `gh.exe`/`git.exe` planted inside the repository (e.g. a malicious
+/// checkout) would run instead of the real binary. An absolute path removes
+/// the working directory from the search entirely (same hardening as
+/// `editor-git`'s `resolve_git_binary`).
+///
+/// `env_var` overrides everything (operator/test control). Falls back to
+/// the bare name when nothing is found on PATH — same behaviour as before.
+fn resolve_on_path(name: &str, env_var: &str) -> String {
+    if let Ok(b) = std::env::var(env_var) {
+        // Keep it absolute: a relative override resolves through the
+        // child's working directory — the same hole this function closes.
+        if let Ok(abs) = Path::new(&b).canonicalize() {
+            return abs.to_string_lossy().to_string();
+        }
+        return b;
+    }
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    find_on_path(name, std::env::split_paths(&path_var)).unwrap_or_else(|| name.to_string())
+}
+
+/// Search `dirs` for `name` (plus PATHEXT extensions on Windows) and return
+/// the canonical — hence absolute — first hit.
+fn find_on_path(name: &str, dirs: impl Iterator<Item = PathBuf>) -> Option<String> {
+    #[cfg(windows)]
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';')
+        .map(|e| e.to_lowercase())
+        .collect();
+    for dir in dirs {
+        #[cfg(windows)]
+        let cands: Vec<PathBuf> = exts
+            .iter()
+            .map(|ext| dir.join(format!("{name}{ext}")))
+            .collect();
+        #[cfg(not(windows))]
+        let cands: Vec<PathBuf> = vec![dir.join(name)];
+        for cand in cands {
+            // `canonicalize` makes even a relative PATH entry absolute —
+            // a "." entry would otherwise resolve through the child's
+            // working directory (the hole this exists to close).
+            if cand.is_file()
+                && let Ok(abs) = cand.canonicalize()
+            {
+                return Some(abs.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Maximum bytes read from each child pipe. A misbehaving tool cannot
+/// exhaust memory: once the cap is hit the pipe fills, the child blocks on
+/// write, and the deadline kills it (surfaced as "timed out").
+const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+
+/// Grace period for pipe readers to hit EOF after the child exits — a
+/// detached grandchild inheriting the pipe's write end keeps it open
+/// forever, and joining the reader thread would hang despite the timeout.
+const EOF_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shared pipe drain: the reader appends up to `cap` bytes, `done` flips on
+/// EOF/error. Bytes stay readable even while the thread is blocked.
+struct PipeDrain {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn spawn_pipe_drain(mut pipe: impl std::io::Read + Send + 'static, cap: usize) -> PipeDrain {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let b = buf.clone();
+    let d = done.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            let room = {
+                let g = b.lock().unwrap_or_else(|e| e.into_inner());
+                cap.saturating_sub(g.len())
+            };
+            if room == 0 {
+                break;
+            }
+            let want = room.min(chunk.len());
+            match pipe.read(&mut chunk[..want]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut g = b.lock().unwrap_or_else(|e| e.into_inner());
+                    g.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+        d.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    PipeDrain { buf, done }
+}
+
+fn collect_drain(drain: &PipeDrain, grace: std::time::Duration) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + grace;
+    while !drain.done.load(std::sync::atomic::Ordering::Relaxed)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::mem::take(&mut *drain.buf.lock().unwrap_or_else(|e| e.into_inner()))
+}
 
 /// `Command::output()` has no timeout — a wedged network call or a credential
 /// prompt on a non-existent terminal hangs forever. Drain both pipes on
@@ -74,7 +188,16 @@ fn run_with_timeout(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, AdapterError> {
-    use std::io::Read;
+    run_with_timeout_capped(bin, dir, args, timeout, MAX_OUTPUT)
+}
+
+fn run_with_timeout_capped(
+    bin: &str,
+    dir: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+    cap: usize,
+) -> Result<std::process::Output, AdapterError> {
     let mut child = Command::new(bin)
         .current_dir(dir)
         .args(args)
@@ -84,21 +207,14 @@ fn run_with_timeout(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| AdapterError::Other(e.to_string()))?;
-    let mut out_pipe = child.stdout.take().expect("piped");
-    let mut err_pipe = child.stderr.take().expect("piped");
-    let out_reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = out_pipe.read_to_end(&mut v);
-        v
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = err_pipe.read_to_end(&mut v);
-        v
-    });
+    let out_drain = spawn_pipe_drain(child.stdout.take().expect("piped"), cap);
+    let err_drain = spawn_pipe_drain(child.stderr.take().expect("piped"), cap);
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
-        match child.try_wait().map_err(|e| AdapterError::Other(e.to_string()))? {
+        match child
+            .try_wait()
+            .map_err(|e| AdapterError::Other(e.to_string()))?
+        {
             Some(s) => break s,
             None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -106,16 +222,14 @@ fn run_with_timeout(
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = out_reader.join();
-                let _ = err_reader.join();
                 return Err(AdapterError::Other(format!("{} timed out", bin)));
             }
         }
     };
     Ok(std::process::Output {
         status,
-        stdout: out_reader.join().unwrap_or_default(),
-        stderr: err_reader.join().unwrap_or_default(),
+        stdout: collect_drain(&out_drain, EOF_GRACE),
+        stderr: collect_drain(&err_drain, EOF_GRACE),
     })
 }
 
@@ -131,7 +245,12 @@ impl RepositoryHostAdapter for GithubAdapter {
         // `gh auth status` exits 0 when logged in but writes its report to
         // STDERR — stdout is empty either way, so `gh_text` would always
         // report "not authenticated".
-        let out = run_with_timeout(&self.gh_bin, &self.work_dir, &["auth", "status"], CMD_TIMEOUT)?;
+        let out = run_with_timeout(
+            &self.gh_bin,
+            &self.work_dir,
+            &["auth", "status"],
+            CMD_TIMEOUT,
+        )?;
         let text = String::from_utf8_lossy(&out.stderr).to_string();
         if out.status.success() && (text.contains("Logged in") || text.contains("account ")) {
             Ok(AuthSession {
@@ -146,7 +265,10 @@ impl RepositoryHostAdapter for GithubAdapter {
 
     fn repository_metadata(&self) -> Result<RepositoryMetadata, AdapterError> {
         let text = self.gh_text(&[
-            "repo", "view", "--json", "nameWithOwner,defaultBranchRef,url",
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner,defaultBranchRef,url",
         ])?;
         let full_name = extract_json_field(&text, "nameWithOwner");
         let default_branch = extract_json_field(&text, "defaultBranchRef");
@@ -169,14 +291,28 @@ impl RepositoryHostAdapter for GithubAdapter {
                 let title = extract_json_field(obj, "title");
                 let state = extract_json_field(obj, "state");
                 let html_url = extract_json_field(obj, "url");
-                prs.push(PullRequest { number, title, state, html_url });
+                prs.push(PullRequest {
+                    number,
+                    title,
+                    state,
+                    html_url,
+                });
             }
         }
         Ok(prs)
     }
 
     fn create_pull_request(&self, title: &str, body: &str) -> Result<PullRequest, AdapterError> {
-        let text = self.gh_text(&["pr", "create", "--title", title, "--body", body, "--json", "number,url"])?;
+        let text = self.gh_text(&[
+            "pr",
+            "create",
+            "--title",
+            title,
+            "--body",
+            body,
+            "--json",
+            "number,url",
+        ])?;
         let number = extract_json_int(&text, "number");
         let html_url = extract_json_field(&text, "url");
         Ok(PullRequest {
@@ -193,7 +329,10 @@ impl RepositoryHostAdapter for GithubAdapter {
         for line in git_text.lines() {
             let name = line.trim().to_string();
             if !name.is_empty() && !name.contains(" -> ") {
-                branches.push(RemoteBranch { name, sha: String::new() });
+                branches.push(RemoteBranch {
+                    name,
+                    sha: String::new(),
+                });
             }
         }
         Ok(branches)
@@ -301,17 +440,59 @@ fn json_unescape(s: &str) -> String {
     out
 }
 
+/// Find `needle` in `json` outside string literals. A plain `str::find` also
+/// matches inside a value: a PR titled `x","state":"MERGED` would inject a
+/// forged `"state":"MERGED` that the extractor then reads as a real field —
+/// `gh pr list` carries remote user input, so keys must only be recognized
+/// at structural positions.
+fn find_outside_strings(json: &str, needle: &str) -> Option<usize> {
+    let bytes = json.as_bytes();
+    let n = needle.as_bytes();
+    let mut in_str = false;
+    let mut escape = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            // A key position is also a string start — try the needle first:
+            // `"title":` both opens a string and is a key.
+            if bytes[i..].starts_with(n) {
+                return Some(i);
+            }
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(n) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Extract a string field from simple JSON (no serde dep for the adapter skeleton).
 fn extract_json_field(json: &str, field: &str) -> String {
     let needle = format!("\"{field}\":\"");
-    if let Some(start) = json.find(&needle) {
+    if let Some(start) = find_outside_strings(json, &needle) {
         let rest = &json[start + needle.len()..];
         if let Some(end) = json_string_end(rest) {
             return json_unescape(&rest[..end]);
         }
     }
     let needle2 = format!("\"{field}\":{{\"name\":\"");
-    if let Some(start) = json.find(&needle2) {
+    if let Some(start) = find_outside_strings(json, &needle2) {
         let rest = &json[start + needle2.len()..];
         if let Some(end) = json_string_end(rest) {
             return json_unescape(&rest[..end]);
@@ -323,7 +504,7 @@ fn extract_json_field(json: &str, field: &str) -> String {
 /// Extract an integer field from simple JSON.
 fn extract_json_int(json: &str, field: &str) -> u64 {
     let needle = format!("\"{field}\":");
-    if let Some(start) = json.find(&needle) {
+    if let Some(start) = find_outside_strings(json, &needle) {
         let rest = &json[start + needle.len()..];
         let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Ok(n) = num.parse() {
@@ -387,7 +568,8 @@ mod tests {
     /// must yield every object, not just the first line's.
     #[test]
     fn split_json_objects_compact_array() {
-        let json = r#"[{"number":1,"title":"a"},{"number":2,"title":"b"},{"number":3,"title":"c"}]"#;
+        let json =
+            r#"[{"number":1,"title":"a"},{"number":2,"title":"b"},{"number":3,"title":"c"}]"#;
         let objs = split_json_objects(json);
         assert_eq!(objs.len(), 3);
         assert_eq!(extract_json_int(objs[2], "number"), 3);
@@ -407,6 +589,28 @@ mod tests {
     fn extract_json_field_escaped_quote() {
         let json = r#"{"title":"say \"hi\" now"}"#;
         assert_eq!(extract_json_field(json, "title"), "say \"hi\" now");
+    }
+
+    /// A `"field":` sequence inside a STRING VALUE is user data, not a key —
+    /// `gh pr list` carries remote-controlled titles, so a forged
+    /// `","state":"MERGED` in a title must not become the reported state.
+    #[test]
+    fn extract_resists_key_injection_through_string_values() {
+        let obj = r#"{"number":7,"title":"x\",\"state\":\"FORGED","state":"OPEN","url":"u"}"#;
+        // Forged key inside the title string must be skipped; the real
+        // `"state"` after it is what we extract.
+        assert_eq!(extract_json_field(obj, "state"), "OPEN");
+        assert_eq!(extract_json_int(obj, "number"), 7);
+        // And a title field still resolves normally.
+        assert_eq!(extract_json_field(obj, "title"), "x\",\"state\":\"FORGED");
+    }
+
+    /// Nested-object form (`"defaultBranchRef":{"name":"main"}`) must also
+    /// ignore key-like text inside earlier string values.
+    #[test]
+    fn extract_nested_key_not_matched_inside_string() {
+        let obj = r#"{"title":"ref\":{\"name\":\"fake"},"defaultBranchRef":{"name":"main"}}"#;
+        assert_eq!(extract_json_field(obj, "defaultBranchRef"), "main");
     }
 
     /// An escaped backslash followed by a literal 'n' must decode to `\n`
@@ -430,8 +634,14 @@ mod tests {
     /// `extract_user` accepts both gh report formats.
     #[test]
     fn extract_user_both_formats() {
-        assert_eq!(extract_user("  ✓ Logged in to github.com account octocat"), "octocat");
-        assert_eq!(extract_user("  ✓ Logged in to github.com as monalisa (oauth_token)"), "monalisa");
+        assert_eq!(
+            extract_user("  ✓ Logged in to github.com account octocat"),
+            "octocat"
+        );
+        assert_eq!(
+            extract_user("  ✓ Logged in to github.com as monalisa (oauth_token)"),
+            "monalisa"
+        );
         assert_eq!(extract_user("You are not logged in"), "");
     }
 
@@ -439,6 +649,32 @@ mod tests {
     fn split_json_objects_empty_and_malformed() {
         assert!(split_json_objects("[]").is_empty());
         assert!(split_json_objects("not json").is_empty());
+    }
+
+    /// `find_on_path` must return an ABSOLUTE path — a relative hit would
+    /// resolve through the child's working directory on Windows
+    /// (CreateProcessW searches it before PATH), re-opening the planted-
+    /// `gh.exe`/`git.exe` hole this function exists to close.
+    #[test]
+    fn find_on_path_returns_absolute_hit() {
+        let dir = std::env::temp_dir().join(format!(
+            "womd-gh-path-{:016x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        let bin = dir.join("fake-tool.exe");
+        #[cfg(not(windows))]
+        let bin = dir.join("fake-tool");
+        std::fs::write(&bin, b"x").unwrap();
+        let found =
+            find_on_path("fake-tool", [dir.clone()].into_iter()).expect("binary must be found");
+        assert!(Path::new(&found).is_absolute(), "{found}");
+        assert!(find_on_path("no-such-tool-xyz", [dir.clone()].into_iter()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A wedged subprocess (dead remote, credential prompt on a non-existent
@@ -456,8 +692,13 @@ mod tests {
         #[cfg(not(windows))]
         let (bin, args) = ("sh", vec!["-c", "sleep 30"]);
         let start = std::time::Instant::now();
-        let err = run_with_timeout(bin, Path::new("."), &args, std::time::Duration::from_millis(400))
-            .expect_err("hung process must error");
+        let err = run_with_timeout(
+            bin,
+            Path::new("."),
+            &args,
+            std::time::Duration::from_millis(400),
+        )
+        .expect_err("hung process must error");
         assert!(err.to_string().contains("timed out"), "{}", err);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(10),
@@ -474,7 +715,10 @@ mod tests {
         #[cfg(windows)]
         let (bin, args) = (
             "cmd",
-            vec!["/c", "for /l %i in (1,1,5000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
+            vec![
+                "/c",
+                "for /l %i in (1,1,5000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ],
         );
         #[cfg(not(windows))]
         let (bin, args) = ("sh", vec!["-c", "yes | head -c 200000"]);
@@ -489,6 +733,34 @@ mod tests {
         // >64 KiB — enough to fill an OS pipe buffer and deadlock a naive
         // spawn+try_wait loop that doesn't drain.
         assert!(out.stdout.len() > 65_536, "len={}", out.stdout.len());
+    }
+
+    /// Output beyond the cap must be bounded: the child blocks on a full
+    /// pipe and is killed at the deadline — memory stays capped.
+    #[test]
+    fn output_beyond_cap_is_killed_not_buffered() {
+        #[cfg(windows)]
+        let (bin, args) = (
+            "powershell",
+            vec![
+                "-NoProfile",
+                "-Command",
+                "1..200000 | ForEach-Object { 'x' * 200 }",
+            ],
+        );
+        #[cfg(not(windows))]
+        let (bin, args) = ("sh", vec!["-c", "yes | head -c 40000000"]);
+        let start = std::time::Instant::now();
+        let err = run_with_timeout_capped(
+            bin,
+            Path::new("."),
+            &args,
+            std::time::Duration::from_secs(2),
+            4096, // tiny cap: writer blocks almost immediately
+        )
+        .expect_err("excess output must be killed");
+        assert!(err.to_string().contains("timed out"), "{}", err);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 
     /// A missing binary must produce an error, not a panic or a hang.

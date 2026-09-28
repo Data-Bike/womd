@@ -15,7 +15,9 @@ impl UrlOpener for SystemUrlOpener {
     fn open(&self, url: &str) -> Result<(), PlatformError> {
         // Security: only allow http, https, and mailto schemes (§86).
         if !is_safe_url(url) {
-            return Err(PlatformError::Os(format!("refusing to open URL with unsafe scheme: {url}")));
+            return Err(PlatformError::Os(format!(
+                "refusing to open URL with unsafe scheme: {url}"
+            )));
         }
         #[cfg(windows)]
         {
@@ -47,6 +49,11 @@ impl UrlOpener for SystemUrlOpener {
 /// Check that a URL uses a safe scheme (http, https, mailto) and has a non-empty host
 /// for http(s). Prevents command injection via `file://`, `javascript:`, etc. (§86).
 fn is_safe_url(url: &str) -> bool {
+    // Control characters (incl. NUL, \r, \n) must never reach the OS
+    // handler's argv — they can mangle command lines on some platforms.
+    if url.chars().any(|c| c.is_control()) {
+        return false;
+    }
     let lower = url.to_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
         // Must have a host after the scheme.
@@ -84,6 +91,10 @@ mod tests {
         assert!(!is_safe_url("mailto:"));
         assert!(!is_safe_url(" https://example.com"));
         assert!(!is_safe_url("\thttps://example.com"));
+        // Control characters inside otherwise-valid URLs are rejected.
+        assert!(!is_safe_url("https://example.com/\nfile:///etc"));
+        assert!(!is_safe_url("mailto:a@b.com\u{0}x"));
+        assert!(!is_safe_url("http://exa\rmple.com"));
     }
 
     #[test]

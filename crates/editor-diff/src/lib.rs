@@ -7,15 +7,15 @@
 
 #![forbid(unsafe_code)]
 
-mod myers;
-mod intraline;
 mod hunk;
+mod intraline;
+mod myers;
 mod semantic;
 
-pub use hunk::{group_into_hunks, Hunk, HunkConfig};
-pub use intraline::{intraline_diff, IntralineChange};
-pub use myers::{line_diff, LineChange, Operation};
-pub use semantic::{semantic_diff, SemanticChange, SemanticUnit};
+pub use hunk::{Hunk, HunkConfig, group_into_hunks};
+pub use intraline::{IntralineChange, intraline_diff};
+pub use myers::{LineChange, Operation, line_diff};
+pub use semantic::{SemanticChange, SemanticUnit, semantic_diff};
 
 use editor_domain::ByteOffset;
 

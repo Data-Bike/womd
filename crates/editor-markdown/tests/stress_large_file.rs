@@ -8,7 +8,10 @@ use std::time::Instant;
 #[test]
 #[ignore = "requires generated 100 MiB file; run explicitly"]
 fn stress_file_parses_and_roundtrips() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-data/womd-stress-100mb.md");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-data/womd-stress-100mb.md"
+    );
     if !std::path::Path::new(path).exists() {
         eprintln!("stress file not generated (node e2e/gen-stress-md.mjs); skipping");
         return;

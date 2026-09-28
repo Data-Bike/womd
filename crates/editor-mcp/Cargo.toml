@@ -1,0 +1,20 @@
+[package]
+name = "editor-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP (Model Context Protocol) server exposing sandboxed document authoring/editing tools to AI agents."
+
+[dependencies]
+editor-domain = { path = "../editor-domain" }
+editor-markdown = { path = "../editor-markdown" }
+editor-storage = { path = "../editor-storage" }
+editor-git = { path = "../editor-git" }
+serde_json = "1"
+regex = "1.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -25,10 +25,12 @@ pub use piece::{Piece, PieceSource, PieceTable};
 /// Convenience: number of Unicode scalar values in a UTF-8 slice.
 pub fn scalar_len(bytes: &[u8]) -> u64 {
     // `char_count` is O(n); used only for single-line column resolution (lines are short).
-    core::str::from_utf8(bytes).map(|s| s.chars().count() as u64).unwrap_or_else(|_| {
-        // Fall back to counting non-continuation bytes for invalid UTF-8 (defensive).
-        bytes.iter().filter(|b| *b & 0xC0 != 0x80).count() as u64
-    })
+    core::str::from_utf8(bytes)
+        .map(|s| s.chars().count() as u64)
+        .unwrap_or_else(|_| {
+            // Fall back to counting non-continuation bytes for invalid UTF-8 (defensive).
+            bytes.iter().filter(|b| *b & 0xC0 != 0x80).count() as u64
+        })
 }
 
 /// Convert a `ByteOffset` within this table to a `LineColumn` (column in scalars).
@@ -102,9 +104,29 @@ mod tests {
     fn line_column_past_eol_clamps_to_line_end() {
         let t = table(b"ab\ncd");
         // Line 0 has 2 scalars + newline; huge column clamps to next line start.
-        assert_eq!(line_column_to_byte(&t, LineColumn { line: LineIndex(0), column: ScalarIndex(99) }).0, 3);
+        assert_eq!(
+            line_column_to_byte(
+                &t,
+                LineColumn {
+                    line: LineIndex(0),
+                    column: ScalarIndex(99)
+                }
+            )
+            .0,
+            3
+        );
         // Last line clamps to document end, not the last byte.
-        assert_eq!(line_column_to_byte(&t, LineColumn { line: LineIndex(1), column: ScalarIndex(99) }).0, 5);
+        assert_eq!(
+            line_column_to_byte(
+                &t,
+                LineColumn {
+                    line: LineIndex(1),
+                    column: ScalarIndex(99)
+                }
+            )
+            .0,
+            5
+        );
     }
 
     #[test]
@@ -114,11 +136,27 @@ mod tests {
         // Columns 0..=3 land on scalar boundaries 0,1,3,7. Column past the end
         // clamps to the document end — never inside a multi-byte scalar.
         let boundaries: Vec<u64> = (0..=3u64)
-            .map(|c| line_column_to_byte(&t, LineColumn { line: LineIndex(0), column: ScalarIndex(c) }).0)
+            .map(|c| {
+                line_column_to_byte(
+                    &t,
+                    LineColumn {
+                        line: LineIndex(0),
+                        column: ScalarIndex(c),
+                    },
+                )
+                .0
+            })
             .collect();
         assert_eq!(boundaries, vec![0, 1, 3, 7]);
         assert_eq!(
-            line_column_to_byte(&t, LineColumn { line: LineIndex(0), column: ScalarIndex(99) }).0,
+            line_column_to_byte(
+                &t,
+                LineColumn {
+                    line: LineIndex(0),
+                    column: ScalarIndex(99)
+                }
+            )
+            .0,
             t.len()
         );
     }
@@ -126,7 +164,27 @@ mod tests {
     #[test]
     fn line_column_empty_line() {
         let t = table(b"a\n\nb");
-        assert_eq!(line_column_to_byte(&t, LineColumn { line: LineIndex(1), column: ScalarIndex(0) }).0, 2);
-        assert_eq!(line_column_to_byte(&t, LineColumn { line: LineIndex(1), column: ScalarIndex(5) }).0, 3);
+        assert_eq!(
+            line_column_to_byte(
+                &t,
+                LineColumn {
+                    line: LineIndex(1),
+                    column: ScalarIndex(0)
+                }
+            )
+            .0,
+            2
+        );
+        assert_eq!(
+            line_column_to_byte(
+                &t,
+                LineColumn {
+                    line: LineIndex(1),
+                    column: ScalarIndex(5)
+                }
+            )
+            .0,
+            3
+        );
     }
 }

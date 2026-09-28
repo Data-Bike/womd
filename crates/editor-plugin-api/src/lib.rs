@@ -93,11 +93,24 @@ pub trait RepositoryHostAdapter {
 }
 
 /// Authentication session returned by a provider.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is manual: a derived impl would print `token` into logs and error
+/// messages (same rule as `editor_git::Credentials`, §87).
+#[derive(Clone)]
 pub struct AuthSession {
     pub provider: ProviderId,
     pub user: String,
     pub token: String,
+}
+
+impl core::fmt::Debug for AuthSession {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AuthSession")
+            .field("provider", &self.provider)
+            .field("user", &self.user)
+            .field("token", &"***")
+            .finish()
+    }
 }
 
 /// Repository metadata from a hosting provider.
@@ -196,4 +209,23 @@ pub enum EventKind {
     ThemeChanged,
     PluginActivated,
     PluginDeactivated,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A derived Debug would leak the bearer token into logs (§87).
+    #[test]
+    fn auth_session_debug_redacts_token() {
+        let s = AuthSession {
+            provider: ProviderId("github".into()),
+            user: "octocat".into(),
+            token: "ghp_secret-token-value".into(),
+        };
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("ghp_secret-token-value"), "{dbg}");
+        assert!(dbg.contains("***"));
+        assert!(dbg.contains("octocat"));
+    }
 }

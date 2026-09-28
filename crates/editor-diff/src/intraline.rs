@@ -35,7 +35,11 @@ fn tokenize(s: &[u8]) -> Vec<Token> {
         while i < s.len() && is_word_byte(s[i]) == is_word {
             i += 1;
         }
-        out.push(Token { is_word, start, end: i });
+        out.push(Token {
+            is_word,
+            start,
+            end: i,
+        });
     }
     out
 }
@@ -91,8 +95,16 @@ pub fn intraline_diff(old: &[u8], new: &[u8]) -> Vec<IntralineChange> {
             li += 1;
         } else {
             // Mismatch: extend the pending change on the non-matching side(s).
-            let old_pos = if oi < old_toks.len() { old_toks[oi].start } else { old.len() };
-            let new_pos = if ni < new_toks.len() { new_toks[ni].start } else { new.len() };
+            let old_pos = if oi < old_toks.len() {
+                old_toks[oi].start
+            } else {
+                old.len()
+            };
+            let new_pos = if ni < new_toks.len() {
+                new_toks[ni].start
+            } else {
+                new.len()
+            };
             let (os, ns) = match cur {
                 Some((os, _, ns, _)) => (os, ns),
                 None => (old_pos, new_pos),
@@ -103,8 +115,16 @@ pub fn intraline_diff(old: &[u8], new: &[u8]) -> Vec<IntralineChange> {
             if ni < new_toks.len() && !new_match {
                 ni += 1;
             }
-            let oe = if oi < old_toks.len() { old_toks[oi].start } else { old.len() };
-            let ne = if ni < new_toks.len() { new_toks[ni].start } else { new.len() };
+            let oe = if oi < old_toks.len() {
+                old_toks[oi].start
+            } else {
+                old.len()
+            };
+            let ne = if ni < new_toks.len() {
+                new_toks[ni].start
+            } else {
+                new.len()
+            };
             cur = Some((os, oe, ns, ne));
         }
     }
@@ -169,8 +189,14 @@ mod tests {
         let changes = intraline_diff(old, new);
         assert_eq!(changes.len(), 1, "expected one change, got {changes:?}");
         let c = &changes[0];
-        assert_eq!(&old[c.old_range.start.0 as usize..c.old_range.end.0 as usize], b"brown");
-        assert_eq!(&new[c.new_range.start.0 as usize..c.new_range.end.0 as usize], b"red");
+        assert_eq!(
+            &old[c.old_range.start.0 as usize..c.old_range.end.0 as usize],
+            b"brown"
+        );
+        assert_eq!(
+            &new[c.new_range.start.0 as usize..c.new_range.end.0 as usize],
+            b"red"
+        );
     }
 
     #[test]
@@ -184,7 +210,11 @@ mod tests {
         // Inserted region is "cruel " (word + trailing space) or " cruel" — accept either
         // as long as it contains "cruel".
         let inserted = &new[c.new_range.start.0 as usize..c.new_range.end.0 as usize];
-        assert!(inserted.windows(5).any(|w| w == b"cruel"), "inserted={:?}", inserted);
+        assert!(
+            inserted.windows(5).any(|w| w == b"cruel"),
+            "inserted={:?}",
+            inserted
+        );
     }
 
     #[test]

@@ -62,7 +62,11 @@ pub fn analyze_context(prefix: &[u8], chunk: &ByteChunk) -> ChunkContext {
     if let Some(last_line) = last_non_blank_line(prefix) {
         let stripped = &last_line[leading_spaces(last_line).min(last_line.len())..];
         if stripped.starts_with(b">") {
-            ctx.block_quote_depth = stripped.iter().take_while(|&&b| b == b'>' || b == b' ').filter(|&&b| b == b'>').count() as u32;
+            ctx.block_quote_depth = stripped
+                .iter()
+                .take_while(|&&b| b == b'>' || b == b' ')
+                .filter(|&&b| b == b'>')
+                .count() as u32;
         }
     }
 
@@ -114,11 +118,7 @@ fn fence_char_and_len(s: &[u8]) -> Option<(u8, usize)> {
         return None;
     }
     let n = s.iter().take_while(|&&b| b == c).count();
-    if n >= 3 {
-        Some((c, n))
-    } else {
-        None
-    }
+    if n >= 3 { Some((c, n)) } else { None }
 }
 
 fn last_non_blank_line(bytes: &[u8]) -> Option<&[u8]> {
@@ -246,7 +246,12 @@ mod tests {
     use editor_domain::ByteOffset;
 
     fn chunk(start: u64, bytes: &[u8]) -> ByteChunk {
-        ByteChunk { start_offset: ByteOffset(start), bytes: bytes.to_vec(), leading_partial: true, trailing_partial: true }
+        ByteChunk {
+            start_offset: ByteOffset(start),
+            bytes: bytes.to_vec(),
+            leading_partial: true,
+            trailing_partial: true,
+        }
     }
 
     #[test]
@@ -315,7 +320,10 @@ mod tests {
     fn shorter_run_does_not_close_fence() {
         let prefix = b"`````\ncode\n```\nmore code\n";
         let ctx = analyze_context(prefix, &chunk(20, b"still inside\n"));
-        assert!(ctx.inside_fenced_code, "3-tick line cannot close a 5-tick fence");
+        assert!(
+            ctx.inside_fenced_code,
+            "3-tick line cannot close a 5-tick fence"
+        );
     }
 
     /// A closing run LONGER than the opener still closes the block.
@@ -344,7 +352,10 @@ mod tests {
     fn indented_line_after_paragraph_is_not_code() {
         let prefix = b"para text\n    continuation of para\n";
         let ctx = analyze_context(prefix, &chunk(35, b"next\n"));
-        assert!(!ctx.inside_indented_code, "paragraph continuation is not code");
+        assert!(
+            !ctx.inside_indented_code,
+            "paragraph continuation is not code"
+        );
     }
 
     /// The same indented line after a BLANK separator IS indented code.
@@ -381,7 +392,10 @@ mod tests {
     fn fence_with_info_inside_block_is_content() {
         let prefix = b"```\ncode\n```rust\nmore\n";
         let ctx = analyze_context(prefix, &chunk(15, b"next\n"));
-        assert!(ctx.inside_fenced_code, "a ```rust line cannot close a fence");
+        assert!(
+            ctx.inside_fenced_code,
+            "a ```rust line cannot close a fence"
+        );
     }
 
     /// An indented continuation line inside a list item is still inside the

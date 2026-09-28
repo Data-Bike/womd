@@ -37,7 +37,12 @@ fn serialize_block(block: &Block, source: &[u8], out: &mut Vec<u8>) {
 }
 
 fn emit_span(span: SourceSpan, source: &[u8], out: &mut Vec<u8>) {
-    out.extend_from_slice(&source[span.start.0 as usize..span.end.0 as usize]);
+    // Clamp rather than slice raw: a span made stale by rebase_spans_after
+    // (a large negative delta can push `end` below `start`, or both past
+    // the buffer) must degrade to emitting less, never panic the caller.
+    let st = (span.start.0 as usize).min(source.len());
+    let e = (span.end.0 as usize).min(source.len()).max(st);
+    out.extend_from_slice(&source[st..e]);
 }
 
 /// Re-emit the line ending that terminated the original span (`\n`, `\r\n`, or
@@ -83,7 +88,11 @@ fn regenerate_block(block: &Block, source: &[u8], out: &mut Vec<u8>) {
                 out.extend_from_slice(serialize_inlines_src(&h.inlines, source).as_bytes());
                 out.push(b'\n');
                 let underline = if h.level == 1 { b'=' } else { b'-' };
-                let ulen = if h.setext_underline_len > 0 { h.setext_underline_len } else { 3 };
+                let ulen = if h.setext_underline_len > 0 {
+                    h.setext_underline_len
+                } else {
+                    3
+                };
                 for _ in 0..ulen {
                     out.push(underline);
                 }
@@ -96,9 +105,13 @@ fn regenerate_block(block: &Block, source: &[u8], out: &mut Vec<u8>) {
         Block::BlockQuote(bq) => {
             regenerate_block_quote(bq, source, out);
         }
-        Block::CodeBlock(_) | Block::Table(_) | Block::HtmlBlock(_)
-        | Block::LinkReferenceDefinition(_) | Block::UnknownBlock(_)
-        | Block::ThematicBreak(_) | Block::BlankLine(_) => {
+        Block::CodeBlock(_)
+        | Block::Table(_)
+        | Block::HtmlBlock(_)
+        | Block::LinkReferenceDefinition(_)
+        | Block::UnknownBlock(_)
+        | Block::ThematicBreak(_)
+        | Block::BlankLine(_) => {
             // Fallback: emit verbatim. Regeneration for these node types is a follow-up;
             // edits to them currently go through the PieceTable byte-level path which is
             // already minimal-diff.
@@ -187,7 +200,11 @@ fn de_mark_quote_source(raw: &[u8]) -> Vec<u8> {
         // it is content (`> a\n    ---` is paragraph text inside the quote).
         let s = if s.first() == Some(&b'>') {
             let after = &s[1..];
-            if after.first() == Some(&b' ') { &after[1..] } else { after }
+            if after.first() == Some(&b' ') {
+                &after[1..]
+            } else {
+                after
+            }
         } else {
             content
         };
@@ -215,7 +232,10 @@ fn de_mark_item_source(raw: &[u8], ordered: bool) -> Vec<u8> {
                 1
             };
             let after = &s[marker_len.min(s.len())..];
-            let ws = after.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+            let ws = after
+                .iter()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .count();
             strip = ind + marker_len + ws;
             let rest = &content[strip.min(content.len())..];
             if rest.starts_with(b"[ ] ") || rest.starts_with(b"[x] ") || rest.starts_with(b"[X] ") {
@@ -360,9 +380,13 @@ fn serialize_block_with_indent(block: &Block, source: &[u8], out: &mut Vec<u8>, 
             }
         }
     } else {
-        // Emit verbatim, applying indent to each line.
+        // Emit verbatim, applying indent to each line. `get` instead of a
+        // bare slice: a stale span (e.g. shifted past the buffer end by an
+        // incremental-reparse splice) must not panic the serializer.
         let span = meta.span;
-        let bytes = &source[span.start.0 as usize..span.end.0 as usize];
+        let bytes = source
+            .get(span.start.0 as usize..span.end.0 as usize)
+            .unwrap_or(&[]);
         let text = String::from_utf8_lossy(bytes);
         for line in iter_lines(&text) {
             for _ in 0..indent {
@@ -407,13 +431,21 @@ fn serialize_inline(il: &Inline, source: &[u8], s: &mut String) {
     match il {
         Inline::Text(_, t) => s.push_str(t),
         Inline::Emphasis(_, children, kind) => {
-            let d = if *kind == EmphasisKind::Asterisk { "*" } else { "_" };
+            let d = if *kind == EmphasisKind::Asterisk {
+                "*"
+            } else {
+                "_"
+            };
             s.push_str(d);
             s.push_str(&serialize_inlines_src(children, source));
             s.push_str(d);
         }
         Inline::Strong(_, children, kind) => {
-            let d = if *kind == EmphasisKind::Asterisk { "**" } else { "__" };
+            let d = if *kind == EmphasisKind::Asterisk {
+                "**"
+            } else {
+                "__"
+            };
             s.push_str(d);
             s.push_str(&serialize_inlines_src(children, source));
             s.push_str(d);
@@ -526,7 +558,10 @@ pub fn toggle_task_item(source: &[u8], item: &ListItem) -> Option<Vec<u8>> {
     // The checkbox sits on the item's first line, directly after the list
     // marker — searching the whole span would hit a literal `[ ]` inside
     // code spans or text of a non-task item.
-    let first_line_end = region.iter().position(|&b| b == b'\n').unwrap_or(region.len());
+    let first_line_end = region
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(region.len());
     let first_line = &region[..first_line_end];
     let marker_pos = first_line
         .windows(3)
@@ -535,11 +570,16 @@ pub fn toggle_task_item(source: &[u8], item: &ListItem) -> Option<Vec<u8>> {
             // Everything before `[` must be indent + list marker + whitespace.
             let prefix = &first_line[..pos];
             let prefix = &prefix[prefix.iter().take_while(|&&b| b == b' ').count()..];
-            let after_marker = if prefix.first() == Some(&b'-') || prefix.first() == Some(&b'*') || prefix.first() == Some(&b'+') {
+            let after_marker = if prefix.first() == Some(&b'-')
+                || prefix.first() == Some(&b'*')
+                || prefix.first() == Some(&b'+')
+            {
                 &prefix[1..]
             } else {
                 let digits = prefix.iter().take_while(|b| b.is_ascii_digit()).count();
-                if digits > 0 && (prefix.get(digits) == Some(&b'.') || prefix.get(digits) == Some(&b')')) {
+                if digits > 0
+                    && (prefix.get(digits) == Some(&b'.') || prefix.get(digits) == Some(&b')'))
+                {
                     &prefix[digits + 1..]
                 } else {
                     return false;
@@ -575,7 +615,9 @@ pub fn replace_text_run(
         return None; // stale span
     }
     let region = &source[st..e];
-    let pos = region.windows(old.len()).position(|w| w == old.as_bytes())?;
+    let pos = region
+        .windows(old.len())
+        .position(|w| w == old.as_bytes())?;
     let abs = para_span.start.0 as usize + pos;
     let mut out = source.to_vec();
     let old_bytes = old.as_bytes();
@@ -606,11 +648,14 @@ pub fn rebase_spans_after(doc: &mut Document, from: ByteOffset, delta: i64) {
 #[cfg(test)]
 mod dirty_tests {
     use super::*;
-    use crate::ast::{Block, BlockQuote, Inline, List, ListItem, NodeMeta, Paragraph, TaskState};
     use crate::SourceSpan;
+    use crate::ast::{Block, BlockQuote, Inline, List, ListItem, NodeMeta, Paragraph, TaskState};
 
     fn meta(span_end: u64) -> NodeMeta {
-        NodeMeta { span: SourceSpan::new(ByteOffset(0), ByteOffset(span_end)), dirty: true }
+        NodeMeta {
+            span: SourceSpan::new(ByteOffset(0), ByteOffset(span_end)),
+            dirty: true,
+        }
     }
 
     fn text_node(s: &str) -> Inline {
@@ -648,8 +693,14 @@ mod dirty_tests {
         let mut out = Vec::new();
         serialize_block(&block, b"", &mut out);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("- First"), "first item marker should be present: {text}");
-        assert!(text.contains("- [x] Second"), "second item with task should be present: {text}");
+        assert!(
+            text.contains("- First"),
+            "first item marker should be present: {text}"
+        );
+        assert!(
+            text.contains("- [x] Second"),
+            "second item with task should be present: {text}"
+        );
     }
 
     #[test]
@@ -710,7 +761,10 @@ mod dirty_tests {
         let mut out = Vec::new();
         serialize_block(&block, b"", &mut out);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("3) Item"), "paren marker must be preserved: {text}");
+        assert!(
+            text.contains("3) Item"),
+            "paren marker must be preserved: {text}"
+        );
     }
 
     /// A header row consisting of a bare `|` produced an inverted cell span
@@ -719,7 +773,8 @@ mod dirty_tests {
     #[test]
     fn degenerate_table_row_does_not_panic() {
         let src = b"|\n---\n";
-        let doc = crate::parse(src, editor_domain::MarkdownProfile::Gfm).expect("parse must not panic");
+        let doc =
+            crate::parse(src, editor_domain::MarkdownProfile::Gfm).expect("parse must not panic");
         let out = serialize(&doc, src);
         assert_eq!(out, src);
     }
@@ -735,7 +790,10 @@ mod dirty_tests {
             b.meta_mut().dirty = true;
         }
         let out = serialize(&doc, src);
-        assert_eq!(out, src, "dirty regeneration must keep line endings and escapes");
+        assert_eq!(
+            out, src,
+            "dirty regeneration must keep line endings and escapes"
+        );
     }
 
     /// `windows(0)` panics — an empty needle must be rejected up front.
@@ -759,7 +817,10 @@ mod dirty_tests {
         let mut out = Vec::new();
         serialize_block(&block, b"", &mut out);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("> Quoted"), "block quote prefix should be present: {text}");
+        assert!(
+            text.contains("> Quoted"),
+            "block quote prefix should be present: {text}"
+        );
     }
 
     /// `split_inclusive('\n')` sees a bare-CR document as ONE line — only the
@@ -767,11 +828,20 @@ mod dirty_tests {
     #[test]
     fn de_mark_source_handles_bare_cr_lines() {
         assert_eq!(de_mark_quote_source(b"> a\r> b\r"), b"a\rb\r".to_vec());
-        assert_eq!(de_mark_quote_source(b"> a\r\n> b\r\n"), b"a\r\nb\r\n".to_vec());
+        assert_eq!(
+            de_mark_quote_source(b"> a\r\n> b\r\n"),
+            b"a\r\nb\r\n".to_vec()
+        );
         // List item: first line strips the "- " marker, continuation lines
         // strip the content indent.
-        assert_eq!(de_mark_item_source(b"- a\r  b\r", false), b"a\rb\r".to_vec());
-        assert_eq!(de_mark_item_source(b"- a\r\n  b\r\n", false), b"a\r\nb\r\n".to_vec());
+        assert_eq!(
+            de_mark_item_source(b"- a\r  b\r", false),
+            b"a\rb\r".to_vec()
+        );
+        assert_eq!(
+            de_mark_item_source(b"- a\r\n  b\r\n", false),
+            b"a\r\nb\r\n".to_vec()
+        );
     }
 
     /// A dirty quote in a bare-CR document must regenerate `> ` on every
@@ -790,6 +860,28 @@ mod dirty_tests {
         assert_eq!(lines.len(), 2, "expected two regenerated lines: {text:?}");
         assert!(lines.iter().all(|l| l.starts_with("> ")), "{text}");
         // No stray bare-CR may survive inside a regenerated line.
-        assert!(!lines[0].contains('\r') && !lines[1].contains('\r'), "{text}");
+        assert!(
+            !lines[0].contains('\r') && !lines[1].contains('\r'),
+            "{text}"
+        );
+    }
+
+    /// A span pushed out of bounds (e.g. `rebase_spans_after` with a large
+    /// negative delta collapsing `end` below `start`, or a splice shifting
+    /// the tail past the buffer) must degrade to emitting less — never
+    /// panic `serialize` via a raw `source[start..end]` slice.
+    #[test]
+    fn stale_spans_do_not_panic() {
+        let src = b"para one\n\npara two\n\npara three\n";
+        let mut doc = crate::parse(src, editor_domain::MarkdownProfile::Gfm).expect("parse");
+        // Simulate a stale span: invert the middle block and blow the last
+        // block's span past the buffer end.
+        let mid = doc.blocks[1].meta_mut();
+        mid.span.start = editor_domain::ByteOffset(20);
+        mid.span.end = editor_domain::ByteOffset(5); // end < start
+        let last = doc.blocks[2].meta_mut();
+        last.span.end = editor_domain::ByteOffset(u64::MAX);
+        // Must not panic; emits whatever survives the clamps.
+        let _ = serialize(&doc, src);
     }
 }

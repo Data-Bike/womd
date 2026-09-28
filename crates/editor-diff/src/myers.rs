@@ -17,7 +17,11 @@ pub enum Operation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineChange {
     /// Line present on both sides with identical content.
-    Equal { old_no: u32, new_no: u32, bytes: Vec<u8> },
+    Equal {
+        old_no: u32,
+        new_no: u32,
+        bytes: Vec<u8>,
+    },
     /// Line present only on the old side.
     Delete { old_no: u32, bytes: Vec<u8> },
     /// Line present only on the new side.
@@ -34,7 +38,9 @@ impl LineChange {
     }
     pub fn bytes(&self) -> &[u8] {
         match self {
-            Self::Equal { bytes, .. } | Self::Delete { bytes, .. } | Self::Insert { bytes, .. } => bytes,
+            Self::Equal { bytes, .. } | Self::Delete { bytes, .. } | Self::Insert { bytes, .. } => {
+                bytes
+            }
         }
     }
 }
@@ -138,7 +144,9 @@ fn myers_edit_script(a: &[&[u8]], b: &[&[u8]]) -> Vec<Step> {
     for d in 0..=max_d {
         trace.push(v.clone());
         for k in (-d..=d).step_by(2) {
-            let mut x = if k == -d || (k != d && v[(k - 1 + offset) as usize] < v[(k + 1 + offset) as usize]) {
+            let mut x = if k == -d
+                || (k != d && v[(k - 1 + offset) as usize] < v[(k + 1 + offset) as usize])
+            {
                 v[(k + 1 + offset) as usize]
             } else {
                 v[(k - 1 + offset) as usize] + 1
@@ -174,11 +182,12 @@ fn backtrack(trace: &[Vec<i64>], a: &[&[u8]], b: &[&[u8]], last_d: i64) -> Vec<S
     for d in (1..=last_d).rev() {
         let v = &trace[d as usize];
         let k = x - y;
-        let prev_k = if k == -d || (k != d && v[(k - 1 + offset) as usize] < v[(k + 1 + offset) as usize]) {
-            k + 1
-        } else {
-            k - 1
-        };
+        let prev_k =
+            if k == -d || (k != d && v[(k - 1 + offset) as usize] < v[(k + 1 + offset) as usize]) {
+                k + 1
+            } else {
+                k - 1
+            };
         let prev_x = v[(prev_k + offset) as usize];
         let prev_y = prev_x - prev_k;
 
@@ -228,16 +237,26 @@ fn script_to_changes(a: &[&[u8]], b: &[&[u8]], script: &[Step], base: u32) -> Ve
     for &s in script {
         match s {
             Step::Equal => {
-                out.push(LineChange::Equal { old_no: base + i + 1, new_no: base + j + 1, bytes: a[i as usize].to_vec() });
+                out.push(LineChange::Equal {
+                    old_no: base + i + 1,
+                    new_no: base + j + 1,
+                    bytes: a[i as usize].to_vec(),
+                });
                 i += 1;
                 j += 1;
             }
             Step::Delete => {
-                out.push(LineChange::Delete { old_no: base + i + 1, bytes: a[i as usize].to_vec() });
+                out.push(LineChange::Delete {
+                    old_no: base + i + 1,
+                    bytes: a[i as usize].to_vec(),
+                });
                 i += 1;
             }
             Step::Insert => {
-                out.push(LineChange::Insert { new_no: base + j + 1, bytes: b[j as usize].to_vec() });
+                out.push(LineChange::Insert {
+                    new_no: base + j + 1,
+                    bytes: b[j as usize].to_vec(),
+                });
                 j += 1;
             }
         }
@@ -266,7 +285,11 @@ mod tests {
         let a = b"line1\nline2\nline3\n";
         let changes = line_diff(a, a);
         assert_eq!(changes_summary(&changes), "===");
-        assert!(changes.iter().all(|c| matches!(c, LineChange::Equal { .. })));
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c, LineChange::Equal { .. }))
+        );
     }
 
     #[test]
@@ -275,8 +298,14 @@ mod tests {
         let new = b"a\nb\nc\n";
         let changes = line_diff(old, new);
         // Two equal lines (a, b) then one inserted line (c).
-        let equals = changes.iter().filter(|c| matches!(c, LineChange::Equal { .. })).count();
-        let inserts: Vec<_> = changes.iter().filter(|c| matches!(c, LineChange::Insert { .. })).collect();
+        let equals = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Equal { .. }))
+            .count();
+        let inserts: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Insert { .. }))
+            .collect();
         assert_eq!(equals, 2);
         assert_eq!(inserts.len(), 1);
         assert_eq!(inserts[0].bytes(), b"c");
@@ -287,7 +316,10 @@ mod tests {
         let old = b"a\nb\nc\n";
         let new = b"a\nc\n";
         let changes = line_diff(old, new);
-        let deletes: Vec<_> = changes.iter().filter(|c| matches!(c, LineChange::Delete { .. })).collect();
+        let deletes: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Delete { .. }))
+            .collect();
         assert_eq!(deletes.len(), 1);
         assert_eq!(deletes[0].bytes(), b"b");
     }
@@ -297,8 +329,14 @@ mod tests {
         let old = b"The quick brown fox\n";
         let new = b"The quick red fox\n";
         let changes = line_diff(old, new);
-        let d: Vec<_> = changes.iter().filter(|c| matches!(c, LineChange::Delete { .. })).collect();
-        let i: Vec<_> = changes.iter().filter(|c| matches!(c, LineChange::Insert { .. })).collect();
+        let d: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Delete { .. }))
+            .collect();
+        let i: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Insert { .. }))
+            .collect();
         assert_eq!(d.len(), 1);
         assert_eq!(i.len(), 1);
         assert_eq!(d[0].bytes(), b"The quick brown fox");
@@ -318,7 +356,11 @@ mod tests {
         let old = b"a\r\nb\r\n";
         let new = b"a\nb\n";
         let changes = line_diff(old, new);
-        assert!(changes.iter().all(|c| matches!(c, LineChange::Equal { .. })));
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c, LineChange::Equal { .. }))
+        );
     }
 
     /// Two large inputs with zero common lines must hit the trace-budget
@@ -328,16 +370,28 @@ mod tests {
     fn disjoint_large_inputs_hit_bounded_fallback() {
         // 3000 + 3000 disjoint lines: D=6000 exceeds the trace budget, so the
         // algorithm must degrade to the coarse (all-delete, all-insert) script.
-        let old: Vec<u8> = (0..3000).flat_map(|i| format!("old-{i}\n").into_bytes()).collect();
-        let new: Vec<u8> = (0..3000).flat_map(|i| format!("new-{i}\n").into_bytes()).collect();
+        let old: Vec<u8> = (0..3000)
+            .flat_map(|i| format!("old-{i}\n").into_bytes())
+            .collect();
+        let new: Vec<u8> = (0..3000)
+            .flat_map(|i| format!("new-{i}\n").into_bytes())
+            .collect();
         let changes = line_diff(&old, &new);
-        let deletes = changes.iter().filter(|c| matches!(c, LineChange::Delete { .. })).count();
-        let inserts = changes.iter().filter(|c| matches!(c, LineChange::Insert { .. })).count();
+        let deletes = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Delete { .. }))
+            .count();
+        let inserts = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Insert { .. }))
+            .count();
         assert_eq!(deletes, 3000, "every old line must be deleted");
         assert_eq!(inserts, 3000, "every new line must be inserted");
         // Line numbers stay 1-based and ordered.
         for (i, c) in changes.iter().enumerate().take(3000) {
-            let LineChange::Delete { old_no, .. } = c else { panic!("delete expected") };
+            let LineChange::Delete { old_no, .. } = c else {
+                panic!("delete expected")
+            };
             assert_eq!(*old_no as usize, i + 1);
         }
     }
@@ -362,9 +416,14 @@ mod tests {
             .filter(|c| matches!(c, LineChange::Insert { .. }))
             .collect();
         assert_eq!(inserts.len(), 1);
-        let LineChange::Insert { new_no, .. } = inserts[0] else { unreachable!() };
+        let LineChange::Insert { new_no, .. } = inserts[0] else {
+            unreachable!()
+        };
         assert_eq!(*new_no, 251, "inserted line is new-side line 251");
-        let equals = changes.iter().filter(|c| matches!(c, LineChange::Equal { .. })).count();
+        let equals = changes
+            .iter()
+            .filter(|c| matches!(c, LineChange::Equal { .. }))
+            .count();
         assert_eq!(equals, 500);
     }
 }
