@@ -1,6 +1,8 @@
 // AST-based Markdown rendering, ported from the legacy vanilla frontend.
 
 import katex from 'katex';
+import { diagramKind, renderAsyncBlockHtml } from './lib/diagram.js';
+import { citationKind, renderCitationText } from './lib/citations.js';
 
 export function escapeHtml(s) {
   return String(s)
@@ -91,8 +93,11 @@ export function renderAstNode(node) {
       return `<blockquote>${renderAstChildren(node.children)}</blockquote>`;
     case "List":
       return renderAstList(node);
-    case "CodeBlock":
+    case "CodeBlock": {
+      const kind = diagramKind(node.language) || citationKind(node.language);
+      if (kind) return renderAsyncBlockHtml(kind, node.content);
       return `<pre><code${node.language ? ` class="language-${escapeAttr(node.language)}"` : ""}>${escapeHtml(node.content)}</code></pre>`;
+    }
     case "Table":
       return renderAstTable(node);
     case "HtmlBlock":
@@ -104,7 +109,7 @@ export function renderAstNode(node) {
     case "Math":
       return renderMath(node.content, node.display);
     case "Text":
-      return escapeHtml(node.text);
+      return renderCitationText(node.text);
     case "Emphasis":
       return `<em>${renderAstChildren(node.children)}</em>`;
     case "Strong":

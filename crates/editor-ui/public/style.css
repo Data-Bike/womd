@@ -418,6 +418,51 @@ body {
 .md-block img { max-width: 100%; border-radius: 4px; }
 .md-block .task-item { display: flex; align-items: center; }
 
+/* Diagram blocks (mermaid / bpmn / plantuml / svg) */
+/* Engines draw dark strokes/text on a transparent background — on the dark
+   app themes that is near-invisible, so diagrams get a light panel (the
+   GitHub approach) that reads the same under every theme. */
+.md-block .diagram { overflow-x: auto; }
+.md-block .diagram-mermaid, .md-block .diagram-bpmn, .md-block .diagram-plantuml {
+  background: #ffffff; color: #1e1e2e; border-radius: 6px; padding: 12px;
+}
+.md-block .diagram svg { max-width: 100%; height: auto; }
+.md-block img.diagram-svg { display: block; }
+.md-block .diagram-pending {
+  margin: 0; padding: 12px 16px; background: var(--bg-toolbar); border-radius: 6px;
+  overflow-x: auto; color: var(--fg-muted); font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+  font-size: 13px; line-height: 1.5; white-space: pre;
+}
+.md-block .diagram-error { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.md-block .diagram-error-msg { padding: 6px 12px; color: #f38ba8; font-size: 12px; background: var(--bg-toolbar); }
+.md-block .diagram-error-source {
+  margin: 0; padding: 12px 16px; font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+  font-size: 13px; line-height: 1.5; white-space: pre; overflow-x: auto;
+}
+
+/* Bibliography blocks (```bibtex / ```ris / ```csl-json) */
+.md-block .bibliography {
+  border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+}
+.md-block .bibliography-head {
+  padding: 6px 12px; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--fg-muted); background: var(--bg-toolbar); border-bottom: 1px solid var(--border);
+}
+.md-block .csl-bib-body { padding: 10px 16px; }
+.md-block .csl-bib-body .csl-entry { margin: 0.25em 0; line-height: 1.5; }
+.md-block .csl-bib-body.csl-hanging .csl-entry { padding-left: 1.6em; text-indent: -1.6em; }
+.md-block .csl-bib-body a { color: var(--link); }
+
+/* [@key] citation chips */
+.cite-chip {
+  display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 0.92em;
+  background: rgba(137, 180, 250, 0.14); color: var(--link); cursor: help;
+  border: 1px solid rgba(137, 180, 250, 0.25);
+}
+.cite-chip.cite-unresolved {
+  background: rgba(243, 138, 168, 0.10); color: #f38ba8; border-color: rgba(243, 138, 168, 0.3);
+}
+
 /* Empty placeholder */
 .md-block.empty-block { color: var(--fg-muted); font-style: italic; }
 

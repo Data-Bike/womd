@@ -10,6 +10,9 @@ import {
   makeImage,
   makeTable,
   wrapCodeBlock,
+  blockTakesHardBreak,
+  insertHardBreak,
+  stripDanglingHardBreak,
 } from './textEditing.js';
 
 // These pure functions back both the block-level textarea editor and the
@@ -297,5 +300,115 @@ describe('toggleLinePrefix', () => {
     // A caret on the second line still prefixes "abc", not a later line.
     const r2 = toggleLinePrefix('\nabc', 2, 2, '- ');
     expect(r2.value).toBe('\n- abc');
+  });
+});
+
+describe('blockTakesHardBreak', () => {
+  it('accepts inline-content blocks', () => {
+    for (const kind of ['paragraph', 'block-quote', 'ordered-list', 'unordered-list']) {
+      expect(blockTakesHardBreak(kind), kind).toBe(true);
+    }
+  });
+
+  it('rejects blocks where "\\" is literal or a newline ends the block', () => {
+    for (const kind of [
+      'heading-1', 'heading-6', 'code-block-fenced-rust', 'code-block-indented',
+      'table', 'html-block', 'thematic-break', 'blank-line', 'link-ref-def',
+      'unknown', undefined,
+    ]) {
+      expect(blockTakesHardBreak(kind), String(kind)).toBe(false);
+    }
+  });
+});
+
+describe('insertHardBreak', () => {
+  const BS = String.fromCharCode(92); // backslash — avoids \' soup
+
+  it('inserts a backslash break at the caret, landing on the new line', () => {
+    const r = insertHardBreak('hello world', 5, 5);
+    expect(r.value).toBe('hello' + BS + '\n world');
+    expect(r.start).toBe(7);
+    expect(r.end).toBe(7);
+  });
+
+  it('replaces a selection with the break', () => {
+    const r = insertHardBreak('hello world', 0, 5);
+    expect(r.value).toBe(BS + '\n world');
+  });
+
+  it('inserts only the newline when the line already ends with a backslash', () => {
+    // A second "\" would escape the first into a literal character.
+    const r = insertHardBreak('foo' + BS, 4, 4);
+    expect(r.value).toBe('foo' + BS + '\n');
+  });
+
+  it('inserts the marker after an even run of trailing backslashes', () => {
+    // "\\\\" is an escaped (literal) backslash — it carries no break, so
+    // the marker is still needed.
+    const r = insertHardBreak('foo' + BS + BS, 5, 5);
+    expect(r.value).toBe('foo' + BS + BS + BS + '\n');
+  });
+
+  it('inserts only the newline after two+ trailing spaces', () => {
+    // Trailing spaces are already a CommonMark hard break.
+    const r = insertHardBreak('foo  ', 5, 5);
+    expect(r.value).toBe('foo  \n');
+  });
+
+  it('on an already-blank line splits the paragraph and drops the dangling marker', () => {
+    // Enter on the empty line created by the previous break means "new
+    // block". The "\" left on "foo" would now end the paragraph, where
+    // CommonMark renders it literally — it must go.
+    const r = insertHardBreak('foo' + BS + '\n', 5, 5);
+    expect(r.value).toBe('foo\n\n');
+    expect(r.start).toBe(5);
+    expect(r.end).toBe(5);
+  });
+
+  it('keeps an escaped (even) backslash run when splitting on a blank line', () => {
+    const r = insertHardBreak('foo' + BS + BS + '\n', 6, 6);
+    expect(r.value).toBe('foo' + BS + BS + '\n\n');
+  });
+
+  it('full Enter, Enter flow from the end of a line', () => {
+    let r = insertHardBreak('foo', 3, 3);
+    r = insertHardBreak(r.value, r.start, r.end);
+    expect(r.value).toBe('foo\n\n');
+  });
+
+  it('treats a whitespace-only line as blank', () => {
+    const r = insertHardBreak('foo\n   ', 7, 7);
+    expect(r.value).toBe('foo\n   \n');
+  });
+
+  it('still breaks when the line only LOOKS empty before the caret', () => {
+    // "  |text": the caret-side text means this is not a blank line — the
+    // user wants "text" on a new line, not a paragraph split.
+    const r = insertHardBreak('  text', 2, 2);
+    expect(r.value).toBe('  ' + BS + '\ntext');
+  });
+});
+
+describe('stripDanglingHardBreak', () => {
+  const BS = String.fromCharCode(92);
+
+  it('drops a trailing marker followed by a line break', () => {
+    expect(stripDanglingHardBreak('foo' + BS + '\n')).toBe('foo');
+    expect(stripDanglingHardBreak('a' + BS + '\nfoo' + BS + '\n  ')).toBe('a' + BS + '\nfoo');
+  });
+
+  it('keeps a backslash typed as the very last character', () => {
+    expect(stripDanglingHardBreak('foo' + BS)).toBe('foo' + BS);
+  });
+
+  it('keeps escaped (even) backslash runs and plain text', () => {
+    expect(stripDanglingHardBreak('foo' + BS + BS + '\n')).toBe('foo' + BS + BS + '\n');
+    expect(stripDanglingHardBreak('foo\n')).toBe('foo\n');
+    expect(stripDanglingHardBreak('')).toBe('');
+  });
+
+  it('leaves interior hard breaks alone', () => {
+    const v = 'a' + BS + '\nb';
+    expect(stripDanglingHardBreak(v)).toBe(v);
   });
 });

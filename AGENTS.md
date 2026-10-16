@@ -14,6 +14,9 @@
   (`e2e/probe.mjs`) against the Vite dev server with a mocked Tauri backend
   (`e2e/mock-tauri.mjs`). Requires `vite dev` (or `cargo tauri dev`) already
   running on :5173. Screenshots land in `e2e/shots/` (gitignored).
+  `npm run test:e2e:diagrams` — same setup, `e2e/diagram-probe.mjs`: every diagram
+  engine + bibliography/citation chips (incl. off-screen bibliography, SVG
+  sanitization, failed-render cleanup).
 - `cargo run -p editor-mcp --bin womd-mcp -- --root <dir>` — MCP stdio server
   exposing sandboxed document tools to AI agents (ADR-007, docs/mcp.md).
 - Workspace uses `resolver = "3"`, edition 2024, Rust 1.95+.
@@ -102,6 +105,34 @@
   programs when the user merely inspects a repo; write and network ops keep the
   plain handle because they legitimately need credential helpers, SSH env, LFS
   filters and commit signing. 94 tests.
+  Diagram fences render inline in the rendered view (`src/lib/diagram.js`):
+  ` ```mermaid `/` ```mmd ` (mermaid, `securityLevel: 'strict'`),
+  ` ```bpmn ` (bpmn-js `Viewer` → `saveSVG`), ` ```plantuml `/` ```puml `/` ```uml `
+  (`@plantuml/core` — official TeaVM JS engine, fully offline; renders are
+  serialized through one queue because the engine shares internal state),
+  ` ```svg ` (emitted as `<img src=data:>` — raw innerHTML would execute
+  embedded scripts). Engines are dynamic-imported lazily per language; the
+  first paint shows a source placeholder, the finished SVG lands in a
+  source-keyed cache and `dataVersion++` re-renders the block. CSP needs
+  `'wasm-unsafe-eval'` in script-src for Viz.js (embedded base64 WASM).
+  Bibliography fences (` ```bibtex `/` ```bib `/` ```ris `/` ```csl-json `,
+  info string `bibtex <style> <locale>`) render via `src/lib/citations.js`:
+  citation-js parses to CSL-JSON, citeproc-js formats with bundled CSL
+  styles (`src/csl/`: apa, ieee, vancouver, chicago-author-date; locales
+  en-US, ru-RU — both `?raw` imports, fully offline). `[@key]`, `[@a; @b]`
+  and bare `@key` render as chips labelled by the bibliography's own style
+  (`(Knuth, 1984)` / `[1]`). Resolution is per document: MarkdownEditor's
+  `refreshBibliographies()` scans block meta for bibliography fences (they
+  are usually off-screen, so the virtualized view never renders them) and
+  calls `setDocumentBibliographies`. A document without a bibliography
+  leaves `@` text untouched; a bare `@word` only chips when it resolves.
+  bpmn-js / PlantUML SVG is sanitized with DOMPurify before `v-html`;
+  diagrams sit on a light panel so they read under every theme. Each async
+  render is time-boxed (60 s) so one wedged engine can't stall the queue.
+  Block-edit Enter: inline blocks get a `\` hard break; Enter on the blank
+  line after it (or closing the edit) removes the dangling marker
+  (`stripDanglingHardBreak`) — at the end of a paragraph it renders as a
+  literal backslash.
 - **editor-mcp** (ADR-007, docs/mcp.md): MCP stdio server so AI agents can author and
   edit documents. Sandboxed to `--root` (system dirs, home root, Desktop, credential
   dirs, `.git` denied; `..`/absolute/symlink escapes rejected; no execution). 19

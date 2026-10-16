@@ -95,6 +95,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { renderBlockHtml } from '../render.js';
+import { onAsyncBlockRendered } from '../lib/diagram.js';
+import { citationKind, setDocumentBibliographies } from '../lib/citations.js';
 import * as textEditing from '../lib/textEditing.js';
 import { byteOffsetToTextareaIndex } from '../lib/byteOffset.js';
 import { contentChanged, normalizeForTextarea, restoreLineEndings } from '../lib/lineEndings.js';
@@ -201,6 +203,11 @@ const sourceLoading = ref(false);
 const sourceTextarea = ref(null);
 
 let unlistenDragDrop = null;
+
+// Async blocks (mermaid/bpmn/plantuml/svg diagrams, bibliographies) render
+// off-thread: first paint shows a source placeholder, the finished HTML lands
+// in the diagram.js cache — re-evaluating visibleBlocks picks it up here.
+const offDiagramRendered = onAsyncBlockRendered(() => { dataVersion.value++; });
 
 const sourceLineCount = computed(() => Math.max(1, sourceText.value.split(/\r?\n/).length));
 
@@ -504,6 +511,39 @@ function syncBlockState(newMetaRaw, newStartLines) {
   anchorAfterEdit = -1;
   rebuildOffsets(firstChanged < Infinity ? firstChanged : 0);
   dataVersion.value++;
+  refreshBibliographies();
+}
+
+// [@key] chips resolve against the document's bibliography fences. Those
+// blocks are usually at the end of the document — far outside the
+// virtualized viewport, so they'd never render (and never register their
+// keys) on their own. Scan the block list instead, load just the
+// bibliography blocks, and hand them to citations.js.
+const FENCE_PREFIX = 'code-block-fenced-';
+let bibRefreshSeq = 0;
+let lastBibSignature = null;
+async function refreshBibliographies() {
+  const seq = ++bibRefreshSeq;
+  const gen = docGeneration;
+  const blocks = [];
+  for (let i = 0; i < meta.length; i++) {
+    const kind = meta[i].kind;
+    if (!kind.startsWith(FENCE_PREFIX) || !citationKind(kind.slice(FENCE_PREFIX.length))) continue;
+    const data = cache.get(i) || await loadBlockData(i);
+    if (seq !== bibRefreshSeq || gen !== docGeneration) return;
+    const node = data?.node;
+    if (node?.type === 'CodeBlock') blocks.push({ info: node.language, source: node.content });
+  }
+  // Edits elsewhere in the document re-run this; skip the repaint when the
+  // bibliography set didn't change.
+  const signature = `${gen}\u0000${blocks.map((b) => `${b.info}\u0001${b.source}`).join('\u0000')}`;
+  if (signature === lastBibSignature) return;
+  lastBibSignature = signature;
+  await setDocumentBibliographies(blocks);
+  // No seq check here: a newer run with the same signature returned early
+  // and relies on THIS run's repaint. A redundant repaint is harmless.
+  if (gen !== docGeneration) return;
+  dataVersion.value++;
 }
 
 async function fetchLineNumbers(count) {
@@ -571,6 +611,7 @@ async function loadDocument() {
   if (!props.doc?.id) {
     meta = []; heights = []; offsets = [0]; cache = new Map(); cacheKeys = []; startLines = [];
     measuredLineSum = 0; measuredPxSum = 0; measuredIndices = new Set();
+    refreshBibliographies();
     totalHeight.value = 0;
     layoutVersion.value++;
     dataVersion.value++;
@@ -605,6 +646,7 @@ async function loadDocument() {
     meta = rawMeta.map(m => ({ kind: m.kind, start: m.start, end: m.end }));
     heights = new Array(meta.length).fill(0);
     measuredLineSum = 0; measuredPxSum = 0; measuredIndices = new Set();
+    refreshBibliographies();
     startLines = await fetchLineNumbers(meta.length);
     if (gen !== docGeneration) return;
     rebuildOffsets(0);
@@ -1017,6 +1059,11 @@ async function exitEditOnce() {
   // strips out of the editable text — compare with it removed on both
   // sides, or every session looks "changed" and re-commits identical bytes.
   const stripTail = (s) => normalizeForTextarea(s).replace(/\n$/, '');
+  // Enter-then-close leaves `text\` + newline: as the block's last line the
+  // marker would render as a literal backslash.
+  if (textEditing.blockTakesHardBreak(meta[index]?.kind)) {
+    editSource.value = textEditing.stripDanglingHardBreak(editSource.value);
+  }
   const changed = stripTail(old) !== stripTail(editSource.value);
 
   // Replace ONLY when content actually changed — a no-change replace_block
@@ -1115,6 +1162,20 @@ function onKeydown(e) {
   } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
     exitEdit();
+  } else if (
+    e.key === 'Enter' && !e.shiftKey && !e.altKey &&
+    textEditing.blockTakesHardBreak(meta[editingIndex.value]?.kind)
+  ) {
+    // Plain Enter in inline content writes a real hard break (`\` + \n)
+    // into the source — a bare newline is a CommonMark softbreak and
+    // renders as a space, which reads as "Enter did nothing". Shift+Enter
+    // remains the escape hatch for a literal softbreak; a second Enter on
+    // the empty new line stays a plain newline and ends the block.
+    e.preventDefault();
+    // Same re-arm as onTextareaInput — the synthetic edit bypasses the
+    // textarea's input event.
+    exitEditRejected = false;
+    applyToTextarea(e.target, textEditing.insertHardBreak);
   }
 }
 
@@ -1796,6 +1857,7 @@ onUnmounted(() => {
   if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
   if (blockResizeObserver) { blockResizeObserver.disconnect(); blockResizeObserver = null; }
   if (unlistenDragDrop) { unlistenDragDrop(); unlistenDragDrop = null; }
+  offDiagramRendered();
 });
 
 function save() {

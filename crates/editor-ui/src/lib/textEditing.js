@@ -174,6 +174,73 @@ export function makeImage(value, start, end, url, placeholder = 'alt text') {
   return insertText(value, start, end, `![${selected}](${url})`);
 }
 
+/**
+ * Block kinds whose textarea source is inline markdown where `\` + newline
+ * produces a real hard line break. Code blocks and HTML blocks treat `\` as
+ * a literal character; headings, thematic breaks and link-ref-defs end at
+ * the newline anyway; a newline inside a table row breaks the table.
+ */
+export function blockTakesHardBreak(kind) {
+  return kind === 'paragraph' || kind === 'block-quote'
+    || kind === 'ordered-list' || kind === 'unordered-list';
+}
+
+/**
+ * Insert a hard line break at the caret: a `\` marker plus the newline, so
+ * the rendered output actually shows the break — a bare `\n` is a CommonMark
+ * softbreak and renders as a space, which reads as "Enter did nothing".
+ * The marker is skipped where a break already exists (an odd run of
+ * trailing `\`, or 2+ trailing spaces) — another `\` would escape the
+ * marker into a literal, or just pile up redundant markers.
+ * A caret on an already-blank line gets a plain newline instead: Enter on
+ * an empty line means "new block", and the resulting blank line ends this
+ * one — the `\` variant would emit an invisible break marker and the block
+ * could never be exited by keyboard.
+ */
+export function insertHardBreak(value, start, end) {
+  const before = value.slice(0, start);
+  const lineStart = before.lastIndexOf('\n') + 1;
+  const lineEnd = value.indexOf('\n', end);
+  const restOfLine = value.slice(end, lineEnd < 0 ? value.length : lineEnd);
+  if (before.slice(lineStart).trim() === '' && restOfLine.trim() === '') {
+    // This blank line ends the paragraph. A `\` marker left on the line
+    // above (from the previous Enter) would now sit at the END of the
+    // paragraph, where CommonMark renders it as a literal backslash —
+    // drop it, so "text, Enter, Enter" yields a clean paragraph split.
+    if (lineStart > 0 && endsWithBreakMarker(value.slice(0, lineStart - 1))) {
+      const v = value.slice(0, lineStart - 2) + value.slice(lineStart - 1);
+      return insertText(v, start - 1, end - 1, '\n');
+    }
+    return insertText(value, start, end, '\n');
+  }
+  // Trailing spaces are a break marker only after real content — leading
+  // whitespace ("  |text") is indentation, not the end of a text line.
+  const hasBreak = endsWithBreakMarker(before) || /\S {2,}$/.test(before.slice(lineStart));
+  return insertText(value, start, end, hasBreak ? '\n' : '\\\n');
+}
+
+// An odd run of trailing backslashes is a live `\` marker; an even run is
+// escaped literal backslashes.
+function endsWithBreakMarker(s) {
+  let n = 0;
+  while (n < s.length && s[s.length - 1 - n] === '\\') n++;
+  return n % 2 === 1;
+}
+
+/**
+ * Drop a hard-break marker left dangling at the end of a block's text
+ * (Enter pressed, then the edit was closed): the trailing `\` would render
+ * as a literal backslash at the end of the paragraph. Only a marker that
+ * is followed by a line break is touched — a backslash the user typed as
+ * the very last character is content and stays.
+ */
+export function stripDanglingHardBreak(value) {
+  const tail = value.match(/\s*$/)[0];
+  const body = value.slice(0, value.length - tail.length);
+  if (!tail.includes('\n') || !endsWithBreakMarker(body)) return value;
+  return body.slice(0, -1);
+}
+
 /** A minimal 2x2 GFM table template, inserted at the cursor. */
 export function makeTable() {
   return '| Header 1 | Header 2 |\n| --- | --- |\n| Cell 1 | Cell 2 |\n';
